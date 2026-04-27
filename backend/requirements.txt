@@ -1,0 +1,24 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Config + validation
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# Weather data parsing — the high-risk dependency
+cfgrib==0.9.14.1
+xarray==2024.9.0
+numpy==2.1.2
+
+# Future weeks (commented out until needed):
+# asyncpg==0.30.0                   # Postgres async driver (week 1)
+# google-cloud-secret-manager       # Secret Manager (week 1)
+# google-cloud-sql-connector[asyncpg]  # Cloud SQL connection (week 1)
+# google-cloud-storage              # GCS (week 2)
+# redis==5.1.1                      # Redis cache (week 2)
+# firebase-admin                    # JWT verification (week 1-2)
+# anthropic                         # Claude API (week 8)
+# stripe                            # Payments (week 7)
+# httpx                             # Async HTTP client for Datalastic (week 7)
+# sse-starlette                     # SSE for routing stream (week 6)
