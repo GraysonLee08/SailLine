@@ -4,17 +4,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app import db
-from app.routers import health
+from app import auth, db
+from app.routers import health, users
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources for the app's lifetime.
 
-    Currently: the Cloud SQL connection pool. As more services are added
-    (Redis, Firebase admin, etc.) initialize them here too.
+    Currently: the Cloud SQL connection pool and the Firebase Admin SDK.
+    As more services are added (Redis, etc.) initialize them here too.
     """
+    auth.initialize()
     await db.startup()
     try:
         yield
@@ -30,6 +31,7 @@ app = FastAPI(
 )
 
 app.include_router(health.router)
+app.include_router(users.router, prefix="/api")
 
 
 @app.get("/")
