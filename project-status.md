@@ -1,13 +1,13 @@
 # SailLine — Project Status
 
-**Last updated:** Week 1 infrastructure complete
-**Status:** ✅ Backend deployed and live on Cloud Run · ready to start application code
+**Last updated:** Week 1 infrastructure complete · Step A (Cloud SQL wiring) complete
+**Status:** ✅ Backend deployed, DB roundtrip verified · ready for Step B (Firebase auth)
 
 ---
 
 ## Executive Summary
 
-You've moved from "idea" to "production-deployed backend with a live HTTPS endpoint" in a single sprint. Everything below is provisioned, documented, and working:
+You've moved from "idea" to "production-deployed backend with a verified end-to-end database roundtrip" in a single sprint. Everything below is provisioned, documented, and working:
 
 - **Product strategy** captured in a 1.1 PRD with validated cost model (break-even at 22 Pro subscribers)
 - **Technical architecture** designed for solo developer on GCP with auto-deploy CI/CD
@@ -15,8 +15,9 @@ You've moved from "idea" to "production-deployed backend with a live HTTPS endpo
 - **GCP infrastructure** fully provisioned: VPC, Cloud SQL with PostGIS, Memorystore Redis, Cloud Storage, Artifact Registry, Cloud Build, Cloud Run
 - **First production deployment** of FastAPI backend with `cfgrib` weather library validated working
 - **Auto-deploy pipeline** wired up: every `git push` to `main` triggers a build and ships a new revision
+- **Cloud SQL connectivity proven**: FastAPI on Cloud Run successfully queries Postgres + PostGIS through the VPC connector via the Cloud SQL Python Connector
 
-The hardest technical risk in the entire project (`cfgrib`/`eccodes` working in a deployed container) is now retired. The path from here is application code.
+The two hardest technical risks in the project (`cfgrib`/`eccodes` working in a deployed container, and Cloud Run reaching Cloud SQL through the VPC) are now retired. The path from here is application code.
 
 ---
 
@@ -52,63 +53,16 @@ PHRF · ORC · ORR-EZ · IRC · MORF
 1. **Isochrone routing** as the algorithmic foundation (industry standard)
 2. **Probabilistic ensemble routing** (v1.5) — running 21 NOAA GEFS forecast members instead of one deterministic forecast
 3. **ML-learned polars** (v3) — neural network trained on real instrument telemetry per-boat
-4. **AI tactical advisor** (Claude API) — translates routing math into plain language
-
-### Cost model
-
-| Subscribers | Revenue | Infrastructure | Net |
-|---|---|---|---|
-| 22 Pro | $330 | ~$320 | break-even |
-| 100 Pro | $1,500 | ~$525 | +$975/mo |
-| 500 Pro | $7,500 | ~$1,200 | +$6,300/mo |
-
-Major cost drivers: Datalastic AIS (~$220–$330/mo), Memorystore Redis (~$36/mo), Cloud SQL (~$10–25/mo).
-
-### Roadmap
-
-| Release | Scope |
-|---|---|
-| **v1** | Pre-race + in-race routing, AIS, AI advisor, GPS recording, desktop UI |
-| **v1.5** | Probabilistic ensemble routing, wave data, tablet/cockpit layout |
-| **v2** | Post-race AI analysis, Pi hardware module, instrument telemetry ingestion |
-| **v3** | ML-learned polars, custom polar uploads, expanded boat classes |
 
 ---
 
-## 2. Technical Architecture
+## 2. Build Sequence
 
-Single-provider on **Google Cloud Platform**. Decision logged after evaluating multi-vendor (Render + Vercel + Supabase + Upstash) and concluding that single-provider's unified IAM, integrated logging, and private VPC networking outweigh the slightly higher idle cost.
-
-### Stack
-
-| Layer | Technology |
-|---|---|
-| Frontend | React + Vite, MapboxGL, Firebase Auth |
-| Frontend hosting | Firebase Hosting |
-| Backend | FastAPI (Python 3.12) |
-| Backend hosting | Cloud Run |
-| Database | Cloud SQL (PostgreSQL 15 + PostGIS) |
-| Cache | Memorystore for Redis (Basic 1GB) |
-| File storage | Cloud Storage |
-| Background jobs | Cloud Run Jobs + Cloud Scheduler |
-| CI/CD | Cloud Build → Artifact Registry → Cloud Run |
-| Auth | Firebase Authentication (JWT) |
-| Secrets | Secret Manager |
-| External AIS | Datalastic API |
-| External AI | Anthropic Claude API |
-| External payments | Stripe |
-| External weather | NOAA GFS + HRRR (GRIB2 via cfgrib) |
-
-### Real-time architecture
-
-- **SSE (Server-Sent Events)** chosen over WebSockets for routing updates — simpler to implement, sufficient for 2–15 minute recalc cadences, automatic reconnection on Cloud Run's 60-minute request limit.
 - **Race modes:** inshore (recalc every 2–3 min, AIS every 3 min) vs distance (recalc every 10–15 min, AIS every 5 min).
-
-### Build sequence (10 weeks)
 
 | Week | Focus |
 |---|---|
-| **1** | Infrastructure setup ✅ |
+| **1** | Infrastructure setup ✅ + Step A (Cloud SQL wiring) ✅ |
 | **2** | Weather pipeline (NOAA → cfgrib → Redis) |
 | **3–4** | Isochrone routing engine (the hardest piece — prototype as standalone script first) |
 | **5** | Pre-race UI (map, mark placement, route overlay) |
@@ -151,12 +105,12 @@ redis.googleapis.com
 
 | Resource | Identifier | Notes |
 |---|---|---|
-| Cloud SQL instance | `sailline-db` | PostgreSQL 15, region `us-central1`, db-f1-micro, dual public+private IP |
+| Cloud SQL instance | `sailline-db` | PostgreSQL 15.17, region `us-central1`, db-f1-micro, dual public+private IP |
 | Private IP | `10.69.0.3` | Used by Cloud Run via VPC connector |
 | Database | `sailline_app` | App database |
 | Admin user | `postgres` | Password in Secret Manager |
 | App user | `sailline` | Password in Secret Manager |
-| Extensions installed | `postgis`, `postgis_topology` | Verified via `SELECT PostGIS_version()` |
+| Extensions installed | `postgis` 3.6, `postgis_topology` | Verified live via FastAPI roundtrip |
 
 Tables: `user_profiles` (created); `race_sessions`, `track_points`, `telemetry_points` (deferred to their respective build weeks).
 
@@ -187,7 +141,7 @@ Tables: `user_profiles` (created); `race_sessions`, `track_points`, `telemetry_p
 | Secret name | Status |
 |---|---|
 | `sailline-db-postgres-password` | ✅ created |
-| `sailline-db-app-password` | ✅ created |
+| `sailline-db-app-password` | ✅ created · injected into Cloud Run via `--set-secrets` |
 | `sailline-datalastic-api-key` | ⏸ deferred to Week 7 |
 | `sailline-anthropic-api-key` | ⏸ deferred to Week 8 |
 | `sailline-stripe-secret-key` | ⏸ deferred to Week 7 |
@@ -206,17 +160,18 @@ Tables: `user_profiles` (created); `race_sessions`, `track_points`, `telemetry_p
 |---|---|---|
 | GitHub connection | 1st gen Cloud Build GitHub App | Repo `GraysonLee08/SailLine` connected |
 | Build trigger | `sailline-api-deploy` | Branch `^main$`, config `infra/cloudbuild.yaml`, runs as `sailline-cloudbuild` SA |
-| Build config | `infra/cloudbuild.yaml` | Build → push → deploy. Logs to Cloud Logging only. Timeout 1200s. |
+| Build config | `infra/cloudbuild.yaml` | Build → push → deploy. Injects `CLOUD_SQL_INSTANCE` env var and `DB_PASSWORD` from Secret Manager. Logs to Cloud Logging only. Timeout 1200s. |
 
 ### Cloud Run service
 
 | Resource | Identifier | Notes |
 |---|---|---|
 | Service | `sailline-api` | Region `us-central1`, public HTTPS endpoint, scales 0–10 |
+| Live URL | `https://sailline-api-105706282249.us-central1.run.app` | Reachable from public internet |
 | Memory / CPU | 512Mi / 1 CPU | Sufficient for v1 |
 | Service account | `sailline-api@sailline.iam.gserviceaccount.com` | Runtime identity |
 | VPC connector | `sailline-connector` | Egress: `private-ranges-only` |
-| Authentication | Allow unauthenticated | API-level auth via Firebase JWT (planned Week 1 application code) |
+| Authentication | Allow unauthenticated | API-level auth via Firebase JWT (Step B) |
 
 ### Firebase
 
@@ -239,17 +194,19 @@ GitHub: **[github.com/GraysonLee08/SailLine](https://github.com/GraysonLee08/Sai
 backend/
 ├── Dockerfile              ✅ builds successfully, eccodes installed
 ├── .dockerignore           ✅
-├── requirements.txt        ✅ FastAPI + cfgrib + xarray + numpy
+├── requirements.txt        ✅ FastAPI + cfgrib + xarray + numpy + asyncpg + Cloud SQL Connector
 ├── .env.example            ✅
 └── app/
     ├── __init__.py         ✅
-    ├── main.py             ✅ FastAPI entry, /health + / endpoints
+    ├── main.py             ✅ FastAPI entry, lifespan-managed DB pool, /health + / endpoints
+    ├── config.py           ✅ pydantic-settings, env vars + secret aliases
+    ├── db.py               ✅ Cloud SQL Connector + asyncpg pool, lazy + non-fatal startup
     └── routers/
         ├── __init__.py     ✅
         └── health.py       ✅ reports cfgrib status
 
 infra/
-└── cloudbuild.yaml         ✅ build → push → deploy pipeline
+└── cloudbuild.yaml         ✅ build → push → deploy, with secrets + CLOUD_SQL_INSTANCE wired
 
 frontend/
 ├── package.json            ✅ Vite + React scaffolding via firebase init
@@ -271,6 +228,7 @@ docs/
 ├── prd.md                                         ✅ Product Requirements (v1.1)
 ├── architecture.md                                ✅ GCP technical architecture
 ├── repository-structure.md                        ✅ Build week annotations
+├── project-status.md                              ✅ this file
 └── infrastructure/
     ├── 01-gcp-bootstrap.md                        ✅ Project + APIs
     ├── 02-firebase-setup.md                       ✅ Firebase Auth + Hosting
@@ -285,13 +243,15 @@ docs/
 
 ## 5. Verified End-to-End
 
+### Container + cfgrib
+
 The `/health` endpoint returns:
 
 ```json
 {
-  "service": "sailline-api",
-  "version": "0.1.0",
-  "cfgrib": "available (cfgrib 0.9.14.1)"
+  "status": "ok",
+  "cfgrib_available": true,
+  "cfgrib_version": "0.9.14.1"
 }
 ```
 
@@ -309,19 +269,44 @@ This confirms:
 - ✅ Image pushes to Artifact Registry with both `$SHORT_SHA` and `latest` tags
 - ✅ Cloud Run deploys the new revision with correct env vars
 
+### Database roundtrip (Step A)
+
+A temporary smoke-test endpoint (`/api/users/me/test`, since removed) returned:
+
+```json
+{
+  "db_now": "2026-04-28T15:06:38.912566+00:00",
+  "postgres": "PostgreSQL 15.17 on x86_64-pc-linux-gnu",
+  "postgis": "3.6 USE_GEOS=1 USE_PROJ=1 USE_STATS=1"
+}
+```
+
+This confirms:
+
+- ✅ FastAPI lifespan successfully initializes the asyncpg pool at startup
+- ✅ `DB_PASSWORD` is correctly injected from Secret Manager into the Cloud Run env
+- ✅ `CLOUD_SQL_INSTANCE` env var is correctly set on the service
+- ✅ The Cloud SQL Python Connector resolves the instance and authenticates
+- ✅ Cloud Run egresses through the VPC connector to Cloud SQL's private IP (`10.69.0.3`)
+- ✅ The `sailline` app user has CONNECT + USAGE on `sailline_app`
+- ✅ PostGIS 3.6 is installed and queryable
+- ✅ The full pool → acquire → execute → return pattern works end-to-end
+
+The smoke-test endpoint was removed after verification to avoid exposing Postgres version info on an unauthenticated route.
+
 ---
 
 ## 6. What's NOT Yet Wired Up
 
 These pieces are infrastructure-ready but the application code hasn't been written yet:
 
-- ❌ FastAPI doesn't yet connect to Cloud SQL (no `app/db.py` implementation)
-- ❌ Firebase JWT verification doesn't run on API requests (no `app/auth.py` implementation)
+- ✅ ~~FastAPI doesn't yet connect to Cloud SQL~~ — wired up in Step A
+- ❌ Firebase JWT verification doesn't run on API requests (no `app/auth.py` implementation) — **Step B**
 - ❌ FastAPI doesn't yet talk to Redis (no client setup)
 - ❌ Weather worker not built (Cloud Run Job stub doesn't exist)
 - ❌ No real product features (all routing, AIS, AI, GPS recording deferred to weeks 2–8)
 
-This is intentional. Week 1 was infrastructure; Weeks 2+ are application code on top of it.
+This is intentional. Week 1 was infrastructure + DB connectivity; Weeks 2+ are application code on top of it.
 
 ---
 
@@ -329,30 +314,14 @@ This is intentional. Week 1 was infrastructure; Weeks 2+ are application code on
 
 ### Immediate (close out Week 1)
 
-**Step A — Wire up Cloud SQL connection**
-
-Goal: Prove Cloud Run can actually reach the database via the VPC connector. This is a low-risk, high-value validation step before any product code.
-
-1. Add to `backend/requirements.txt`:
-   ```
-   asyncpg==0.30.0
-   google-cloud-sql-connector[asyncpg]
-   google-cloud-secret-manager
-   ```
-
-2. Implement `backend/app/db.py` — Cloud SQL Connector + asyncpg pool
-3. Add a `/users/me/test` endpoint that does `SELECT NOW()` against `sailline_app`
-4. Push, watch auto-deploy, curl the endpoint
-5. Verify response contains a current timestamp from Postgres
-
 **Step B — Wire up Firebase JWT verification**
 
-Goal: First protected endpoint, end-to-end auth flow.
+Goal: First protected endpoint, end-to-end auth flow. Same shape as Step A: verify a single piece of the puzzle in isolation, then build features on top.
 
-1. Add `firebase-admin` to `requirements.txt`
+1. Add `firebase-admin` to `backend/requirements.txt` (uncomment the existing line)
 2. Implement `backend/app/auth.py` — `get_current_user` and `require_pro` dependencies
 3. Build minimal React login flow (Email/Google sign-in via Firebase SDK)
-4. Add a protected endpoint like `/users/me` that returns the JWT's claims
+4. Add a protected endpoint `/api/users/me` that returns the JWT's claims
 5. End-to-end test: log in via React → token stored → call protected endpoint → 200 with user info
 
 ### Week 2 — Weather pipeline
@@ -462,6 +431,7 @@ The risks that mattered going in have mostly been retired. Remaining risks:
 | `cfgrib`/`eccodes` install fails on Cloud Run | High | ✅ retired (validated working) |
 | GCP IAM/networking misconfiguration | High | ✅ retired (everything passes verification) |
 | Cloud Build CI/CD pipeline | Medium | ✅ retired (auto-deploy verified) |
+| Cloud Run → Cloud SQL connectivity through VPC | Medium | ✅ retired (live DB roundtrip confirmed) |
 | Isochrone engine too slow for 2-min recalc | High | ⏳ unmitigated until Week 3 |
 | NOAA GRIB servers slow/unreliable | Medium | ⏳ mitigation: aggressive caching to GCS |
 | Datalastic AIS coverage thin mid-lake | Medium | ⏳ documented limitation, in-app warning planned |
@@ -473,8 +443,8 @@ The biggest remaining technical risk is the isochrone routing engine performance
 
 ## 10. The Bottom Line
 
-You went from a one-line idea ("real-time routing for sailing races") to a production-deployed backend with fully automated CI/CD in roughly a week of evening work. The infrastructure is real, the documentation is comprehensive, and the path forward is clear.
+You went from a one-line idea ("real-time routing for sailing races") to a production-deployed backend with fully automated CI/CD **and a verified database roundtrip** in roughly a week of evening work. The infrastructure is real, the documentation is comprehensive, and the path forward is clear.
 
 You're now off the infrastructure track and onto the application track. Every commit ships automatically. Time to write the actual product.
 
-**Next coding session:** Step A — wire up Cloud SQL and ship the first real DB-backed endpoint. Should be a 1–2 hour session and gives you a concrete win to start Week 2.
+**Next coding session:** Step B — wire up Firebase JWT verification. Add `firebase-admin`, implement `app/auth.py`, build the React login flow, and ship the first protected endpoint. Should be a 2–3 hour session and closes out Week 1 entirely.
