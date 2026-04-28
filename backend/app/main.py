@@ -1,28 +1,38 @@
 """FastAPI application entry point."""
 
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+
 from app import db
-from app.routers import users
-from app.routers import health
+from app.routers import health, users
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage shared resources for the app's lifetime.
+
+    Currently: the Cloud SQL connection pool. As more services are added
+    (Redis, Firebase admin, etc.) initialize them here too.
+    """
+    await db.startup()
+    try:
+        yield
+    finally:
+        await db.shutdown()
+
 
 app = FastAPI(
     title="SailLine API",
     description="Real-time race routing for sailors.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.include_router(health.router)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db.startup()
-    yield
-    await db.shutdown()
-
-
-app = FastAPI(lifespan=lifespan)
 app.include_router(users.router, prefix="/api")
+
+
 @app.get("/")
 async def root():
     """Root endpoint — returns a hello message and confirms cfgrib is importable."""

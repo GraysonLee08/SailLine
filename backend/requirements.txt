@@ -11,10 +11,11 @@ cfgrib==0.9.14.1
 xarray==2024.9.0
 numpy==2.1.2
 
+# Database (week 1 — Cloud SQL via Connector + asyncpg pool)
+asyncpg==0.30.0
+cloud-sql-python-connector[asyncpg]==1.11.0
+
 # Future weeks (commented out until needed):
-asyncpg==0.30.0                              # Postgres async driver
-# google-cloud-secret-manager       # Secret Manager (week 1)
-google-cloud-sql-connector[asyncpg]==1.11.0  # Cloud SQL connection
 # google-cloud-storage              # GCS (week 2)
 # redis==5.1.1                      # Redis cache (week 2)
 # firebase-admin                    # JWT verification (week 1-2)
