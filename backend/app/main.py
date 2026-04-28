@@ -1,7 +1,9 @@
 """FastAPI application entry point."""
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
-
+from app import db
+from app.routers import users
 from app.routers import health
 
 app = FastAPI(
@@ -12,7 +14,15 @@ app = FastAPI(
 
 app.include_router(health.router)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.startup()
+    yield
+    await db.shutdown()
 
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(users.router, prefix="/api")
 @app.get("/")
 async def root():
     """Root endpoint — returns a hello message and confirms cfgrib is importable."""

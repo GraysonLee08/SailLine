@@ -12,9 +12,9 @@ xarray==2024.9.0
 numpy==2.1.2
 
 # Future weeks (commented out until needed):
-# asyncpg==0.30.0                   # Postgres async driver (week 1)
+asyncpg==0.30.0                              # Postgres async driver
 # google-cloud-secret-manager       # Secret Manager (week 1)
-# google-cloud-sql-connector[asyncpg]  # Cloud SQL connection (week 1)
+google-cloud-sql-connector[asyncpg]==1.11.0  # Cloud SQL connection
 # google-cloud-storage              # GCS (week 2)
 # redis==5.1.1                      # Redis cache (week 2)
 # firebase-admin                    # JWT verification (week 1-2)
