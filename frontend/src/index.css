@@ -1,0 +1,128 @@
+/* SailLine global styles + design tokens.
+   Distilled from design_reference/styles.css — wireframe aesthetic
+   stripped, production polish added. */
+
+:root {
+  /* Light surface (right panel, inputs, cards) */
+  --paper: #fafaf7;
+  --paper-2: #f3f2ec;
+  --hair: #e5e5dd;
+  --rule: #cdcdc6;
+
+  /* Dark surface (left hero panel, deep accents) */
+  --night: #0a0e14;
+  --night-2: #111723;
+  --night-3: #1a2332;
+
+  /* Text */
+  --ink: #16161a;
+  --ink-2: #2a2a30;
+  --ink-3: #5a5a62;
+  --ink-4: #8a8a92;
+
+  /* Inverse text on dark */
+  --paper-ink: rgba(255, 255, 255, 0.92);
+  --paper-ink-2: rgba(255, 255, 255, 0.62);
+  --paper-ink-3: rgba(255, 255, 255, 0.38);
+
+  /* Accent — used SPARINGLY. Per design ref. */
+  --accent: #ff5b1f;
+  --accent-soft: rgba(255, 91, 31, 0.12);
+  --accent-2: #1f6dff;
+
+  /* States */
+  --error: #d63b1f;
+  --success: #2d8f5b;
+
+  /* Radii / shadows */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+
+  /* Type */
+  --display: "Inter", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--display);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+input,
+button {
+  font-family: inherit;
+}
+
+/* Typographic primitives — these mirror the design reference's
+   .display / .mono / .lbl conventions but are usable as utilities. */
+.t-display {
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.02;
+}
+
+.t-mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.t-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-4);
+}
+
+.t-label--inverse {
+  color: var(--paper-ink-3);
+}
+
+/* Wordmark — Inter w/ accented period, matches the wireframes */
+.wordmark {
+  font-family: var(--display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-size: 22px;
+  color: var(--ink);
+}
+.wordmark--inverse {
+  color: var(--paper-ink);
+}
+.wordmark .dot {
+  color: var(--accent);
+}
+
+/* Reduce motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
