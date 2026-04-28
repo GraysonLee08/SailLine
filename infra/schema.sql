@@ -17,3 +17,11 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 
 -- Tables for race_sessions, track_points, telemetry_points are added in
 -- their respective build weeks (see architecture.md §9).
+-- at the bottom of infra/schema.sql, before the final newline
+GRANT SELECT, INSERT, UPDATE, DELETE ON user_profiles TO sailline;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sailline;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO sailline;
