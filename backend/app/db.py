@@ -1,32 +1,37 @@
 """Cloud SQL connection pool.
 
 Uses the Cloud SQL Python Connector to establish connections over the VPC's
-private IP path, with asyncpg as the underlying driver. The Connector handles
-TLS and credential rotation; asyncpg.Pool handles connection reuse.
+private IP path, with asyncpg as the underlying driver.
 
-Lifecycle is managed by the FastAPI lifespan context in `app.main` —
-`startup()` is called on app boot, `shutdown()` on graceful termination.
+Startup is intentionally non-fatal: if the pool can't be created (bad
+credentials, network unreachable, etc.), the app still boots so /health
+responds. Endpoints that need DB access will then return a clear 503.
 """
 
 from __future__ import annotations
+
+import logging
 
 import asyncpg
 from google.cloud.sql.connector import Connector, IPTypes
 
 from app.config import settings
 
+log = logging.getLogger(__name__)
+
 _connector: Connector | None = None
 _pool: asyncpg.Pool | None = None
+_startup_error: str | None = None
 
 
-async def _create_connection() -> asyncpg.Connection:
-    """Connection factory passed to asyncpg.create_pool.
+async def _create_connection(*args, **kwargs) -> asyncpg.Connection:
+    """Connection factory used by asyncpg.create_pool.
 
-    Each new pool member is established via the Cloud SQL Connector, which
-    resolves the instance, opens a private-IP connection, and wraps it in
-    asyncpg's protocol.
+    asyncpg's pool internally passes positional args plus `loop=...` and other
+    kwargs to the connect callable. We ignore them — connection details all
+    come from settings via the Cloud SQL Connector.
     """
-    assert _connector is not None, "Connector not initialized — call startup() first"
+    assert _connector is not None
     return await _connector.connect_async(
         settings.cloud_sql_instance,
         "asyncpg",
@@ -38,26 +43,28 @@ async def _create_connection() -> asyncpg.Connection:
 
 
 async def startup() -> None:
-    """Initialize the Cloud SQL Connector and the asyncpg pool.
-
-    Called from the FastAPI lifespan handler at app start. Idempotent — safe
-    to call twice (e.g., during a hot reload in local dev).
-    """
-    global _connector, _pool
+    """Initialize the Connector and asyncpg pool. Non-fatal on failure."""
+    global _connector, _pool, _startup_error
     if _pool is not None:
         return
 
-    _connector = Connector()
-    _pool = await asyncpg.create_pool(
-        connect=_create_connection,
-        min_size=1,
-        max_size=5,
-        command_timeout=10,
-    )
+    try:
+        _connector = Connector()
+        # min_size=0 → no connection is opened during pool creation;
+        # the first acquire() triggers the lazy connect.
+        _pool = await asyncpg.create_pool(
+            connect=_create_connection,
+            min_size=0,
+            max_size=5,
+            command_timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _startup_error = f"{type(exc).__name__}: {exc}"
+        log.exception("DB pool init failed; app will boot without DB access")
 
 
 async def shutdown() -> None:
-    """Close the pool and the Connector cleanly on app shutdown."""
+    """Close the pool and Connector cleanly on app shutdown."""
     global _connector, _pool
     if _pool is not None:
         await _pool.close()
@@ -68,17 +75,23 @@ async def shutdown() -> None:
 
 
 def get_pool() -> asyncpg.Pool:
-    """FastAPI dependency — returns the shared pool.
+    """FastAPI dependency — returns the shared pool, or raises 503 if startup failed."""
+    if _pool is None:
+        from fastapi import HTTPException, status
 
-    Usage in a router:
-        from fastapi import Depends
-        from app.db import get_pool
-        import asyncpg
-
-        @router.get("/something")
-        async def handler(pool: asyncpg.Pool = Depends(get_pool)):
-            async with pool.acquire() as conn:
-                ...
-    """
-    assert _pool is not None, "DB pool not initialized — startup() was not called"
+        detail = "database pool unavailable"
+        if _startup_error:
+            detail = f"{detail}: {_startup_error}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        )
     return _pool
+
+
+def startup_status() -> dict:
+    """Diagnostic helper — returns pool state and any startup error."""
+    return {
+        "pool_initialized": _pool is not None,
+        "startup_error": _startup_error,
+    }
