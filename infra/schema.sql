@@ -15,9 +15,9 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Tables for race_sessions, track_points, telemetry_points are added in
--- their respective build weeks (see architecture.md §9).
--- at the bottom of infra/schema.sql, before the final newline
+-- Grant the app user (`sailline`) access to existing and future tables.
+-- These statements run as the schema owner (`postgres`) and only need to
+-- happen once per database. Future tables auto-grant via DEFAULT PRIVILEGES.
 GRANT SELECT, INSERT, UPDATE, DELETE ON user_profiles TO sailline;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
@@ -25,3 +25,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO sailline;
+
+-- Tables for race_sessions, track_points, telemetry_points are added in
+-- their respective build weeks (see architecture.md §9).

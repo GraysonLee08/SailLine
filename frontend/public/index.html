@@ -1,89 +1,222 @@
 <!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Welcome to Firebase Hosting</title>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SailLine</title>
 
-    <!-- update the version number as needed -->
-    <script defer src="/__/firebase/12.12.1/firebase-app-compat.js"></script>
-    <!-- include only the Firebase features as you need -->
-    <script defer src="/__/firebase/12.12.1/firebase-auth-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-database-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-firestore-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-functions-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-messaging-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-storage-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-analytics-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-remote-config-compat.js"></script>
-    <script defer src="/__/firebase/12.12.1/firebase-performance-compat.js"></script>
-    <!-- 
-      initialize the SDK after all desired features are loaded, set useEmulator to false
-      to avoid connecting the SDK to running emulators.
-    -->
-    <script defer src="/__/firebase/init.js?useEmulator=true"></script>
+  <!-- Firebase compat SDK (matches the auto-injected init.js) -->
+  <script defer src="/__/firebase/12.12.1/firebase-app-compat.js"></script>
+  <script defer src="/__/firebase/12.12.1/firebase-auth-compat.js"></script>
+  <!-- Firebase Hosting auto-injects the project config via this URL. -->
+  <script defer src="/__/firebase/init.js?useEmulator=false"></script>
 
-    <style media="screen">
-      body { background: #ECEFF1; color: rgba(0,0,0,0.87); font-family: Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; }
-      #message { background: white; max-width: 360px; margin: 100px auto 16px; padding: 32px 24px; border-radius: 3px; }
-      #message h2 { color: #ffa100; font-weight: bold; font-size: 16px; margin: 0 0 8px; }
-      #message h1 { font-size: 22px; font-weight: 300; color: rgba(0,0,0,0.6); margin: 0 0 16px;}
-      #message p { line-height: 140%; margin: 16px 0 24px; font-size: 14px; }
-      #message a { display: block; text-align: center; background: #039be5; text-transform: uppercase; text-decoration: none; color: white; padding: 16px; border-radius: 4px; }
-      #message, #message a { box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24); }
-      #load { color: rgba(0,0,0,0.4); text-align: center; font-size: 13px; }
-      @media (max-width: 600px) {
-        body, #message { margin-top: 0; background: white; box-shadow: none; }
-        body { border-top: 16px solid #ffa100; }
-      }
-    </style>
-  </head>
-  <body>
-    <div id="message">
-      <h2>Welcome</h2>
-      <h1>Firebase Hosting Setup Complete</h1>
-      <p>You're seeing this because you've successfully setup Firebase Hosting. Now it's time to go build something extraordinary!</p>
-      <a target="_blank" href="https://firebase.google.com/docs/hosting/">Open Hosting Documentation</a>
+  <style>
+    :root {
+      --bg: #0e1a2b;
+      --card: #ffffff;
+      --ink: #1a2434;
+      --muted: #6b7a8f;
+      --accent: #1f6feb;
+      --accent-hover: #1a5fcc;
+      --error: #c0392b;
+      --border: #d8dee6;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(160deg, #0e1a2b 0%, #1a3a5c 100%);
+    }
+    main {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 400px;
+      background: var(--card);
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.25);
+      padding: 32px;
+    }
+    h1 {
+      margin: 0 0 4px; font-size: 28px; font-weight: 600;
+    }
+    .subtitle { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+    label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+    input {
+      width: 100%; padding: 10px 12px; font-size: 15px;
+      border: 1px solid var(--border); border-radius: 6px;
+      margin-bottom: 14px; font-family: inherit;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    button {
+      width: 100%; padding: 11px; font-size: 15px; font-weight: 500;
+      border: none; border-radius: 6px; cursor: pointer;
+      font-family: inherit;
+      background: var(--accent); color: white;
+      transition: background 0.15s;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    button.secondary {
+      background: white; color: var(--ink);
+      border: 1px solid var(--border);
+      margin-top: 8px;
+    }
+    button.secondary:hover:not(:disabled) { background: #f5f7fa; }
+    .row { display: flex; gap: 8px; }
+    .row button { flex: 1; }
+    .error {
+      color: var(--error); font-size: 13px; margin-top: 12px;
+      min-height: 18px;
+    }
+    .welcome { text-align: center; }
+    .welcome h2 { margin: 0 0 4px; font-size: 22px; }
+    .welcome .tier {
+      display: inline-block; padding: 3px 10px; border-radius: 999px;
+      background: #e8f0fe; color: var(--accent);
+      font-size: 12px; font-weight: 600; text-transform: uppercase;
+      margin: 8px 0 24px;
+    }
+    .welcome .email { color: var(--muted); font-size: 14px; margin: 0 0 4px; }
+    .hidden { display: none; }
+  </style>
+</head>
+
+<body>
+  <main>
+    <div class="card">
+      <!-- Logged-out view -->
+      <div id="auth-view">
+        <h1>SailLine</h1>
+        <p class="subtitle">Real-time race routing for sailors</p>
+
+        <label for="email">Email</label>
+        <input id="email" type="email" autocomplete="email">
+
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password">
+
+        <div class="row">
+          <button id="signin-btn">Sign in</button>
+          <button id="signup-btn" class="secondary">Sign up</button>
+        </div>
+        <button id="google-btn" class="secondary">Continue with Google</button>
+
+        <div id="error" class="error"></div>
+      </div>
+
+      <!-- Logged-in view -->
+      <div id="welcome-view" class="hidden welcome">
+        <h2>Welcome aboard</h2>
+        <p class="email" id="welcome-email"></p>
+        <span class="tier" id="welcome-tier">free</span>
+        <p class="subtitle" id="welcome-message">Ready to sail.</p>
+        <button id="signout-btn" class="secondary">Sign out</button>
+      </div>
     </div>
-    <p id="load">Firebase SDK Loading&hellip;</p>
+  </main>
 
-    <script>
-      document.addEventListener('DOMContentLoaded', function() {
-        const loadEl = document.querySelector('#load');
-        // // 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
-        // // The Firebase SDK is initialized and available here!
-        //
-        // firebase.auth().onAuthStateChanged(user => { });
-        // firebase.database().ref('/path/to/ref').on('value', snapshot => { });
-        // firebase.firestore().doc('/foo/bar').get().then(() => { });
-        // firebase.functions().httpsCallable('yourFunction')().then(() => { });
-        // firebase.messaging().requestPermission().then(() => { });
-        // firebase.storage().ref('/path/to/ref').getDownloadURL().then(() => { });
-        // firebase.analytics(); // call to activate
-        // firebase.analytics().logEvent('tutorial_completed');
-        // firebase.performance(); // call to activate
-        //
-        // // 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+  <script defer>
+    // The compat scripts attach `firebase` to window after defer loads.
+    // Wait for DOMContentLoaded so all scripts (including init.js) have run.
+    window.addEventListener("DOMContentLoaded", () => {
+      const API_URL = "https://sailline-api-105706282249.us-central1.run.app";
 
+      const $ = (id) => document.getElementById(id);
+      const authView = $("auth-view");
+      const welcomeView = $("welcome-view");
+      const errorEl = $("error");
+
+      const showError = (msg) => { errorEl.textContent = msg || ""; };
+      const setBusy = (busy) => {
+        ["signin-btn", "signup-btn", "google-btn"].forEach((id) => {
+          $(id).disabled = busy;
+        });
+      };
+
+      // --- Auth event handlers ---
+      $("signin-btn").addEventListener("click", async () => {
+        showError("");
+        setBusy(true);
         try {
-          let app = firebase.app();
-          let features = [
-            'auth', 
-            'database', 
-            'firestore',
-            'functions',
-            'messaging', 
-            'storage', 
-            'analytics', 
-            'remoteConfig',
-            'performance',
-          ].filter(feature => typeof app[feature] === 'function');
-          loadEl.textContent = `Firebase SDK loaded with ${features.join(', ')}`;
-        } catch (e) {
-          console.error(e);
-          loadEl.textContent = 'Error loading the Firebase SDK, check the console.';
+          await firebase.auth().signInWithEmailAndPassword(
+            $("email").value.trim(),
+            $("password").value
+          );
+        } catch (err) {
+          showError(err.message);
+        } finally {
+          setBusy(false);
         }
       });
-    </script>
-  </body>
+
+      $("signup-btn").addEventListener("click", async () => {
+        showError("");
+        setBusy(true);
+        try {
+          await firebase.auth().createUserWithEmailAndPassword(
+            $("email").value.trim(),
+            $("password").value
+          );
+        } catch (err) {
+          showError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      $("google-btn").addEventListener("click", async () => {
+        showError("");
+        setBusy(true);
+        try {
+          const provider = new firebase.auth.GoogleAuthProvider();
+          await firebase.auth().signInWithPopup(provider);
+        } catch (err) {
+          showError(err.message);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      $("signout-btn").addEventListener("click", () => {
+        firebase.auth().signOut();
+      });
+
+      // --- Auth state listener ---
+      firebase.auth().onAuthStateChanged(async (user) => {
+        if (!user) {
+          authView.classList.remove("hidden");
+          welcomeView.classList.add("hidden");
+          return;
+        }
+
+        // Logged in. Hit the protected endpoint to fetch tier.
+        authView.classList.add("hidden");
+        welcomeView.classList.remove("hidden");
+        $("welcome-email").textContent = user.email || user.uid;
+        $("welcome-tier").textContent = "loading…";
+        $("welcome-message").textContent = "Fetching your profile…";
+
+        try {
+          const token = await user.getIdToken();
+          const res = await fetch(`${API_URL}/api/users/me`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (!res.ok) throw new Error(`API ${res.status}`);
+          const profile = await res.json();
+          $("welcome-tier").textContent = profile.tier;
+          $("welcome-message").textContent =
+            `Welcome, ${profile.tier} sailor.`;
+        } catch (err) {
+          $("welcome-tier").textContent = "error";
+          $("welcome-message").textContent = `Could not load profile: ${err.message}`;
+        }
+      });
+    });
+  </script>
+</body>
 </html>
