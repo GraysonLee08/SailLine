@@ -25,3 +25,6 @@ firebase-admin==6.5.0
 # stripe                            # Payments (week 7)
 # httpx                             # Async HTTP client for Datalastic (week 7)
 # sse-starlette                     # SSE for routing stream (week 6)
+
+# Testing
+pytest==8.3.3
