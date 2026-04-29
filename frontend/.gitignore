@@ -74,3 +74,6 @@ node_modules/
 
 # Backend tests fixtures
 backend/tests/fixtures/*.grib2
+
+# Backend ingest_output
+backend/ingest_output/
