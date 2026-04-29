@@ -54,8 +54,8 @@ def hrrr_url(date: str, cycle: int, fhour: int) -> str:
 class Source:
     name: str
     url_fn: Callable[[str, int, int], str]
-    cycle_step_hours: int     # GFS runs every 6h, HRRR every 1h
-    publish_lag_hours: int    # min wait after cycle before files are stable
+    cycle_step_hours: int
+    publish_lag_hours: int
     default_fhour: int
 
 
@@ -150,6 +150,9 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
     if fhour is None:
         fhour = source.default_fhour
 
+    bbox_env = os.environ.get("WEATHER_BBOX")
+    bbox = tuple(map(float, bbox_env.split(","))) if bbox_env else DEFAULT_BBOX
+
     date, cycle = latest_cycle(source)
     grib_url = source.url_fn(date, cycle, fhour)
     print(f"[{source.name}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
@@ -160,7 +163,7 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
         raise RuntimeError(f"No matching wind fields in {grib_url}.idx")
 
     fd, tmp_path_str = tempfile.mkstemp(suffix=".grib2")
-    os.close(fd)  # Windows won't let us unlink an open file
+    os.close(fd)
     tmp_path = Path(tmp_path_str)
     try:
         download_grib(grib_url, ranges, tmp_path)
@@ -168,20 +171,20 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
             f"[{source.name}] downloaded {tmp_path.stat().st_size / 1024:.1f} KB",
             flush=True,
         )
-        grid = parse_grib_to_wind_grid(tmp_path, source=source.name)
+        grid = parse_grib_to_wind_grid(
+            tmp_path, source=source.name, target_bbox=bbox
+        )
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
         except PermissionError:
-            # Defensive: on Windows, xarray/cfgrib can occasionally hold the file
-            # briefly after close. The OS will clean Temp on its own; not worth dying.
             pass
 
-    bbox_env = os.environ.get("WEATHER_BBOX")
-    bbox = tuple(map(float, bbox_env.split(","))) if bbox_env else DEFAULT_BBOX
     payload = clip_and_serialize(grid, bbox)
     print(
-        f"[{source.name}] clipped to {payload['shape'][0]}x{payload['shape'][1]} grid",
+        f"[{source.name}] grid {payload['shape'][0]}x{payload['shape'][1]} "
+        f"({payload['lats'][0]:.2f}..{payload['lats'][-1]:.2f}N, "
+        f"{payload['lons'][0]:.2f}..{payload['lons'][-1]:.2f}E)",
         flush=True,
     )
 
