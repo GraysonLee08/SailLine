@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code.
 COPY app/ ./app/
+COPY workers/ ./workers/
 
 # Cloud Run injects the PORT env var; default to 8080 for local docker run.
 ENV PORT=8080
