@@ -5,22 +5,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import auth, db
-from app.routers import health, users
+from app import auth, db, redis_client
+from app.routers import health, users, weather
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources for the app's lifetime.
 
-    Currently: the Cloud SQL connection pool and the Firebase Admin SDK.
-    As more services are added (Redis, etc.) initialize them here too.
+    Currently: Firebase Admin SDK, Cloud SQL connection pool, Redis client.
+    As more services are added, initialize them here too.
     """
     auth.initialize()
     await db.startup()
+    await redis_client.startup()
     try:
         yield
     finally:
+        await redis_client.shutdown()
         await db.shutdown()
 
 
@@ -52,6 +54,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(users.router, prefix="/api")
+app.include_router(weather.router)  # router carries its own /api/weather prefix
 
 
 @app.get("/")
