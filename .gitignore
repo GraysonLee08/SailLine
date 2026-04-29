@@ -1,1 +1,45 @@
+# === Python (backend) ===
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
+# === Node (frontend) ===
+node_modules/
+*.log
+npm-debug.log*
+.npm
+.eslintcache
+*.tgz
+
+# === Build output ===
+dist/
+build/
+coverage/
+.nyc_output/
+
+# === Firebase ===
+.firebase/
+firebase-debug.log*
+.dataconnect
+
+# === Env files ===
+.env
+.env.local
+.env.*.local
+
+# === Backend data artifacts ===
+backend/tests/fixtures/*.grib2
+backend/ingest_output/
+
+# === Editors ===
+.vscode/
+.idea/
+
+# === OS ===
+.DS_Store
+Thumbs.db
