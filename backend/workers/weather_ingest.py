@@ -20,6 +20,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+import gzip
+import redis
+from google.cloud import storage
+
 import numpy as np
 
 from app.services.grib import WindGrid, parse_grib_to_wind_grid
@@ -57,11 +61,13 @@ class Source:
     cycle_step_hours: int
     publish_lag_hours: int
     default_fhour: int
+    cache_ttl_seconds: int      # Redis TTL
+    target_resolution_deg: float  # used only for curvilinear (HRRR); GFS ignores
 
 
 SOURCES: dict[str, Source] = {
-    "gfs": Source("gfs", gfs_url, cycle_step_hours=6, publish_lag_hours=5, default_fhour=6),
-    "hrrr": Source("hrrr", hrrr_url, cycle_step_hours=1, publish_lag_hours=2, default_fhour=1),
+    "gfs":  Source("gfs",  gfs_url,  6, 5, 6,  cache_ttl_seconds=6 * 3600, target_resolution_deg=0.25),
+    "hrrr": Source("hrrr", hrrr_url, 1, 2, 1,  cache_ttl_seconds=1 * 3600, target_resolution_deg=0.10),
 }
 
 
@@ -144,6 +150,24 @@ def clip_and_serialize(
 # ---------------------------------------------------------------------------
 # Pipeline
 
+def _write_redis(key: str, ttl: int, blob: bytes) -> None:
+    r = redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", 6379)),
+        socket_timeout=10,
+    )
+    r.setex(key, ttl, blob)
+
+
+def _write_gcs(source_name: str, cycle_iso: str, blob: bytes) -> str:
+    bucket_name = os.environ["GCS_WEATHER_BUCKET"]
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    path = f"{source_name}/{cycle_iso}.json.gz"
+    obj = bucket.blob(path)
+    obj.content_encoding = "gzip"
+    obj.upload_from_string(blob, content_type="application/json")
+    return f"gs://{bucket_name}/{path}"
 
 def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) -> dict:
     source = SOURCES[source_name]
@@ -172,7 +196,10 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
             flush=True,
         )
         grid = parse_grib_to_wind_grid(
-            tmp_path, source=source.name, target_bbox=bbox
+            tmp_path,
+            source=source.name,
+            target_bbox=bbox,
+            target_resolution_deg=source.target_resolution_deg,
         )
     finally:
         try:
@@ -188,19 +215,28 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
         flush=True,
     )
 
+    payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    payload_gz = gzip.compress(payload_json)
+    print(
+        f"[{source.name}] payload {len(payload_json) / 1024:.1f} KB "
+        f"-> gz {len(payload_gz) / 1024:.1f} KB",
+        flush=True,
+    )
+
     if dry_run:
         out_dir = Path(__file__).parent.parent / "ingest_output"
         out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{source.name}_f{fhour:03d}.json"
-        out_path.write_text(json.dumps(payload))
-        print(
-            f"[{source.name}] dry-run -> {out_path} "
-            f"({out_path.stat().st_size / 1024:.1f} KB)",
-            flush=True,
-        )
+        out_path = out_dir / f"{source.name}_f{fhour:03d}.json.gz"
+        out_path.write_bytes(payload_gz)
+        print(f"[{source.name}] dry-run -> {out_path}", flush=True)
     else:
-        raise NotImplementedError(
-            "Redis/GCS writes land in step 3. Use --dry-run for now."
+        cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
+        _write_redis(f"weather:{source.name}:latest", source.cache_ttl_seconds, payload_gz)
+        gcs_uri = _write_gcs(source.name, cycle_iso, payload_gz)
+        print(
+            f"[{source.name}] redis ttl={source.cache_ttl_seconds}s "
+            f"gcs={gcs_uri}",
+            flush=True,
         )
 
     return payload

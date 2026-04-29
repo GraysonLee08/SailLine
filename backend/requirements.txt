@@ -19,13 +19,15 @@ cloud-sql-python-connector[asyncpg]==1.11.0
 # Auth (week 1 — Firebase JWT verification)
 firebase-admin==6.5.0
 
-# Future weeks (commented out until needed):
-# google-cloud-storage              # GCS (week 2)
-# redis==5.1.1                      # Redis cache (week 2)
+# Storage
+google-cloud-storage==3.10.1
+redis==5.1.1
+
+# Testing
+pytest==8.3.3
+
+
 # anthropic                         # Claude API (week 8)
 # stripe                            # Payments (week 7)
 # httpx                             # Async HTTP client for Datalastic (week 7)
 # sse-starlette                     # SSE for routing stream (week 6)
-
-# Testing
-pytest==8.3.3
