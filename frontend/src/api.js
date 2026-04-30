@@ -24,5 +24,8 @@ export async function apiFetch(path, { method = "GET", body } = {}) {
     const text = await res.text().catch(() => "");
     throw new Error(`API ${res.status}: ${text || res.statusText}`);
   }
+
+  // 204 No Content (e.g. DELETE) — nothing to parse.
+  if (res.status === 204) return null;
   return res.json();
 }

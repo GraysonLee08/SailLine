@@ -54,8 +54,8 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(users.router, prefix="/api")
-app.include_router(races.router, prefix="/api")
 app.include_router(weather.router)  # router carries its own /api/weather prefix
+app.include_router(races.router)    # router carries its own /api/races prefix
 
 
 @app.get("/")

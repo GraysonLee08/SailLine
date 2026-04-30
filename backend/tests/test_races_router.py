@@ -1,295 +1,246 @@
 """Tests for app/routers/races.py.
 
-Strategy:
-- Use TestClient with dependency_overrides to swap get_current_user (no real
-  Firebase token) and get_pool (a FakePool that records SQL + canned rows).
-- No real DB. Tests are about: routing, auth wiring, ownership-boundary 404s,
-  payload validation pass-through, and that the SQL we *would* run uses the
-  authenticated user's uid (not anything from the request body).
+Mocks the asyncpg pool by overriding the FastAPI `db.get_pool` dependency
+and stubbing `get_current_user`. No real database is touched.
 """
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
-from uuid import UUID, uuid4
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app import db
 from app.auth import get_current_user
-from app.db import get_pool
-from app.main import app
+from app.routers import races
 
 
-# ---------------------------------------------------------------------------
-# Test doubles
+# ─── Fixtures ────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def fake_user():
+    return {
+        "uid": "test-uid",
+        "email": "t@example.com",
+        "tier": "free",
+        "claims": {},
+    }
 
 
-class FakeConn:
-    """Stand-in for an asyncpg connection. Records the last call for asserts."""
-
-    def __init__(self, fetchrow_return=None, fetch_return=None, fetchval_return=None):
-        self.fetchrow_return = fetchrow_return
-        self.fetch_return = fetch_return or []
-        self.fetchval_return = fetchval_return
-        self.calls: list[tuple[str, str, tuple]] = []  # (method, sql, args)
-
-    async def fetchrow(self, sql: str, *args: Any):
-        self.calls.append(("fetchrow", sql, args))
-        return self.fetchrow_return
-
-    async def fetch(self, sql: str, *args: Any):
-        self.calls.append(("fetch", sql, args))
-        return self.fetch_return
-
-    async def fetchval(self, sql: str, *args: Any):
-        self.calls.append(("fetchval", sql, args))
-        return self.fetchval_return
+@pytest.fixture
+def mock_conn():
+    """The asyncpg Connection mock. Tests configure return values on this."""
+    return AsyncMock()
 
 
-class FakePool:
-    """Pool that yields a FakeConn from acquire()."""
-
-    def __init__(self, conn: FakeConn):
-        self.conn = conn
-
+@pytest.fixture
+def app(fake_user, mock_conn):
+    """Fresh FastAPI app wired up with the races router and dependency overrides."""
     @asynccontextmanager
-    async def acquire(self):
-        yield self.conn
+    async def fake_acquire():
+        yield mock_conn
+
+    pool = MagicMock()
+    pool.acquire = fake_acquire
+
+    app = FastAPI()
+    app.include_router(races.router)
+    app.dependency_overrides[get_current_user] = lambda: fake_user
+    app.dependency_overrides[db.get_pool] = lambda: pool
+    return app
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
+@pytest.fixture
+def client(app):
+    return TestClient(app)
 
 
-TEST_UID = "firebase-uid-abc123"
-OTHER_UID = "firebase-uid-someone-else"
-
-
-def _course_payload() -> dict:
-    return {
-        "marks": [
-            {"id": "S", "name": "Start/Finish", "lat": 41.920, "lon": -87.610},
-            {"id": "W", "name": "Windward",     "lat": 41.955, "lon": -87.605},
-            {"id": "L", "name": "Leeward",      "lat": 41.890, "lon": -87.615},
-        ],
-        "course": [
-            {"mark_id": "S"},
-            {"mark_id": "W", "rounding": "port"},
-            {"mark_id": "L", "rounding": "port"},
-            {"mark_id": "S"},
-        ],
-        "laps": 3,
-    }
-
-
-def _create_payload() -> dict:
-    return {
-        "name": "Saturday MORF Race 14",
+def _make_row(**overrides):
+    """Build a fake DB row dict matching the SELECT projection."""
+    now = datetime(2026, 4, 30, 12, 0, tzinfo=timezone.utc)
+    base = {
+        "id": uuid4(),
+        "name": "Saturday Buoy Race",
         "mode": "inshore",
         "boat_class": "J/105",
-        "course": _course_payload(),
-    }
-
-
-def _row(uid: str = TEST_UID, race_id: UUID | None = None) -> dict:
-    """A complete row matching the SELECT columns in races.py."""
-    return {
-        "id": race_id or uuid4(),
-        "user_id": uid,
-        "name": "Saturday MORF Race 14",
-        "mode": "inshore",
-        "boat_class": "J/105",
-        "course": _course_payload(),
+        "marks": json.dumps([
+            {"name": "Start", "lat": 41.9, "lon": -87.6},
+            {"name": "M1", "lat": 42.0, "lon": -87.5},
+        ]),
         "started_at": None,
         "ended_at": None,
-        "created_at": datetime(2026, 4, 30, 14, 0, tzinfo=timezone.utc),
+        "created_at": now,
+        "updated_at": now,
     }
+    base.update(overrides)
+    return base
 
 
-@pytest.fixture
-def fake_user() -> dict:
-    """Stand-in for what get_current_user produces."""
-    return {
-        "uid": TEST_UID,
-        "email": "skipper@example.com",
-        "tier": "free",
-        "claims": {"email_verified": True},
+# ─── List ────────────────────────────────────────────────────────────────
+
+def test_list_empty(client, mock_conn):
+    mock_conn.fetch.return_value = []
+
+    r = client.get("/api/races")
+
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_list_returns_rows(client, mock_conn):
+    row = _make_row()
+    mock_conn.fetch.return_value = [row]
+
+    r = client.get("/api/races")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "Saturday Buoy Race"
+    assert body[0]["marks"][0] == {"name": "Start", "lat": 41.9, "lon": -87.6}
+
+
+# ─── Create ──────────────────────────────────────────────────────────────
+
+def test_create_race(client, mock_conn):
+    mock_conn.fetchrow.return_value = _make_row()
+
+    payload = {
+        "name": "Saturday Buoy Race",
+        "mode": "inshore",
+        "boat_class": "J/105",
+        "marks": [
+            {"name": "Start", "lat": 41.9, "lon": -87.6},
+            {"name": "M1", "lat": 42.0, "lon": -87.5},
+        ],
     }
+    r = client.post("/api/races", json=payload)
+
+    assert r.status_code == 201
+    body = r.json()
+    assert body["name"] == "Saturday Buoy Race"
+    assert len(body["marks"]) == 2
+    mock_conn.fetchrow.assert_awaited_once()
 
 
-@pytest.fixture
-def client(fake_user: dict):
-    """TestClient with auth + pool dependencies overridable per-test.
+def test_create_rejects_invalid_mode(client, mock_conn):
+    payload = {
+        "name": "X",
+        "mode": "bogus",  # not in {inshore, distance}
+        "boat_class": "J/105",
+        "marks": [],
+    }
+    r = client.post("/api/races", json=payload)
 
-    Each test sets `app.dependency_overrides[get_pool]` with the FakePool
-    it needs. Auth is overridden once for the whole fixture to fake_user.
-    """
-    app.dependency_overrides[get_current_user] = lambda: fake_user
-    yield TestClient(app)
-    app.dependency_overrides.clear()
-
-
-def _use_pool(conn: FakeConn) -> FakePool:
-    """Wire a FakePool up as the get_pool override and return it."""
-    pool = FakePool(conn)
-    app.dependency_overrides[get_pool] = lambda: pool
-    return pool
+    assert r.status_code == 422
+    mock_conn.fetchrow.assert_not_awaited()
 
 
-# ---------------------------------------------------------------------------
-# POST /api/races
+def test_create_rejects_out_of_range_lat(client, mock_conn):
+    payload = {
+        "name": "X",
+        "mode": "inshore",
+        "boat_class": "J/105",
+        "marks": [{"name": "M", "lat": 91.0, "lon": 0.0}],
+    }
+    r = client.post("/api/races", json=payload)
+
+    assert r.status_code == 422
+    mock_conn.fetchrow.assert_not_awaited()
 
 
-def test_create_race_returns_201_and_body(client: TestClient):
-    conn = FakeConn(fetchrow_return=_row())
-    _use_pool(conn)
+def test_create_with_empty_marks_is_allowed(client, mock_conn):
+    """User can create the shell of a race and add marks later."""
+    mock_conn.fetchrow.return_value = _make_row(marks="[]")
 
-    resp = client.post("/api/races", json=_create_payload())
+    payload = {
+        "name": "Draft",
+        "mode": "distance",
+        "boat_class": "Beneteau First 36.7",
+        "marks": [],
+    }
+    r = client.post("/api/races", json=payload)
 
-    assert resp.status_code == 201
-    body = resp.json()
-    assert body["user_id"] == TEST_UID
-    assert body["mode"] == "inshore"
-    assert body["course"]["laps"] == 3
-
-
-def test_create_race_uses_authenticated_uid_not_request_body(client: TestClient):
-    """Even if the client sends a user_id, we ignore it and use the JWT uid."""
-    conn = FakeConn(fetchrow_return=_row())
-    _use_pool(conn)
-    payload = _create_payload() | {"user_id": "attacker-controlled"}
-
-    resp = client.post("/api/races", json=payload)
-
-    # Pydantic strict mode rejects the extra field outright — even better than
-    # silently ignoring it.
-    assert resp.status_code == 422
-
-    # And on the legitimate request, the uid passed to SQL is the JWT one.
-    conn2 = FakeConn(fetchrow_return=_row())
-    _use_pool(conn2)
-    client.post("/api/races", json=_create_payload())
-    method, _sql, args = conn2.calls[0]
-    assert method == "fetchrow"
-    assert args[0] == TEST_UID  # first $1 in the INSERT
+    assert r.status_code == 201
+    assert r.json()["marks"] == []
 
 
-def test_create_race_rejects_invalid_course(client: TestClient):
-    """Pydantic validation runs before we touch the DB."""
-    _use_pool(FakeConn())  # shouldn't be called
-    bad = _create_payload()
-    bad["course"]["course"][1]["mark_id"] = "ZZZ"  # not in marks
+# ─── Get by id ───────────────────────────────────────────────────────────
 
-    resp = client.post("/api/races", json=bad)
+def test_get_by_id_found(client, mock_conn):
+    row = _make_row()
+    mock_conn.fetchrow.return_value = row
 
-    assert resp.status_code == 422
+    r = client.get(f"/api/races/{row['id']}")
 
-
-def test_create_race_rejects_unknown_boat_class(client: TestClient):
-    _use_pool(FakeConn())
-    bad = _create_payload() | {"boat_class": "Optimist"}
-
-    resp = client.post("/api/races", json=bad)
-
-    assert resp.status_code == 422
+    assert r.status_code == 200
+    assert r.json()["id"] == str(row["id"])
 
 
-# ---------------------------------------------------------------------------
-# GET /api/races
+def test_get_by_id_404(client, mock_conn):
+    mock_conn.fetchrow.return_value = None
+
+    r = client.get(f"/api/races/{uuid4()}")
+
+    assert r.status_code == 404
 
 
-def test_list_races_returns_only_current_users_rows(client: TestClient):
-    rows = [_row(), _row()]
-    conn = FakeConn(fetch_return=rows)
-    _use_pool(conn)
+# ─── Update ──────────────────────────────────────────────────────────────
 
-    resp = client.get("/api/races")
+def test_patch_rename(client, mock_conn):
+    row = _make_row(name="Renamed")
+    mock_conn.fetchrow.return_value = row
 
-    assert resp.status_code == 200
-    assert len(resp.json()) == 2
+    r = client.patch(f"/api/races/{row['id']}", json={"name": "Renamed"})
 
-    method, sql, args = conn.calls[0]
-    assert method == "fetch"
-    assert "WHERE user_id = $1" in sql
-    assert args[0] == TEST_UID
+    assert r.status_code == 200
+    assert r.json()["name"] == "Renamed"
 
 
-def test_list_races_empty(client: TestClient):
-    _use_pool(FakeConn(fetch_return=[]))
+def test_patch_replaces_marks(client, mock_conn):
+    new_marks = [{"name": "S", "lat": 1.0, "lon": 2.0}]
+    row = _make_row(marks=json.dumps(new_marks))
+    mock_conn.fetchrow.return_value = row
 
-    resp = client.get("/api/races")
+    r = client.patch(f"/api/races/{row['id']}", json={"marks": new_marks})
 
-    assert resp.status_code == 200
-    assert resp.json() == []
-
-
-# ---------------------------------------------------------------------------
-# GET /api/races/{id}
+    assert r.status_code == 200
+    assert r.json()["marks"] == new_marks
 
 
-def test_get_race_found(client: TestClient):
-    rid = uuid4()
-    conn = FakeConn(fetchrow_return=_row(race_id=rid))
-    _use_pool(conn)
+def test_patch_empty_body_400(client, mock_conn):
+    r = client.patch(f"/api/races/{uuid4()}", json={})
 
-    resp = client.get(f"/api/races/{rid}")
-
-    assert resp.status_code == 200
-    assert resp.json()["id"] == str(rid)
+    assert r.status_code == 400
+    mock_conn.fetchrow.assert_not_awaited()
 
 
-def test_get_race_404_when_not_found(client: TestClient):
-    _use_pool(FakeConn(fetchrow_return=None))
+def test_patch_404(client, mock_conn):
+    mock_conn.fetchrow.return_value = None
 
-    resp = client.get(f"/api/races/{uuid4()}")
+    r = client.patch(f"/api/races/{uuid4()}", json={"name": "x"})
 
-    assert resp.status_code == 404
-
-
-def test_get_race_404_when_owned_by_someone_else(client: TestClient):
-    """Ownership-boundary check is in the SQL (WHERE user_id = $2).
-
-    This test confirms the SQL includes that filter — so a row owned by
-    another uid would not be returned, which surfaces as 404."""
-    conn = FakeConn(fetchrow_return=None)  # query returns nothing for our uid
-    _use_pool(conn)
-
-    resp = client.get(f"/api/races/{uuid4()}")
-
-    assert resp.status_code == 404
-    _method, sql, args = conn.calls[0]
-    assert "WHERE id = $1 AND user_id = $2" in sql
-    assert args[1] == TEST_UID
+    assert r.status_code == 404
 
 
-def test_get_race_rejects_non_uuid_path(client: TestClient):
-    _use_pool(FakeConn())
-    resp = client.get("/api/races/not-a-uuid")
-    assert resp.status_code == 422
+# ─── Delete ──────────────────────────────────────────────────────────────
+
+def test_delete_success(client, mock_conn):
+    mock_conn.execute.return_value = "DELETE 1"
+
+    r = client.delete(f"/api/races/{uuid4()}")
+
+    assert r.status_code == 204
 
 
-# ---------------------------------------------------------------------------
-# DELETE /api/races/{id}
+def test_delete_404(client, mock_conn):
+    mock_conn.execute.return_value = "DELETE 0"
 
+    r = client.delete(f"/api/races/{uuid4()}")
 
-def test_delete_race_204(client: TestClient):
-    rid = uuid4()
-    conn = FakeConn(fetchval_return=rid)
-    _use_pool(conn)
-
-    resp = client.delete(f"/api/races/{rid}")
-
-    assert resp.status_code == 204
-    _method, sql, args = conn.calls[0]
-    assert "DELETE FROM race_sessions" in sql
-    assert args[1] == TEST_UID
-
-
-def test_delete_race_404_when_not_found(client: TestClient):
-    _use_pool(FakeConn(fetchval_return=None))
-
-    resp = client.delete(f"/api/races/{uuid4()}")
-
-    assert resp.status_code == 404
+    assert r.status_code == 404

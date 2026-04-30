@@ -5,9 +5,6 @@
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- ---------------------------------------------------------------------------
--- Auth + user profiles
-
 CREATE TABLE IF NOT EXISTS user_profiles (
     id              TEXT PRIMARY KEY,           -- Firebase Auth UID
     tier            TEXT NOT NULL DEFAULT 'free'
@@ -18,40 +15,30 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- ---------------------------------------------------------------------------
--- Race setup (Week 3)
---
--- One row per race the user creates. The `course` JSONB column holds the
--- marks registry, the lap sequence, and lap count — all validated by
--- Pydantic on the way in (see backend/app/models/race.py).
---
--- boat_class has no CHECK constraint here on purpose: adding a boat class
--- should be a Python deploy, not a SQL migration. The Pydantic enum is the
--- source of truth.
-
+-- Race plans + (eventually) live/completed races. v1 uses this for pre-race
+-- planning only; started_at / ended_at stay NULL until in-race mode lands
+-- in week 6. `name` is added beyond the architecture.md spec for the list UI.
 CREATE TABLE IF NOT EXISTS race_sessions (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     TEXT NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,
     mode        TEXT NOT NULL CHECK (mode IN ('inshore', 'distance')),
     boat_class  TEXT NOT NULL,
-    course      JSONB NOT NULL,
+    marks       JSONB NOT NULL DEFAULT '[]'::jsonb,
     started_at  TIMESTAMPTZ,
     ended_at    TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS race_sessions_user_created_idx
-    ON race_sessions (user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS race_sessions_user_idx
+    ON race_sessions(user_id, created_at DESC);
 
--- ---------------------------------------------------------------------------
--- Grants
---
--- Run as the schema owner (`postgres`) once per database.
--- Future tables auto-grant via the DEFAULT PRIVILEGES statements below.
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON user_profiles  TO sailline;
-GRANT SELECT, INSERT, UPDATE, DELETE ON race_sessions  TO sailline;
+-- Grant the app user (`sailline`) access to existing and future tables.
+-- These statements run as the schema owner (`postgres`) and only need to
+-- happen once per database. Future tables auto-grant via DEFAULT PRIVILEGES.
+GRANT SELECT, INSERT, UPDATE, DELETE ON user_profiles TO sailline;
+GRANT SELECT, INSERT, UPDATE, DELETE ON race_sessions TO sailline;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sailline;
@@ -59,5 +46,5 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO sailline;
 
--- track_points and telemetry_points land in their respective build weeks
--- (see architecture.md §9).
+-- Tables for track_points, telemetry_points are added in their respective
+-- build weeks (see architecture.md §9).
