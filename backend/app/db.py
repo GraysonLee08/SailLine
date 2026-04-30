@@ -10,6 +10,7 @@ responds. Endpoints that need DB access will then return a clear 503.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import asyncpg
@@ -42,6 +43,23 @@ async def _create_connection(*args, **kwargs) -> asyncpg.Connection:
     )
 
 
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    """Per-connection setup: register a JSON/JSONB codec.
+
+    Without this, asyncpg returns JSONB columns as raw JSON strings and
+    expects callers to pass JSON strings on writes. Registering json.dumps /
+    json.loads as the codec lets us pass and receive plain Python dicts —
+    cleaner at the call site, and we avoid sprinkling json.loads() through
+    every router that touches a JSONB column.
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def startup() -> None:
     """Initialize the Connector and asyncpg pool. Non-fatal on failure."""
     global _connector, _pool, _startup_error
@@ -54,6 +72,7 @@ async def startup() -> None:
         # the first acquire() triggers the lazy connect.
         _pool = await asyncpg.create_pool(
             connect=_create_connection,
+            init=_init_connection,
             min_size=0,
             max_size=5,
             command_timeout=10,

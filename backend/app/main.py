@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import auth, db, redis_client
-from app.routers import health, users, weather
+from app.routers import health, races, users, weather
 
 
 @asynccontextmanager
@@ -54,6 +54,7 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(users.router, prefix="/api")
+app.include_router(races.router, prefix="/api")
 app.include_router(weather.router)  # router carries its own /api/weather prefix
 
 
