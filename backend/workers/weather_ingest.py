@@ -14,6 +14,8 @@ import argparse
 import json
 import os
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -82,9 +84,33 @@ def latest_cycle(source: Source) -> tuple[str, int]:
 # Byte-range download via .idx (shared with scripts/download_fixture.py)
 
 
+def _urlopen_with_retries(req, *, timeout: int, max_attempts: int = 3):
+    """urlopen with exponential backoff on 5xx and network errors.
+
+    4xx (including 404 'cycle not yet published') propagates immediately so
+    callers can fail fast instead of waiting through retries on a permanent
+    error. Returns the urlopen response (caller is responsible for using it
+    as a context manager).
+    """
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == max_attempts:
+                raise
+            print(f"  retry {attempt}/{max_attempts} after HTTP {e.code}", flush=True)
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == max_attempts:
+                raise
+            print(f"  retry {attempt}/{max_attempts} after {type(e).__name__}", flush=True)
+        time.sleep(delay)
+        delay *= 2
+
+
 def fetch_ranges(idx_url: str, fields: tuple[str, ...]) -> list[tuple[int, int | None]]:
     """Parse a NOAA .idx file, return (start, end) byte ranges for matching fields."""
-    with urllib.request.urlopen(idx_url, timeout=30) as resp:
+    with _urlopen_with_retries(idx_url, timeout=30) as resp:
         lines = [ln for ln in resp.read().decode("ascii").splitlines() if ln.strip()]
 
     entries: list[tuple[int, int, str]] = []
@@ -107,7 +133,7 @@ def download_grib(grib_url: str, ranges: list[tuple[int, int | None]], out: Path
         for start, end in ranges:
             header = f"bytes={start}-{end if end is not None else ''}"
             req = urllib.request.Request(grib_url, headers={"Range": header})
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with _urlopen_with_retries(req, timeout=120) as resp:
                 f.write(resp.read())
 
 
@@ -150,6 +176,7 @@ def clip_and_serialize(
 # ---------------------------------------------------------------------------
 # Pipeline
 
+
 def _write_redis(key: str, ttl: int, blob: bytes) -> None:
     r = redis.Redis(
         host=os.environ["REDIS_HOST"],
@@ -168,6 +195,7 @@ def _write_gcs(source_name: str, cycle_iso: str, blob: bytes) -> str:
     obj.content_encoding = "gzip"
     obj.upload_from_string(blob, content_type="application/json")
     return f"gs://{bucket_name}/{path}"
+
 
 def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) -> dict:
     source = SOURCES[source_name]
