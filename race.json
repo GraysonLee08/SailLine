@@ -1,0 +1,17 @@
+﻿{
+  "name": "Smoke Test Race",
+  "mode": "inshore",
+  "boat_class": "J/105",
+  "course": {
+    "marks": [
+      {"id": "S", "name": "Start", "lat": 41.92, "lon": -87.61},
+      {"id": "W", "name": "Windward", "lat": 41.95, "lon": -87.60}
+    ],
+    "course": [
+      {"mark_id": "S"},
+      {"mark_id": "W", "rounding": "port"},
+      {"mark_id": "S"}
+    ],
+    "laps": 1
+  }
+}
