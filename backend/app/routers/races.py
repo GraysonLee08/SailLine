@@ -23,7 +23,7 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
@@ -36,12 +36,6 @@ router = APIRouter(prefix="/api/races", tags=["races"])
 # ─── Models ──────────────────────────────────────────────────────────────
 
 class Mark(BaseModel):
-    # Drop description from API responses when it's None, so marks without
-    # a race-book description serialize as just {name, lat, lon} rather
-    # than carrying a "description": null key. Storage is unaffected —
-    # the field just doesn't appear on the wire.
-    model_config = ConfigDict(exclude_none=True)
-
     name: str = Field(min_length=1, max_length=64)
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)

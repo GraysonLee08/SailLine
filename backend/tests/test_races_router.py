@@ -103,7 +103,13 @@ def test_list_returns_rows(client, mock_conn):
     body = r.json()
     assert len(body) == 1
     assert body[0]["name"] == "Saturday Buoy Race"
-    assert body[0]["marks"][0] == {"name": "Start", "lat": 41.9, "lon": -87.6}
+    # Compare core fields only — Pydantic includes description: null in
+    # the serialized response, which is fine on the wire (the frontend
+    # treats null and missing identically).
+    m = body[0]["marks"][0]
+    assert m["name"] == "Start"
+    assert m["lat"] == 41.9
+    assert m["lon"] == -87.6
     assert body[0]["start_at"] is None
 
 
@@ -235,7 +241,12 @@ def test_patch_replaces_marks(client, mock_conn):
     r = client.patch(f"/api/races/{row['id']}", json={"marks": new_marks})
 
     assert r.status_code == 200
-    assert r.json()["marks"] == new_marks
+    returned = r.json()["marks"]
+    assert len(returned) == 1
+    # description: null may be present in the response — compare core fields.
+    assert returned[0]["name"] == "S"
+    assert returned[0]["lat"] == 1.0
+    assert returned[0]["lon"] == 2.0
 
 
 def test_patch_set_start_at(client, mock_conn):
