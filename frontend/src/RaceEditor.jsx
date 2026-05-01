@@ -8,13 +8,8 @@
 // Hovering a marker on the map shows a popup with its name, formatted
 // coords, and (for library marks) the race-book description.
 //
-// Implementation notes:
-// - `marks` is the source of truth. Markers, line, and popups all derive.
-// - Mark rows hold local string state for their lat/lon inputs and commit
-//   to `marks` on blur. This keeps editing smooth without thrashing the
-//   map on every keystroke.
-// - Drag-end and manual coord edits clear `description` because the mark
-//   has moved off its canonical race-book position.
+// Lat/lon input format (deg-min vs decimal) is user-toggleable and
+// persisted to localStorage. Storage and API are always decimal degrees.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -22,12 +17,20 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import { apiFetch } from "./api";
 import { BOAT_CLASSES } from "./lib/boatClasses";
 import { COURSE_FAMILIES, buildCourseMarks } from "./lib/morfCourses";
-import { formatLat, formatLon, formatDecimal, parseCoord } from "./lib/latlon";
+import {
+  formatLat,
+  formatLon,
+  formatLatInput,
+  formatLonInput,
+  formatDecimal,
+  parseCoord,
+} from "./lib/latlon";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
 const DEFAULT_CENTER = [-87.55, 41.85]; // Centered on SA7
 const DEFAULT_ZOOM = 11;
+const COORD_FORMAT_KEY = "sailline.coordFormat";
 
 export default function RaceEditor({ raceId, onClose, onSaved }) {
   const isNew = !raceId;
@@ -37,11 +40,27 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   const [boatClass, setBoatClass] = useState(BOAT_CLASSES[0]);
   const [marks, setMarks] = useState([]);
 
+  // 'dm' = deg-decimal-min (sailor default), 'decimal' = decimal degrees.
+  // Persisted so it sticks across sessions / races.
+  const [coordFormat, setCoordFormat] = useState(() => {
+    try {
+      return localStorage.getItem(COORD_FORMAT_KEY) || "dm";
+    } catch {
+      return "dm";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(COORD_FORMAT_KEY, coordFormat);
+    } catch {
+      /* localStorage disabled */
+    }
+  }, [coordFormat]);
+
   const [loading, setLoading] = useState(!isNew);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
 
-  // Stable ref so map handlers can update marks without rebinding.
   const setMarksRef = useRef(setMarks);
   setMarksRef.current = setMarks;
 
@@ -116,9 +135,6 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   }, []);
 
   // ── Sync markers + course line whenever positions/order change ────
-  // Keying on positions+names (not the full mark objects) means that
-  // editing inputs in the sidebar that haven't committed yet doesn't
-  // thrash the map.
   const syncKey = useMemo(
     () => marks.map((m) => `${m.name}|${m.lat}|${m.lon}`).join("~"),
     [marks],
@@ -140,7 +156,6 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         closeOnClick: false,
       }).setHTML(buildPopupHTML(mark));
 
-      // Show on hover. Mapbox's setPopup binds to click; we want hover.
       el.addEventListener("mouseenter", () => {
         popup.setLngLat([mark.lon, mark.lat]).addTo(map);
       });
@@ -152,7 +167,6 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 
       marker.on("dragend", () => {
         const ll = marker.getLngLat();
-        // Drag invalidates description (mark is no longer at canonical pos).
         setMarksRef.current((prev) =>
           prev.map((m, idx) =>
             idx === i
@@ -177,7 +191,6 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       });
     }
 
-    // First-time fit when loading an existing race or applying a preset.
     if (!fittedRef.current && marks.length > 0) {
       fitToMarks(map, marks);
       fittedRef.current = true;
@@ -210,7 +223,6 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       prev.map((m, idx) => (idx === i ? { ...m, name: value } : m)),
     );
 
-  // Edits to lat/lon clear description for the same reason as drag.
   const updateCoord = (i, field, value) =>
     setMarks((prev) =>
       prev.map((m, idx) =>
@@ -240,7 +252,7 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       return;
     }
     setMarks(next);
-    fittedRef.current = false; // refit to the new course
+    fittedRef.current = false;
   };
 
   // ── Save ──────────────────────────────────────────────────────────
@@ -349,7 +361,12 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
               </select>
             </Section>
 
-            <Section label={`Course (${marks.length})`}>
+            <Section
+              label={`Course (${marks.length})`}
+              action={
+                <FormatToggle value={coordFormat} onChange={setCoordFormat} />
+              }
+            >
               {marks.length === 0 ? (
                 <p style={styles.hint}>
                   Pick a MORF course above, click anywhere on the map to drop a
@@ -362,6 +379,7 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
                       key={i}
                       index={i}
                       mark={m}
+                      format={coordFormat}
                       isFirst={i === 0}
                       isLast={i === marks.length - 1}
                       onRename={(v) => renameMark(i, v)}
@@ -389,31 +407,39 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 
 // ── Mark row (local string state, commits on blur) ──────────────────
 
-function MarkRow({ index, mark, isFirst, isLast, onRename, onLat, onLon, onUp, onDown, onDelete }) {
-  // Local strings keep the input cursor stable while typing. We commit
-  // to parent state on blur or Enter.
-  const [latStr, setLatStr] = useState(formatDecimal(mark.lat));
-  const [lonStr, setLonStr] = useState(formatDecimal(mark.lon));
+function MarkRow({
+  index, mark, format, isFirst, isLast,
+  onRename, onLat, onLon, onUp, onDown, onDelete,
+}) {
+  // Pick formatters based on the active format. parseCoord handles both
+  // formats regardless, so users can still paste decimal into a deg-min
+  // input (or vice versa) — we just re-format on commit.
+  const fmtLat = format === "dm" ? formatLatInput : formatDecimal;
+  const fmtLon = format === "dm" ? formatLonInput : formatDecimal;
 
-  // If the underlying mark coords change from elsewhere (drag, course load,
-  // reorder), reset our local strings.
-  useEffect(() => { setLatStr(formatDecimal(mark.lat)); }, [mark.lat]);
-  useEffect(() => { setLonStr(formatDecimal(mark.lon)); }, [mark.lon]);
+  const [latStr, setLatStr] = useState(fmtLat(mark.lat));
+  const [lonStr, setLonStr] = useState(fmtLon(mark.lon));
 
-  const commit = (str, setStr, current, onCommit) => {
+  // Resync local strings whenever the underlying value or the active
+  // format changes (e.g. drag, course load, format toggle).
+  useEffect(() => { setLatStr(fmtLat(mark.lat)); }, [mark.lat, format]);
+  useEffect(() => { setLonStr(fmtLon(mark.lon)); }, [mark.lon, format]);
+
+  const commit = (str, setStr, current, fmt, onCommit) => {
     const v = parseCoord(str);
     if (Number.isFinite(v)) {
       onCommit(v);
-      setStr(formatDecimal(v));
+      setStr(fmt(v));
     } else {
-      // Revert to last good value.
-      setStr(formatDecimal(current));
+      setStr(fmt(current));
     }
   };
+  const onLatBlur = () => commit(latStr, setLatStr, mark.lat, fmtLat, onLat);
+  const onLonBlur = () => commit(lonStr, setLonStr, mark.lon, fmtLon, onLon);
+  const onKey = (e) => { if (e.key === "Enter") e.target.blur(); };
 
-  const onLatBlur = () => commit(latStr, setLatStr, mark.lat, onLat);
-  const onLonBlur = () => commit(lonStr, setLonStr, mark.lon, onLon);
-  const onKey = (e, blur) => { if (e.key === "Enter") e.target.blur(); };
+  const placeholderLat = format === "dm" ? "41 51.17 N" : "41.85283";
+  const placeholderLon = format === "dm" ? "87 33.41 W" : "-87.55683";
 
   return (
     <li style={styles.markRow}>
@@ -435,18 +461,18 @@ function MarkRow({ index, mark, isFirst, isLast, onRename, onLat, onLon, onUp, o
           onChange={(e) => setLatStr(e.target.value)}
           onBlur={onLatBlur}
           onKeyDown={onKey}
-          placeholder="lat"
+          placeholder={placeholderLat}
           style={styles.coordInput}
-          title="Decimal degrees (e.g. 41.85283) or deg-min (41 51.17 N)"
+          title="Decimal (41.85283) or deg-min (41 51.17 N) both accepted"
         />
         <input
           value={lonStr}
           onChange={(e) => setLonStr(e.target.value)}
           onBlur={onLonBlur}
           onKeyDown={onKey}
-          placeholder="lon"
+          placeholder={placeholderLon}
           style={styles.coordInput}
-          title="Decimal degrees (e.g. -87.55683) or deg-min (87 33.41 W)"
+          title="Decimal (-87.55683) or deg-min (87 33.41 W) both accepted"
         />
       </div>
     </li>
@@ -455,10 +481,13 @@ function MarkRow({ index, mark, isFirst, isLast, onRename, onLat, onLon, onUp, o
 
 // ── Subcomponents ───────────────────────────────────────────────────
 
-function Section({ label, children }) {
+function Section({ label, action, children }) {
   return (
     <div style={styles.section}>
-      <span style={styles.label}>{label}</span>
+      <div style={styles.sectionHeader}>
+        <span style={styles.label}>{label}</span>
+        {action}
+      </div>
       {children}
     </div>
   );
@@ -478,6 +507,29 @@ function ModeRadio({ value, current, onChange, children }) {
       <input type="radio" checked={checked} onChange={() => onChange(value)} style={{ display: "none" }} />
       {children}
     </label>
+  );
+}
+
+function FormatToggle({ value, onChange }) {
+  return (
+    <div style={styles.formatToggle} role="group" aria-label="Coordinate format">
+      <FormatBtn active={value === "dm"} onClick={() => onChange("dm")}>Deg-min</FormatBtn>
+      <FormatBtn active={value === "decimal"} onClick={() => onChange("decimal")}>Decimal</FormatBtn>
+    </div>
+  );
+}
+function FormatBtn({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        ...styles.formatBtn,
+        background: active ? "var(--ink)" : "var(--paper)",
+        color: active ? "var(--paper)" : "var(--ink-3)",
+      }}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -531,8 +583,6 @@ function createMarkerElement(label) {
   return el;
 }
 
-// HTML for the hover popup. We escape user-controlled fields (mark name,
-// description) since they can contain anything once a user edits them.
 function buildPopupHTML(mark) {
   const esc = (s) =>
     String(s ?? "")
@@ -568,10 +618,13 @@ const styles = {
   sidebar: { width: SIDEBAR_WIDTH, flexShrink: 0, borderLeft: "1px solid var(--rule)", background: "var(--paper)", display: "flex", flexDirection: "column", overflow: "hidden" },
   scrollArea: { flex: 1, overflowY: "auto", padding: "20px" },
   section: { marginBottom: 18 },
-  label: { display: "block", fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 500 },
+  sectionHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 },
+  label: { fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 },
   input: { width: "100%", height: 40, padding: "0 12px", border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 14, color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
   radioGroup: { display: "flex", gap: 8 },
   radio: { flex: 1, height: 40, border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, cursor: "pointer", transition: "background 0.1s, border-color 0.1s, color 0.1s" },
+  formatToggle: { display: "flex", border: "1px solid var(--rule)", borderRadius: "var(--r-sm)", overflow: "hidden" },
+  formatBtn: { border: "none", padding: "4px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.04em", fontWeight: 500 },
   hint: { fontSize: 13, color: "var(--ink-3)", margin: "0 0 12px", lineHeight: 1.5 },
   marksList: { listStyle: "none", padding: 0, margin: "0 0 12px" },
   markRow: { padding: "10px 0", borderBottom: "1px solid var(--rule)" },
