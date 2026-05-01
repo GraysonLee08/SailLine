@@ -58,3 +58,9 @@ GRANT USAGE, CREATE ON SCHEMA public TO sailline;
 GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES
     ON user_profiles, race_sessions
     TO sailline;
+
+-- Ownership catch-up: explicitly set the owner to sailline for tables
+-- that already exist but were created by the `postgres` user before Alembic
+-- took over. This fixes the permission errors on subsequent migration applies.
+ALTER TABLE IF EXISTS race_sessions OWNER TO sailline;
+ALTER TABLE IF EXISTS user_profiles OWNER TO sailline;
