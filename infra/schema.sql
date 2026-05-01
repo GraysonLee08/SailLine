@@ -6,7 +6,7 @@
 -- What lives here:
 --   - PostGIS extension
 --   - Default privileges so future tables auto-grant to the `sailline` user
---   - Catch-up grants on any existing tables (handles the prod DB)
+--   - Catch-up grants on the pre-Alembic tables (user_profiles, race_sessions)
 --
 -- What does NOT live here (table DDL):
 --   - All `CREATE TABLE`, `CREATE INDEX`, and column changes go through
@@ -17,14 +17,21 @@
 --
 -- Apply from Cloud Shell as the `postgres` superuser:
 --   gcloud sql connect sailline-db --user=postgres --database=sailline_app < infra/schema.sql
+-- Or via cloud-sql-proxy + psql:
+--   psql -h 127.0.0.1 -U postgres -d sailline_app -f infra/schema.sql
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 
 -- Default privileges: tables created hereafter (by Alembic, by hand,
--- whoever) automatically grant DML to the app user. This is what lets
--- migrations run as `sailline` without a follow-up GRANT step.
+-- whoever) automatically grant DML + REFERENCES to the app user.
+--
+-- REFERENCES is needed whenever a new table adds a foreign key pointing
+-- at an existing table — Postgres requires REFERENCES on the *target* of
+-- a FK, not just the source. Missing this is what caused the 0002
+-- migration's first apply to fail with `permission denied for table
+-- race_sessions` on 2026-05-01.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sailline;
+    GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES ON TABLES TO sailline;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO sailline;
@@ -33,13 +40,21 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- new tables and the `alembic_version` tracking table.
 GRANT USAGE, CREATE ON SCHEMA public TO sailline;
 
--- Catch-up grants for any tables that already exist. DEFAULT PRIVILEGES
--- only affects future objects, so existing tables (user_profiles,
--- race_sessions on the prod DB) need their grants applied directly.
--- Idempotent — re-running just re-grants what's already granted.
-DO $$
-BEGIN
-    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sailline';
-    EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO sailline';
-END
-$$;
+-- Catch-up grants for the pre-Alembic tables. DEFAULT PRIVILEGES only
+-- affects future objects, so the two tables that existed before Alembic
+-- was wired up (user_profiles, race_sessions) need their grants applied
+-- directly. Both are owned by `postgres`.
+--
+-- Listing tables explicitly rather than using `GRANT ON ALL TABLES IN
+-- SCHEMA public` is deliberate: GRANT requires ownership, and the
+-- `alembic_version` table is owned by `sailline` (created by Alembic
+-- the first time it ran). The ALL form fails with `permission denied
+-- for table alembic_version` even when run as superuser, because
+-- "all tables" includes tables postgres can't grant on.
+--
+-- New tables created by Alembic going forward are owned by `sailline`
+-- and need no explicit GRANT — sailline already has every privilege
+-- on tables it owns.
+GRANT SELECT, INSERT, UPDATE, DELETE, REFERENCES
+    ON user_profiles, race_sessions
+    TO sailline;

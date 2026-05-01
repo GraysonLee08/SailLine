@@ -10,7 +10,7 @@ SailLine uses [Alembic](https://alembic.sqlalchemy.org/) to manage Postgres sche
 
 The pre-Alembic workflow used `CREATE TABLE IF NOT EXISTS` in `infra/schema.sql`. That makes re-runs idempotent but blind to schema drift — if a table already exists with a different shape, the script silently no-ops. We hit this exact failure on 2026-04-30 (see `docs/2026-04-30-session-summary.md`): the script reported `CREATE TABLE` and exited cleanly while the table on disk still had the old columns. Three re-applies before we caught it.
 
-Alembic tracks applied revisions in a dedicated `alembic_version` table. Migrations fail loudly when something is wrong, and `--sql` mode lets us review the exact SQL before running it.
+Alembic tracks applied revisions in a dedicated `alembic_version` table. Migrations fail loudly when something is wrong, and a real DB connection means the migration runner sees the actual current state instead of guessing.
 
 ---
 
@@ -23,7 +23,8 @@ backend/
     ├── env.py                     # builds DB URL from env vars; runs migrations
     ├── script.py.mako             # template for new migration files
     └── versions/
-        └── 0001_baseline.py       # captures user_profiles + race_sessions
+        ├── 0001_baseline.py       # captures user_profiles + race_sessions
+        └── 0002_add_track_points.py
 ```
 
 All `alembic` commands must be run from the `backend/` directory (where `alembic.ini` lives).
@@ -49,7 +50,7 @@ psql -h 127.0.0.1 -U postgres -d sailline_app -f ../infra/schema.sql
 
 # Then run migrations as the app user:
 alembic upgrade head
-alembic current   # confirms HEAD revision
+alembic current
 ```
 
 ### Production (one-time stamp)
@@ -59,26 +60,32 @@ The production database already contains `user_profiles` and `race_sessions` fro
 From Cloud Shell:
 
 ```bash
-# Start the proxy in the background. cloud-sql-proxy is pre-installed in Cloud Shell.
+# Reusable venv for the Alembic CLI (~/sailline-venv persists between sessions)
+python3 -m venv ~/sailline-venv
+source ~/sailline-venv/bin/activate
+pip install alembic==1.13.3 'psycopg[binary]==3.2.3'
+
+# Forward the private-IP Cloud SQL instance to localhost
 cloud-sql-proxy sailline:us-central1:sailline-db &
 
-# Pull the app password from Secret Manager.
+# Apply the bootstrap as superuser
+export PGPASSWORD=$(gcloud secrets versions access latest --secret=sailline-db-postgres-password)
+psql -h 127.0.0.1 -U postgres -d sailline_app -f infra/schema.sql
+unset PGPASSWORD
+
+# Stamp the DB at 0001 as the app user
 export DB_USER=sailline DB_NAME=sailline_app
 export DB_PASSWORD=$(gcloud secrets versions access latest --secret=sailline-db-app-password)
 export DB_HOST=127.0.0.1 DB_PORT=5432
-
-# Apply the slimmed-down bootstrap (CREATE EXTENSION + GRANTs are
-# idempotent; the new GRANT USAGE, CREATE on schema public is what
-# lets the next step actually work).
-gcloud sql connect sailline-db --user=postgres --database=sailline_app < infra/schema.sql
-
-# Stamp the DB as already at revision 0001.
 cd backend
 alembic stamp 0001
 alembic current   # → 0001 (head)
 
-# Tear down the proxy.
+# Tear down
+unset DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+deactivate
 kill %1
+cd ~
 ```
 
 This is a one-time operation. Future migrations on prod use `upgrade`, not `stamp`.
@@ -101,21 +108,12 @@ def upgrade() -> None:
         CREATE TABLE track_points (
             id          BIGSERIAL PRIMARY KEY,
             session_id  UUID REFERENCES race_sessions ON DELETE CASCADE,
-            recorded_at TIMESTAMPTZ NOT NULL,
-            position    GEOGRAPHY(POINT, 4326) NOT NULL,
-            speed_kts   FLOAT,
-            heading_deg FLOAT,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            ...
         )
-    """)
-    op.execute("""
-        CREATE INDEX track_session_time_idx
-            ON track_points(session_id, recorded_at)
     """)
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS track_session_time_idx")
     op.execute("DROP TABLE IF EXISTS track_points")
 ```
 
@@ -127,33 +125,38 @@ Bump the revision number sequentially: `0001`, `0002`, `0003`. The `down_revisio
 
 ## Applying migrations
 
-### Preview the SQL first
+### Don't bother with `--sql` for preview
 
-For anything non-trivial, generate the SQL without applying it:
+Alembic's `upgrade head --sql` is offline mode — it generates SQL without connecting to the DB, which means it can't see the `alembic_version` table and assumes the DB is empty. The output regenerates *every* migration from scratch, not just the unapplied ones. Useless for our setup.
+
+If you want to confirm what will run before running it, use:
 
 ```bash
-alembic upgrade head --sql
+alembic current     # what revision is the DB actually at?
+alembic history     # all migrations and their order
+alembic heads       # latest revision in the codebase
 ```
 
-Prints the exact statements that would run. Especially worth doing for `ALTER TABLE`, anything with data movement, or anything you've never run before.
+The gap between `current` and `heads` is exactly what `upgrade` will apply.
 
 ### Apply against production
 
 From Cloud Shell:
 
 ```bash
+source ~/sailline-venv/bin/activate
 cloud-sql-proxy sailline:us-central1:sailline-db &
+
 export DB_USER=sailline DB_NAME=sailline_app
 export DB_PASSWORD=$(gcloud secrets versions access latest --secret=sailline-db-app-password)
 export DB_HOST=127.0.0.1 DB_PORT=5432
 
 cd backend
 alembic upgrade head
-alembic current   # confirm new HEAD
-kill %1           # stop the proxy
+alembic current
 ```
 
-Then **flush the connection pool** on the running API so it picks up the new schema. Without this, asyncpg can keep stale prepared statements that reference old column names — exactly the failure mode that caused the third re-debug yesterday:
+Then **flush the connection pool** on the running API so it picks up the new schema. Without this, asyncpg can keep stale prepared statements that reference old column names — exactly the failure mode that caused the third re-debug on 2026-04-30:
 
 ```bash
 gcloud run services update sailline-api \
@@ -162,6 +165,15 @@ gcloud run services update sailline-api \
 ```
 
 The BUMP env var forces a new revision, which gives every container a fresh asyncpg pool.
+
+Cleanup:
+
+```bash
+unset DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+deactivate
+kill %1
+cd ~
+```
 
 ### Rolling back
 
@@ -173,9 +185,17 @@ Only meaningful in dev. In production, prefer rolling forward with a new migrati
 
 ---
 
-## Permissions note
+## Permissions
 
-Most migrations should run cleanly as the `sailline` app user. `infra/schema.sql` set `ALTER DEFAULT PRIVILEGES`, so any new table created by `sailline` is automatically usable by `sailline`. Migrations that need superuser (e.g. installing a new extension) should run as `postgres`:
+The `sailline` app user runs migrations. `infra/schema.sql` grants it everything it needs in the typical case:
+
+- `SELECT, INSERT, UPDATE, DELETE, REFERENCES` on existing tables (catch-up grants for `user_profiles` and `race_sessions`)
+- `ALTER DEFAULT PRIVILEGES` so new tables created by Alembic auto-grant the same set
+- `USAGE, CREATE` on schema `public` so Alembic can create `alembic_version` and new tables
+
+Tables created by Alembic going forward are **owned by sailline**, not postgres. Owners have all privileges implicitly, so no follow-up GRANT is ever needed for FKs between Alembic-created tables.
+
+The only situation requiring superuser is something the app user inherently can't do — installing a new extension, creating a new role, etc:
 
 ```bash
 export DB_USER=postgres
@@ -183,7 +203,7 @@ export DB_PASSWORD=$(gcloud secrets versions access latest --secret=sailline-db-
 alembic upgrade head
 ```
 
-Then switch the env vars back to `sailline` for normal operation.
+Then switch back to `sailline` for normal operation.
 
 ---
 
@@ -197,6 +217,15 @@ You ran `alembic` from the wrong directory. It must be run from `backend/` where
 
 **`relation "user_profiles" already exists` on production**
 You ran `alembic upgrade` instead of `alembic stamp 0001` for the initial sync. Run `alembic stamp 0001` to mark the revision applied without re-running the DDL, then carry on.
+
+**`permission denied for table <pre-Alembic table>` while running a migration**
+The migration is creating a FK pointing at one of the original tables (`user_profiles` or `race_sessions`) and the catch-up grants in `infra/schema.sql` weren't applied. Re-apply `infra/schema.sql` as `postgres` — the `GRANT ... REFERENCES` block is idempotent. If for some reason the catch-up GRANT fails, run it manually:
+
+```sql
+GRANT REFERENCES ON user_profiles, race_sessions TO sailline;
+```
+
+Don't use `GRANT ... ON ALL TABLES IN SCHEMA public` — that includes `alembic_version` (owned by sailline, not postgres) and the whole statement aborts.
 
 **`permission denied for schema public` when running migrations as `sailline`**
 The new `infra/schema.sql` grants `USAGE, CREATE on schema public` to `sailline`, but if your prod DB was bootstrapped with the old version this grant is missing. Re-apply the bootstrap as `postgres` (it's idempotent) and retry.
