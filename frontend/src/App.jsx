@@ -1,14 +1,22 @@
 // App — listens to Firebase auth state and routes between
 // AuthView (logged out) and AppView (logged in).
 //
-// We intentionally keep this thin. Future routing (pre-race, in-race,
-// settings) will live inside AppView once those screens exist.
+// AppView is lazy-loaded so the auth-gate path doesn't pull mapbox-gl
+// or any of the post-login bundle. The Suspense fallback intentionally
+// matches the pre-auth-resolution splash below — visually a single
+// continuous loading state from page open through authenticated render.
 
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { onAuthStateChanged } from "firebase/auth";
 import { auth } from "./firebase";
 import AuthView from "./AuthView.jsx";
-import AppView from "./AppView.jsx";
+
+const AppView = lazy(() => import("./AppView.jsx"));
+
+// Single splash element reused for both pre-auth-resolution and the
+// AppView chunk download. Identical-by-design so the two states feel
+// like one continuous "still loading" rather than two flashes.
+const SPLASH = <div style={{ height: "100vh", background: "var(--night)" }} />;
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -26,8 +34,16 @@ export default function App() {
   if (!authReady) {
     // Pre-auth-resolution flash. Keep it dark so we don't flash
     // the light form while Firebase resolves the cached session.
-    return <div style={{ height: "100vh", background: "var(--night)" }} />;
+    return SPLASH;
   }
 
-  return user ? <AppView user={user} /> : <AuthView />;
+  if (!user) {
+    return <AuthView />;
+  }
+
+  return (
+    <Suspense fallback={SPLASH}>
+      <AppView user={user} />
+    </Suspense>
+  );
 }

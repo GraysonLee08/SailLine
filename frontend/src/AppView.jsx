@@ -6,14 +6,26 @@
 // Persisted to localStorage so it survives reloads, but cleared
 // automatically once the race is more than 6h past its start time —
 // no point keeping a finished race front-and-center the next morning.
+//
+// Code splitting:
+//   - MapView is eagerly imported. By the time we get here, the AppView
+//     chunk has already paid the mapbox-gl cost — adding a Suspense
+//     boundary around the always-mounted base layer would just flicker
+//     on every login without saving anything.
+//   - RacesListView and RaceEditor are lazy-loaded. Both only mount on
+//     user navigation (menu drawer / button click), so the common
+//     "open the app, look at wind on the map" path doesn't pull editor
+//     code. Each chunk is cached after first use, so the fallback
+//     effectively never appears more than once per session.
 
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiFetch } from "./api";
 import { MapView } from "./components/MapView.jsx";
-import RacesListView from "./RacesListView.jsx";
-import RaceEditor from "./RaceEditor.jsx";
+
+const RacesListView = lazy(() => import("./RacesListView.jsx"));
+const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
 
@@ -141,34 +153,38 @@ export default function AppView({ user }) {
 
       {view.kind === "races" && (
         <div style={{ ...styles.layer, zIndex: 1 }}>
-          <RacesListView
-            onBack={() => setView({ kind: "map" })}
-            onCreate={() =>
-              setView({ kind: "editor", raceId: null, returnTo: "races" })
-            }
-            onOpen={(race) => {
-              setActive(race);
-              setView({ kind: "map" });
-            }}
-            onEdit={(id) =>
-              setView({ kind: "editor", raceId: id, returnTo: "races" })
-            }
-          />
+          <Suspense fallback={<ViewLoading />}>
+            <RacesListView
+              onBack={() => setView({ kind: "map" })}
+              onCreate={() =>
+                setView({ kind: "editor", raceId: null, returnTo: "races" })
+              }
+              onOpen={(race) => {
+                setActive(race);
+                setView({ kind: "map" });
+              }}
+              onEdit={(id) =>
+                setView({ kind: "editor", raceId: id, returnTo: "races" })
+              }
+            />
+          </Suspense>
         </div>
       )}
 
       {view.kind === "editor" && (
         <div style={{ ...styles.layer, zIndex: 2 }}>
-          <RaceEditor
-            raceId={view.raceId}
-            onClose={() => setView({ kind: view.returnTo || "races" })}
-            onSaved={(race) => {
-              // After save, the just-saved race becomes active and we
-              // land on the map. Map = single pane of glass.
-              setActive(race);
-              setView({ kind: "map" });
-            }}
-          />
+          <Suspense fallback={<ViewLoading />}>
+            <RaceEditor
+              raceId={view.raceId}
+              onClose={() => setView({ kind: view.returnTo || "races" })}
+              onSaved={(race) => {
+                // After save, the just-saved race becomes active and we
+                // land on the map. Map = single pane of glass.
+                setActive(race);
+                setView({ kind: "map" });
+              }}
+            />
+          </Suspense>
         </div>
       )}
 
@@ -193,6 +209,18 @@ export default function AppView({ user }) {
         tier={profile?.tier ?? "…"}
         onNavigate={goto}
       />
+    </div>
+  );
+}
+
+// Suspense fallback for lazy-loaded RacesListView / RaceEditor. Sits
+// inside the layer wrapper so it inherits the right z-index. After the
+// first load each chunk is cached and the fallback effectively never
+// appears again in the session.
+function ViewLoading() {
+  return (
+    <div style={styles.viewLoading}>
+      <span style={styles.viewLoadingText}>Loading…</span>
     </div>
   );
 }
@@ -270,6 +298,18 @@ const styles = {
   layer: {
     position: "absolute",
     inset: 0,
+  },
+  viewLoading: {
+    position: "absolute",
+    inset: 0,
+    background: "var(--paper)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewLoadingText: {
+    color: "var(--ink-3)",
+    fontSize: 14,
   },
   menuButton: {
     position: "absolute",
