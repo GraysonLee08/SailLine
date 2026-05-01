@@ -5,8 +5,9 @@ scoped to the calling user (no race is ever returned across users).
 
 Marks are stored as JSONB. asyncpg returns JSONB as a string by default
 (no codec registered), so we explicitly json.loads on the way out and
-json.dumps on the way in. Each mark is `{name, lat, lon}` — `kind`
-(start/finish) is implicit by position to keep the v1 form simple.
+json.dumps on the way in. Each mark is `{name, lat, lon, description?}`.
+The optional `description` lets the editor surface race book metadata for
+named marks (e.g. "205° - 1.3 miles from Four Mile Crib") in hover popups.
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ class Mark(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
+    description: Optional[str] = Field(default=None, max_length=500)
 
 
 class RaceCreate(BaseModel):
@@ -78,7 +80,7 @@ def _decode_marks(value: Any) -> list[dict]:
         return []
     if isinstance(value, (bytes, str)):
         return json.loads(value)
-    return value  # already decoded (codec registered upstream, or test mock)
+    return value
 
 
 def _row_to_race(row: asyncpg.Record) -> dict:
@@ -98,9 +100,10 @@ def _row_to_race(row: asyncpg.Record) -> dict:
 def _marks_json(marks: list[Mark] | list[dict]) -> str:
     """Serialize marks to a JSON string for the ::jsonb cast.
 
-    Accepts both Pydantic Mark instances and already-dumped dicts (the
-    latter happens when the router is hit from `RaceUpdate.model_dump`)."""
-    return json.dumps([m.model_dump() if isinstance(m, Mark) else m for m in marks])
+    `exclude_none=True` keeps the JSONB compact when description is unset."""
+    return json.dumps(
+        [m.model_dump(exclude_none=True) if isinstance(m, Mark) else m for m in marks]
+    )
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────
@@ -221,7 +224,6 @@ async def delete_race(
             race_id,
             user["uid"],
         )
-    # asyncpg returns "DELETE <rowcount>" — bail with 404 if nothing matched
     if result.rsplit(" ", 1)[-1] == "0":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
     return None
