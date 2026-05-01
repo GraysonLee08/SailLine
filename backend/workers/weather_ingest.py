@@ -1,12 +1,17 @@
-"""NOAA weather ingestion -> wind grid JSON, clipped to a bbox.
+"""NOAA weather ingestion -> wind grid JSON, clipped to a region bbox.
 
-Production: runs as a Cloud Run Job, writes to Redis + GCS.
+Production: runs as a Cloud Run Job per (source, region), writes to Redis + GCS.
 Local: --dry-run flag writes JSON to ./ingest_output/ instead.
 
 Usage (from backend/):
     python -m workers.weather_ingest gfs --dry-run
-    python -m workers.weather_ingest hrrr --dry-run
-    python -m workers.weather_ingest gfs --fhour 12 --dry-run
+    python -m workers.weather_ingest hrrr --region chesapeake --dry-run
+    python -m workers.weather_ingest gfs --region hawaii --fhour 12 --dry-run
+
+--region defaults to great_lakes so existing infra (the original
+sailline-ingest-{source} Cloud Run Jobs that don't yet pass --region)
+continues to work after deploy. New region-specific jobs pass --region
+explicitly. See docs/multi-region-rollout.md.
 """
 from __future__ import annotations
 
@@ -28,10 +33,12 @@ from google.cloud import storage
 
 import numpy as np
 
+from app.regions import REGIONS, Region
 from app.services.grib import WindGrid, parse_grib_to_wind_grid
 
-# Great Lakes + buffer: min_lat, max_lat, min_lon, max_lon
-DEFAULT_BBOX = (40.0, 50.0, -94.0, -75.0)
+# Kept for back-compat with tests/test_weather_ingest_live.py and any caller
+# that imported it. New code should reach into app.regions instead.
+DEFAULT_BBOX = REGIONS["great_lakes"].bbox
 
 WIND_FIELDS = (":UGRD:10 m above ground:", ":VGRD:10 m above ground:")
 
@@ -63,7 +70,7 @@ class Source:
     cycle_step_hours: int
     publish_lag_hours: int
     default_fhour: int
-    cache_ttl_seconds: int      # Redis TTL
+    cache_ttl_seconds: int        # Redis TTL
     target_resolution_deg: float  # used only for curvilinear (HRRR); GFS ignores
 
 
@@ -186,29 +193,45 @@ def _write_redis(key: str, ttl: int, blob: bytes) -> None:
     r.setex(key, ttl, blob)
 
 
-def _write_gcs(source_name: str, cycle_iso: str, blob: bytes) -> str:
+def _write_gcs(source_name: str, region_name: str, cycle_iso: str, blob: bytes) -> str:
     bucket_name = os.environ["GCS_WEATHER_BUCKET"]
     client = storage.Client()
     bucket = client.bucket(bucket_name)
-    path = f"{source_name}/{cycle_iso}.json.gz"
+    path = f"{source_name}/{region_name}/{cycle_iso}.json.gz"
     obj = bucket.blob(path)
     obj.content_encoding = "gzip"
     obj.upload_from_string(blob, content_type="application/json")
     return f"gs://{bucket_name}/{path}"
 
 
-def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) -> dict:
+def ingest(
+    source_name: str,
+    region_name: str = "great_lakes",
+    fhour: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    if region_name not in REGIONS:
+        raise ValueError(
+            f"unknown region: {region_name}. valid: {sorted(REGIONS)}"
+        )
+    region: Region = REGIONS[region_name]
+
+    if source_name not in region.sources:
+        raise ValueError(
+            f"source {source_name!r} not configured for region {region_name!r}. "
+            f"valid: {list(region.sources)}"
+        )
+
     source = SOURCES[source_name]
     if fhour is None:
         fhour = source.default_fhour
 
-    bbox_env = os.environ.get("WEATHER_BBOX")
-    bbox = tuple(map(float, bbox_env.split(","))) if bbox_env else DEFAULT_BBOX
+    bbox = region.bbox
 
     date, cycle = latest_cycle(source)
     grib_url = source.url_fn(date, cycle, fhour)
-    print(f"[{source.name}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
-    print(f"[{source.name}] url={grib_url}", flush=True)
+    print(f"[{source.name}/{region.name}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
+    print(f"[{source.name}/{region.name}] url={grib_url}", flush=True)
 
     ranges = fetch_ranges(f"{grib_url}.idx", WIND_FIELDS)
     if not ranges:
@@ -220,7 +243,8 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
     try:
         download_grib(grib_url, ranges, tmp_path)
         print(
-            f"[{source.name}] downloaded {tmp_path.stat().st_size / 1024:.1f} KB",
+            f"[{source.name}/{region.name}] downloaded "
+            f"{tmp_path.stat().st_size / 1024:.1f} KB",
             flush=True,
         )
         grid = parse_grib_to_wind_grid(
@@ -237,7 +261,7 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
 
     payload = clip_and_serialize(grid, bbox)
     print(
-        f"[{source.name}] grid {payload['shape'][0]}x{payload['shape'][1]} "
+        f"[{source.name}/{region.name}] grid {payload['shape'][0]}x{payload['shape'][1]} "
         f"({payload['lats'][0]:.2f}..{payload['lats'][-1]:.2f}N, "
         f"{payload['lons'][0]:.2f}..{payload['lons'][-1]:.2f}E)",
         flush=True,
@@ -246,7 +270,7 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
     payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_gz = gzip.compress(payload_json)
     print(
-        f"[{source.name}] payload {len(payload_json) / 1024:.1f} KB "
+        f"[{source.name}/{region.name}] payload {len(payload_json) / 1024:.1f} KB "
         f"-> gz {len(payload_gz) / 1024:.1f} KB",
         flush=True,
     )
@@ -254,15 +278,19 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
     if dry_run:
         out_dir = Path(__file__).parent.parent / "ingest_output"
         out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{source.name}_f{fhour:03d}.json.gz"
+        out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
         out_path.write_bytes(payload_gz)
-        print(f"[{source.name}] dry-run -> {out_path}", flush=True)
+        print(f"[{source.name}/{region.name}] dry-run -> {out_path}", flush=True)
     else:
         cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
-        _write_redis(f"weather:{source.name}:latest", source.cache_ttl_seconds, payload_gz)
-        gcs_uri = _write_gcs(source.name, cycle_iso, payload_gz)
+        _write_redis(
+            f"weather:{source.name}:{region.name}:latest",
+            source.cache_ttl_seconds,
+            payload_gz,
+        )
+        gcs_uri = _write_gcs(source.name, region.name, cycle_iso, payload_gz)
         print(
-            f"[{source.name}] redis ttl={source.cache_ttl_seconds}s "
+            f"[{source.name}/{region.name}] redis ttl={source.cache_ttl_seconds}s "
             f"gcs={gcs_uri}",
             flush=True,
         )
@@ -273,11 +301,20 @@ def ingest(source_name: str, fhour: int | None = None, dry_run: bool = False) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description="NOAA weather ingestion worker")
     parser.add_argument("source", choices=sorted(SOURCES.keys()))
+    parser.add_argument(
+        "--region",
+        default="great_lakes",
+        choices=sorted(REGIONS.keys()),
+        help="Region to clip to (default: great_lakes)",
+    )
     parser.add_argument("--fhour", type=int, help="Forecast hour (default: source-specific)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Write JSON to ./ingest_output/ instead of Redis/GCS")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write JSON to ./ingest_output/ instead of Redis/GCS",
+    )
     args = parser.parse_args()
-    ingest(args.source, fhour=args.fhour, dry_run=args.dry_run)
+    ingest(args.source, region_name=args.region, fhour=args.fhour, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

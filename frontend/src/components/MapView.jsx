@@ -1,12 +1,18 @@
 // MapView — the always-mounted base layer of the app.
 //
-// Renders HRRR wind barbs (adaptive density), and on top of that the
-// course of the currently active race when one is set: a dashed blue
-// line through the marks plus numbered draggable-style markers (these
-// ones are read-only — drag/edit happens in RaceEditor).
+// Renders wind barbs (adaptive density) for the user's current region, and
+// on top of that the course of the currently active race when one is set:
+// a dashed blue line through the marks plus numbered draggable-style
+// markers (these ones are read-only — drag/edit happens in RaceEditor).
 //
-// The race overlay (top-center) shows the race name and a live
-// countdown; Edit jumps to the editor and ✕ clears the active race.
+// Region is auto-detected (GPS → IP → great_lakes fallback) by useRegion.
+// When the region changes — either because detection completed, or because
+// a race in a different region was loaded — the map flies to the new
+// region's center and the wind data refetches automatically (useWeather
+// keys on region+source).
+//
+// The race overlay (top-center) shows the race name and a live countdown;
+// Edit jumps to the editor and ✕ clears the active race.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -15,6 +21,8 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import { useWeather } from "../hooks/useWeather";
 import { useGeolocation } from "../hooks/useGeolocation";
 import { useCountdown } from "../hooks/useCountdown";
+import { useRegion } from "../hooks/useRegion";
+import { regionCenter } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
 
@@ -43,9 +51,12 @@ mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 // are a presentation layer, not new data.
 const TARGET_BARB_SPACING_PX = 70;
 
-// Lake Michigan fallback when GPS is denied / inland / unavailable.
-const DEFAULT_CENTER = [-87.0, 43.5];
-const DEFAULT_ZOOM = 13;
+// Map zoom levels used at various stages.
+//   REGION_FLY_ZOOM — overview of the resolved region (also used for initial
+//                     map mount, so the first render is already in the right place)
+//   GPS_FLY_ZOOM   — close-up around the user's reported position
+const REGION_FLY_ZOOM = 7;
+const GPS_FLY_ZOOM = 13;
 
 // Padding for fitBounds when an active race is loaded. Generous (140px)
 // so there's room around the course for the routing model output once it
@@ -142,24 +153,39 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   // active race that resolves AFTER GPS would get its fitBounds
   // overwritten when GPS later refires through a re-render.
   const gpsHandledRef = useRef(false);
+  // Tracks which region we've already flown to, so the flyTo only fires
+  // when the region actually changes (not on every re-render).
+  const flownRegionRef = useRef(null);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
-  const { data: weather, validTime, ageMinutes } = useWeather("great_lakes", "hrrr");
+  const region = useRegion(activeRace);
+  const source = region.defaultSource;
+  const { data: weather, validTime, ageMinutes } = useWeather(
+    region.name,
+    source,
+  );
   const { position } = useGeolocation();
 
   // Initialize map once. Assigning mapRef.current synchronously (before
   // .on("load")) makes the strict-mode double-mount in dev bail on the
   // second pass, which would otherwise cancel the style request.
+  //
+  // Initial center is the resolved region — useRegion returns synchronously
+  // from localStorage or DEFAULT_REGION, so we always have something here
+  // and avoid a flash-of-wrong-region for users outside the Great Lakes.
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/light-v11",
-      center: DEFAULT_CENTER,
-      zoom: DEFAULT_ZOOM,
+      center: regionCenter(region),
+      zoom: REGION_FLY_ZOOM,
     });
     mapRef.current = map;
+    // Record the initial region so the flyTo effect below only fires on
+    // genuine region changes, not on first mount.
+    flownRegionRef.current = region.name;
 
     map.on("load", () => {
       const images = generateBarbImages();
@@ -240,6 +266,25 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     };
   }, [weather, styleLoaded]);
 
+  // Fly to the region center when the region changes. Skipped if an
+  // active race is set (the race's fitBounds wins) and skipped if a GPS
+  // flyTo is about to fire for a precise location (more useful than the
+  // region center). Only fires once per region transition.
+  useEffect(() => {
+    if (!mapRef.current) return;
+    if (flownRegionRef.current === region.name) return;
+    flownRegionRef.current = region.name;
+
+    if (activeRace) return; // race claim wins
+    if (position) return;   // GPS will handle precise centering below
+
+    mapRef.current.flyTo({
+      center: regionCenter(region),
+      zoom: REGION_FLY_ZOOM,
+      duration: 1200,
+    });
+  }, [region, activeRace, position]);
+
   // Recenter on browser GPS when it resolves — but only once, and only
   // if there's no active race claiming the viewport. An active race's
   // fitBounds always wins.
@@ -250,7 +295,7 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     if (activeRace) return;
     mapRef.current.flyTo({
       center: [position.lon, position.lat],
-      zoom: DEFAULT_ZOOM,
+      zoom: GPS_FLY_ZOOM,
       duration: 1500,
     });
   }, [position, activeRace]);
@@ -339,10 +384,12 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         />
       )}
 
-      {/* Wind status — top left. */}
+      {/* Wind status — top left. Shows the active source label and
+          freshness. Region label is intentionally not shown — the map
+          itself is the indicator. */}
       {weather && (
         <div style={styles.windOverlay}>
-          <span style={styles.label}>HRRR</span>
+          <span style={styles.label}>{source.toUpperCase()}</span>
           <span style={styles.value}>
             valid {validTime?.toISOString().slice(11, 16)}Z
           </span>

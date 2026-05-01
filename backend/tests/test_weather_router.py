@@ -70,16 +70,34 @@ def test_returns_gzipped_payload_with_headers(client, mock_redis, fake_blob, exp
     assert r.headers["cache-control"] == "public, max-age=300"
     assert r.headers["vary"] == "Accept-Encoding"
     assert r.content == gzip.decompress(fake_blob)
-    mock_redis.get.assert_awaited_once_with("weather:hrrr:latest")
+    mock_redis.get.assert_awaited_once_with("weather:hrrr:great_lakes:latest")
 
 
-def test_gfs_source_uses_gfs_key(client, mock_redis, fake_blob):
+def test_gfs_source_uses_region_scoped_gfs_key(client, mock_redis, fake_blob):
     mock_redis.get.return_value = fake_blob
 
     r = client.get("/api/weather?region=great_lakes&source=gfs")
 
     assert r.status_code == 200
-    mock_redis.get.assert_awaited_once_with("weather:gfs:latest")
+    mock_redis.get.assert_awaited_once_with("weather:gfs:great_lakes:latest")
+
+
+def test_chesapeake_uses_region_scoped_key(client, mock_redis, fake_blob):
+    mock_redis.get.return_value = fake_blob
+
+    r = client.get("/api/weather?region=chesapeake&source=hrrr")
+
+    assert r.status_code == 200
+    mock_redis.get.assert_awaited_once_with("weather:hrrr:chesapeake:latest")
+
+
+def test_hawaii_uses_region_scoped_gfs_key(client, mock_redis, fake_blob):
+    mock_redis.get.return_value = fake_blob
+
+    r = client.get("/api/weather?region=hawaii&source=gfs")
+
+    assert r.status_code == 200
+    mock_redis.get.assert_awaited_once_with("weather:gfs:hawaii:latest")
 
 
 # -- ETag / 304 -----------------------------------------------------------
@@ -126,21 +144,65 @@ def test_unknown_source_returns_400(client, mock_redis):
     mock_redis.get.assert_not_awaited()
 
 
-# -- Fallback -------------------------------------------------------------
+def test_hrrr_on_hawaii_returns_400(client, mock_redis):
+    """Hawaii is GFS-only — HRRR doesn't cover it."""
+    r = client.get("/api/weather?region=hawaii&source=hrrr")
 
-def test_gcs_fallback_when_redis_empty(client, mock_redis, fake_blob, monkeypatch):
-    mock_redis.get.return_value = None
-    monkeypatch.setattr(weather, "_read_latest_gcs", lambda source: fake_blob)
+    assert r.status_code == 400
+    mock_redis.get.assert_not_awaited()
+
+
+# -- Legacy fallback (great_lakes only, transitional) ---------------------
+
+def test_great_lakes_legacy_redis_fallback(client, mock_redis, fake_blob):
+    """During cutover, if the new region-scoped key is missing for great_lakes,
+    fall back to the legacy weather:{source}:latest key. Other regions don't
+    get this fallback."""
+    # First call (region-scoped key) misses, second call (legacy key) hits.
+    mock_redis.get.side_effect = [None, fake_blob]
 
     r = client.get("/api/weather?region=great_lakes&source=hrrr")
 
     assert r.status_code == 200
     assert r.content == gzip.decompress(fake_blob)
+    calls = [c.args[0] for c in mock_redis.get.await_args_list]
+    assert calls == ["weather:hrrr:great_lakes:latest", "weather:hrrr:latest"]
+
+
+def test_chesapeake_does_not_use_legacy_fallback(client, mock_redis, monkeypatch):
+    """Non-legacy regions don't hit the legacy key path."""
+    mock_redis.get.return_value = None
+    monkeypatch.setattr(weather, "_read_latest_gcs", lambda src, region: None)
+
+    r = client.get("/api/weather?region=chesapeake&source=hrrr")
+
+    assert r.status_code == 503
+    calls = [c.args[0] for c in mock_redis.get.await_args_list]
+    assert calls == ["weather:hrrr:chesapeake:latest"]
+
+
+# -- GCS fallback ---------------------------------------------------------
+
+def test_gcs_fallback_when_redis_empty(client, mock_redis, fake_blob, monkeypatch):
+    mock_redis.get.return_value = None
+    captured = {}
+
+    def fake_gcs(source, region):
+        captured["args"] = (source, region)
+        return fake_blob
+
+    monkeypatch.setattr(weather, "_read_latest_gcs", fake_gcs)
+
+    r = client.get("/api/weather?region=chesapeake&source=hrrr")
+
+    assert r.status_code == 200
+    assert r.content == gzip.decompress(fake_blob)
+    assert captured["args"] == ("hrrr", "chesapeake")
 
 
 def test_503_when_redis_and_gcs_both_empty(client, mock_redis, monkeypatch):
     mock_redis.get.return_value = None
-    monkeypatch.setattr(weather, "_read_latest_gcs", lambda source: None)
+    monkeypatch.setattr(weather, "_read_latest_gcs", lambda src, region: None)
 
     r = client.get("/api/weather?region=great_lakes&source=hrrr")
 

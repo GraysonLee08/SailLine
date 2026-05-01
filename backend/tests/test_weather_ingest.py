@@ -35,7 +35,7 @@ from workers.weather_ingest import (
 # Helpers
 
 
-def _synthetic_grid() -> WindGrid:
+def _synthetic_grid(source: str = "gfs") -> WindGrid:
     """3x3 wind grid inside the great_lakes bbox, with known reference time."""
     return WindGrid(
         lats=np.array([41.0, 42.0, 43.0]),
@@ -44,7 +44,20 @@ def _synthetic_grid() -> WindGrid:
         v=np.full((3, 3), -3.0, dtype=np.float32),
         reference_time=datetime(2026, 4, 29, 6, tzinfo=timezone.utc),
         valid_time=datetime(2026, 4, 29, 12, tzinfo=timezone.utc),
-        source="gfs",
+        source=source,
+    )
+
+
+def _synthetic_grid_for_chesapeake() -> WindGrid:
+    """3x3 wind grid inside the chesapeake bbox."""
+    return WindGrid(
+        lats=np.array([37.0, 38.0, 39.0]),
+        lons=np.array([-77.0, -76.5, -76.0]),
+        u=np.full((3, 3), 4.0, dtype=np.float32),
+        v=np.full((3, 3), -2.0, dtype=np.float32),
+        reference_time=datetime(2026, 4, 29, 12, tzinfo=timezone.utc),
+        valid_time=datetime(2026, 4, 29, 13, tzinfo=timezone.utc),
+        source="hrrr",
     )
 
 
@@ -182,6 +195,21 @@ def test_fetch_ranges_gives_up_after_max_attempts(mock_urlopen, _mock_sleep):
 
 
 # ---------------------------------------------------------------------------
+# Region validation tests
+
+
+def test_ingest_rejects_unknown_region():
+    with pytest.raises(ValueError, match="unknown region"):
+        ingest("gfs", region_name="atlantis", dry_run=True)
+
+
+def test_ingest_rejects_hrrr_for_hawaii():
+    """Hawaii is GFS-only because HRRR doesn't cover it."""
+    with pytest.raises(ValueError, match="not configured"):
+        ingest("hrrr", region_name="hawaii", dry_run=True)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration tests with everything mocked
 
 
@@ -199,16 +227,40 @@ def test_ingest_dry_run_writes_gz_to_disk(
     out_path = (
         Path(weather_ingest.__file__).parent.parent
         / "ingest_output"
-        / "gfs_f006.json.gz"
+        / "gfs_great_lakes_f006.json.gz"
     )
     out_path.unlink(missing_ok=True)
     try:
-        payload = ingest("gfs", fhour=6, dry_run=True)
+        payload = ingest("gfs", region_name="great_lakes", fhour=6, dry_run=True)
 
         assert out_path.exists()
         on_disk = json.loads(gzip.decompress(out_path.read_bytes()))
         assert on_disk["source"] == "gfs"
         assert on_disk["shape"] == payload["shape"]
+    finally:
+        out_path.unlink(missing_ok=True)
+
+
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_dry_run_chesapeake_uses_region_in_filename(
+    mock_latest, mock_fetch, mock_download, mock_parse
+):
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.return_value = [(0, 999)]
+    mock_parse.return_value = _synthetic_grid_for_chesapeake()
+
+    out_path = (
+        Path(weather_ingest.__file__).parent.parent
+        / "ingest_output"
+        / "hrrr_chesapeake_f001.json.gz"
+    )
+    out_path.unlink(missing_ok=True)
+    try:
+        ingest("hrrr", region_name="chesapeake", fhour=1, dry_run=True)
+        assert out_path.exists()
     finally:
         out_path.unlink(missing_ok=True)
 
@@ -219,7 +271,7 @@ def test_ingest_dry_run_writes_gz_to_disk(
 @patch("workers.weather_ingest.download_grib")
 @patch("workers.weather_ingest.fetch_ranges")
 @patch("workers.weather_ingest.latest_cycle")
-def test_ingest_writes_redis_and_gcs(
+def test_ingest_writes_region_scoped_redis_and_gcs(
     mock_latest, mock_fetch, mock_download, mock_parse,
     mock_redis_cls, mock_storage_cls, monkeypatch,
 ):
@@ -240,20 +292,55 @@ def test_ingest_writes_redis_and_gcs(
     mock_storage_inst.bucket.return_value = mock_bucket
     mock_storage_cls.return_value = mock_storage_inst
 
-    ingest("gfs", fhour=6, dry_run=False)
+    ingest("gfs", region_name="great_lakes", fhour=6, dry_run=False)
 
-    # Redis: weather:gfs:latest, TTL=6h, gzipped JSON bytes
+    # Redis: weather:gfs:great_lakes:latest, TTL=6h, gzipped JSON bytes
     mock_redis_inst.setex.assert_called_once()
     key, ttl, blob = mock_redis_inst.setex.call_args[0]
-    assert key == "weather:gfs:latest"
+    assert key == "weather:gfs:great_lakes:latest"
     assert ttl == 6 * 3600
     decoded = json.loads(gzip.decompress(blob))
     assert decoded["source"] == "gfs"
 
-    # GCS: gfs/{cycle_iso}.json.gz in fake-bucket
+    # GCS: gfs/great_lakes/{cycle_iso}.json.gz in fake-bucket
     mock_storage_inst.bucket.assert_called_with("fake-bucket")
-    mock_bucket.blob.assert_called_with("gfs/20260429T0600Z.json.gz")
+    mock_bucket.blob.assert_called_with("gfs/great_lakes/20260429T0600Z.json.gz")
     mock_blob.upload_from_string.assert_called_once()
+
+
+@patch("workers.weather_ingest.storage.Client")
+@patch("workers.weather_ingest.redis.Redis")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_chesapeake_writes_chesapeake_keys(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+    mock_redis_cls, mock_storage_cls, monkeypatch,
+):
+    monkeypatch.setenv("REDIS_HOST", "fake-redis")
+    monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
+
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.return_value = [(0, 999)]
+    mock_parse.return_value = _synthetic_grid_for_chesapeake()
+
+    mock_redis_inst = MagicMock()
+    mock_redis_cls.return_value = mock_redis_inst
+
+    mock_blob = MagicMock()
+    mock_bucket = MagicMock()
+    mock_bucket.blob.return_value = mock_blob
+    mock_storage_inst = MagicMock()
+    mock_storage_inst.bucket.return_value = mock_bucket
+    mock_storage_cls.return_value = mock_storage_inst
+
+    ingest("hrrr", region_name="chesapeake", fhour=1, dry_run=False)
+
+    key, ttl, _ = mock_redis_inst.setex.call_args[0]
+    assert key == "weather:hrrr:chesapeake:latest"
+    assert ttl == 1 * 3600
+    mock_bucket.blob.assert_called_with("hrrr/chesapeake/20260429T1200Z.json.gz")
 
 
 @patch("workers.weather_ingest.fetch_ranges")
@@ -263,7 +350,7 @@ def test_ingest_raises_when_idx_has_no_wind_fields(mock_latest, mock_fetch):
     mock_fetch.return_value = []
 
     with pytest.raises(RuntimeError, match="No matching wind fields"):
-        ingest("gfs", fhour=6, dry_run=True)
+        ingest("gfs", region_name="great_lakes", fhour=6, dry_run=True)
 
 
 @patch("workers.weather_ingest.parse_grib_to_wind_grid")
@@ -283,7 +370,7 @@ def test_ingest_cleans_up_tempfile_on_parse_failure(
     mock_download.side_effect = lambda url, ranges, out: captured.append(Path(out))
 
     with pytest.raises(ValueError, match="corrupt grib"):
-        ingest("gfs", fhour=6, dry_run=True)
+        ingest("gfs", region_name="great_lakes", fhour=6, dry_run=True)
 
     assert captured, "download_grib should have been called"
     assert not captured[0].exists(), "tempfile should be cleaned up"

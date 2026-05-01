@@ -18,7 +18,8 @@ import os
 import numpy as np
 import pytest
 
-from workers.weather_ingest import DEFAULT_BBOX, ingest
+from app.regions import REGIONS
+from workers.weather_ingest import ingest
 
 pytestmark = [
     pytest.mark.slow,
@@ -36,7 +37,7 @@ def test_real_noaa_end_to_end(source: str):
     Uses dry_run=True so Redis/GCS aren't touched. The payload still goes
     through the full fetch -> download -> parse -> clip -> serialize path —
     that's what we want to catch if NOAA breaks something."""
-    payload = ingest(source, dry_run=True)
+    payload = ingest(source, region_name="great_lakes", dry_run=True)
 
     # Schema sanity — guards against silent shape drift
     assert set(payload) == {
@@ -54,8 +55,9 @@ def test_real_noaa_end_to_end(source: str):
     assert speed.max() < 100, f"max wind {speed.max()} m/s — unphysical, parse broke?"
     assert 0.5 < speed.mean() < 25, f"mean wind {speed.mean()} m/s looks wrong"
 
-    # Bbox is the configured great_lakes default
-    assert payload["bbox"]["min_lat"] == DEFAULT_BBOX[0]
-    assert payload["bbox"]["max_lat"] == DEFAULT_BBOX[1]
-    assert payload["bbox"]["min_lon"] == DEFAULT_BBOX[2]
-    assert payload["bbox"]["max_lon"] == DEFAULT_BBOX[3]
+    # Bbox matches the great_lakes registry entry
+    expected = REGIONS["great_lakes"].bbox
+    assert payload["bbox"]["min_lat"] == expected[0]
+    assert payload["bbox"]["max_lat"] == expected[1]
+    assert payload["bbox"]["min_lon"] == expected[2]
+    assert payload["bbox"]["max_lon"] == expected[3]
