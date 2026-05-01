@@ -1,10 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+// MapView — the always-mounted base layer of the app.
+//
+// Renders HRRR wind barbs (adaptive density), and on top of that the
+// course of the currently active race when one is set: a dashed blue
+// line through the marks plus numbered draggable-style markers (these
+// ones are read-only — drag/edit happens in RaceEditor).
+//
+// The race overlay (top-center) shows the race name and a live
+// countdown; Edit jumps to the editor and ✕ clears the active race.
+
+import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 
 import { useWeather } from "../hooks/useWeather";
 import { useGeolocation } from "../hooks/useGeolocation";
+import { useCountdown } from "../hooks/useCountdown";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
+import { formatLat, formatLon } from "../lib/latlon";
 
 // TODO(v1.x): wind particle / flow visualization. Two paths investigated and
 // shelved for v1:
@@ -34,6 +46,15 @@ const TARGET_BARB_SPACING_PX = 70;
 // Lake Michigan fallback when GPS is denied / inland / unavailable.
 const DEFAULT_CENTER = [-87.0, 43.5];
 const DEFAULT_ZOOM = 13;
+
+// Padding for fitBounds when an active race is loaded. Generous (140px)
+// so there's room around the course for the routing model output once it
+// lands, and so the top-center race overlay never covers a mark.
+// maxZoom: 12 keeps tight courses from zooming in absurdly close so the
+// user sees the whole route in context rather than two marks filling the
+// screen.
+const COURSE_FIT_PADDING = 140;
+const COURSE_FIT_MAX_ZOOM = 12;
 
 /**
  * Compute the wind barb features to render at the current map view.
@@ -109,9 +130,18 @@ function makeFeature(lon, lat, u, v) {
   };
 }
 
-export function MapView() {
+export function MapView({ activeRace, onEditActive, onClearActive }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
+  const courseMarkersRef = useRef([]);
+  // Tracks which race ID we've already fitBounds'd to, so re-renders
+  // (e.g. countdown tick triggering a new useMemo elsewhere) don't
+  // hijack the user's panning every second.
+  const fittedRaceIdRef = useRef(null);
+  // One-shot guard for the initial GPS recenter — without it, an
+  // active race that resolves AFTER GPS would get its fitBounds
+  // overwritten when GPS later refires through a re-render.
+  const gpsHandledRef = useRef(false);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
   const { data: weather, validTime, ageMinutes } = useWeather("great_lakes", "hrrr");
@@ -141,11 +171,11 @@ export function MapView() {
         img.src = dataUrl;
       });
 
+      // Wind layer first.
       map.addSource("wind", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
       });
-
       map.addLayer({
         id: "wind-barbs",
         type: "symbol",
@@ -157,6 +187,25 @@ export function MapView() {
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
           "icon-size": 0.8,
+        },
+      });
+
+      // Course-line on top — visually consistent with RaceEditor (blue
+      // dashed). Last-added wins for layer order on a Mapbox style, so
+      // the course always draws over the barbs even when both are
+      // populated.
+      map.addSource("course", {
+        type: "geojson",
+        data: emptyLine(),
+      });
+      map.addLayer({
+        id: "course-line",
+        type: "line",
+        source: "course",
+        paint: {
+          "line-color": "#1a73e8",
+          "line-width": 3,
+          "line-dasharray": [2, 1.5],
         },
       });
 
@@ -191,21 +240,108 @@ export function MapView() {
     };
   }, [weather, styleLoaded]);
 
-  // Recenter on browser GPS when it resolves. User can pan freely after.
+  // Recenter on browser GPS when it resolves — but only once, and only
+  // if there's no active race claiming the viewport. An active race's
+  // fitBounds always wins.
   useEffect(() => {
     if (!mapRef.current || !position) return;
+    if (gpsHandledRef.current) return;
+    gpsHandledRef.current = true;
+    if (activeRace) return;
     mapRef.current.flyTo({
       center: [position.lon, position.lat],
       zoom: DEFAULT_ZOOM,
       duration: 1500,
     });
-  }, [position]);
+  }, [position, activeRace]);
+
+  // Render / clear the active race's course + markers.
+  // syncKey changes whenever the marks themselves change (e.g. user
+  // edited the race and came back); fittedRaceIdRef gates the initial
+  // fitBounds so it only runs when we switch RACES, not on every
+  // re-render of the same race.
+  const syncKey = useMemo(() => {
+    if (!activeRace) return "";
+    return (
+      activeRace.id +
+      "::" +
+      (activeRace.marks || [])
+        .map((m) => `${m.name}|${m.lat}|${m.lon}`)
+        .join("~")
+    );
+  }, [activeRace]);
+
+  useEffect(() => {
+    if (!styleLoaded) return;
+    const map = mapRef.current;
+    if (!map) return;
+
+    // Always tear down old markers first.
+    courseMarkersRef.current.forEach((m) => m.remove());
+    courseMarkersRef.current = [];
+
+    const source = map.getSource("course");
+    if (!source) return;
+
+    if (!activeRace || !activeRace.marks?.length) {
+      source.setData(emptyLine());
+      fittedRaceIdRef.current = null;
+      return;
+    }
+
+    activeRace.marks.forEach((mark, i) => {
+      const el = createMarkerElement(i + 1);
+      const popup = new mapboxgl.Popup({
+        offset: 18,
+        closeButton: false,
+        closeOnClick: false,
+      }).setHTML(buildPopupHTML(mark));
+
+      el.addEventListener("mouseenter", () => {
+        popup.setLngLat([mark.lon, mark.lat]).addTo(map);
+      });
+      el.addEventListener("mouseleave", () => popup.remove());
+
+      // Read-only: no draggable. Edits happen in RaceEditor.
+      const marker = new mapboxgl.Marker({ element: el })
+        .setLngLat([mark.lon, mark.lat])
+        .addTo(map);
+
+      courseMarkersRef.current.push(marker);
+    });
+
+    source.setData({
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "LineString",
+        coordinates: activeRace.marks.map((m) => [m.lon, m.lat]),
+      },
+    });
+
+    if (fittedRaceIdRef.current !== activeRace.id) {
+      fitToMarks(map, activeRace.marks);
+      fittedRaceIdRef.current = activeRace.id;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncKey, styleLoaded]);
 
   return (
     <div style={styles.shell}>
       <div ref={containerRef} style={styles.map} />
+
+      {/* Race overlay — top center, only when a race is active. */}
+      {activeRace && (
+        <RaceOverlay
+          race={activeRace}
+          onEdit={onEditActive}
+          onClear={onClearActive}
+        />
+      )}
+
+      {/* Wind status — top left. */}
       {weather && (
-        <div style={styles.overlay}>
+        <div style={styles.windOverlay}>
           <span style={styles.label}>HRRR</span>
           <span style={styles.value}>
             valid {validTime?.toISOString().slice(11, 16)}Z
@@ -217,10 +353,123 @@ export function MapView() {
   );
 }
 
+function RaceOverlay({ race, onEdit, onClear }) {
+  const cd = useCountdown(race.start_at);
+  return (
+    <div style={styles.raceOverlay}>
+      <div style={styles.raceMain}>
+        <div style={styles.raceLabel}>Active race</div>
+        <div style={styles.raceName}>{race.name}</div>
+        <div
+          style={{
+            ...styles.raceCountdown,
+            color: cd.isUnset
+              ? "var(--ink-3)"
+              : cd.isPast
+              ? "var(--ink-3)"
+              : "#1a73e8",
+          }}
+        >
+          {cd.isUnset
+            ? "No start time set"
+            : cd.isPast
+            ? cd.label
+            : `Starts in ${cd.label}`}
+        </div>
+      </div>
+      <div style={styles.raceActions}>
+        <button onClick={onEdit} style={styles.raceEditBtn}>
+          Edit
+        </button>
+        <button
+          onClick={onClear}
+          style={styles.raceClearBtn}
+          aria-label="Clear active race"
+          title="Clear active race"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function emptyLine() {
+  return {
+    type: "Feature",
+    properties: {},
+    geometry: { type: "LineString", coordinates: [] },
+  };
+}
+
+function fitToMarks(map, marks) {
+  if (!marks?.length) return;
+  if (marks.length === 1) {
+    map.flyTo({ center: [marks[0].lon, marks[0].lat], zoom: 12, duration: 800 });
+    return;
+  }
+  const bounds = new mapboxgl.LngLatBounds(
+    [marks[0].lon, marks[0].lat],
+    [marks[0].lon, marks[0].lat],
+  );
+  marks.forEach((m) => bounds.extend([m.lon, m.lat]));
+  map.fitBounds(bounds, {
+    padding: COURSE_FIT_PADDING,
+    duration: 800,
+    maxZoom: COURSE_FIT_MAX_ZOOM,
+  });
+}
+
+function createMarkerElement(label) {
+  const el = document.createElement("div");
+  el.style.cssText = `
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #16161a;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+    border: 2px solid #fff;
+  `;
+  el.textContent = String(label);
+  return el;
+}
+
+function buildPopupHTML(mark) {
+  const esc = (s) =>
+    String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  const latLine = `${esc(formatLat(mark.lat))} &nbsp;·&nbsp; ${esc(formatLon(mark.lon))}`;
+  const desc = mark.description
+    ? `<div style="margin-top:6px;color:#5a5a64;font-size:12px;line-height:1.4;">${esc(mark.description)}</div>`
+    : "";
+  return `
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-width:180px;">
+      <div style="font-weight:600;font-size:14px;color:#16161a;">${esc(mark.name)}</div>
+      <div style="margin-top:4px;color:#5a5a64;font-size:12px;font-variant-numeric:tabular-nums;">${latLine}</div>
+      ${desc}
+    </div>
+  `;
+}
+
 const styles = {
   shell: { position: "relative", width: "100%", height: "100vh" },
   map: { position: "absolute", inset: 0 },
-  overlay: {
+
+  // Wind status (top-left).
+  windOverlay: {
     position: "absolute",
     top: 12,
     left: 12,
@@ -235,8 +484,83 @@ const styles = {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: 12,
     color: "#1f2937",
+    zIndex: 5,
   },
   label: { fontWeight: 600, letterSpacing: "0.05em" },
   value: { color: "#475569" },
   age: { color: "#94a3b8" },
+
+  // Race overlay (top-center).
+  raceOverlay: {
+    position: "absolute",
+    top: 12,
+    left: "50%",
+    transform: "translateX(-50%)",
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "10px 14px 10px 18px",
+    background: "rgba(255, 255, 255, 0.96)",
+    backdropFilter: "blur(8px)",
+    borderRadius: 10,
+    boxShadow: "0 2px 10px rgba(0, 0, 0, 0.08)",
+    minWidth: 240,
+    maxWidth: "calc(100vw - 140px)",
+    zIndex: 5,
+  },
+  raceMain: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 2,
+    minWidth: 0,
+    flex: 1,
+  },
+  raceLabel: {
+    fontSize: 10,
+    color: "var(--ink-3)",
+    textTransform: "uppercase",
+    letterSpacing: "0.08em",
+    fontWeight: 500,
+  },
+  raceName: {
+    fontSize: 15,
+    color: "var(--ink)",
+    fontWeight: 500,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  raceCountdown: {
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: 13,
+    fontVariantNumeric: "tabular-nums",
+    fontWeight: 500,
+  },
+  raceActions: {
+    display: "flex",
+    gap: 6,
+    flexShrink: 0,
+  },
+  raceEditBtn: {
+    border: "1px solid var(--rule)",
+    background: "var(--paper)",
+    borderRadius: "var(--r-sm)",
+    padding: "6px 12px",
+    fontSize: 13,
+    color: "var(--ink)",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  raceClearBtn: {
+    width: 30,
+    height: 30,
+    border: "1px solid var(--rule)",
+    background: "var(--paper)",
+    borderRadius: "var(--r-sm)",
+    fontSize: 14,
+    color: "var(--ink-3)",
+    cursor: "pointer",
+    padding: 0,
+    fontFamily: "inherit",
+  },
 };

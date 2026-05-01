@@ -72,6 +72,7 @@ def _make_row(**overrides):
             {"name": "Start", "lat": 41.9, "lon": -87.6},
             {"name": "M1", "lat": 42.0, "lon": -87.5},
         ]),
+        "start_at": None,
         "started_at": None,
         "ended_at": None,
         "created_at": now,
@@ -103,6 +104,7 @@ def test_list_returns_rows(client, mock_conn):
     assert len(body) == 1
     assert body[0]["name"] == "Saturday Buoy Race"
     assert body[0]["marks"][0] == {"name": "Start", "lat": 41.9, "lon": -87.6}
+    assert body[0]["start_at"] is None
 
 
 # ─── Create ──────────────────────────────────────────────────────────────
@@ -125,7 +127,30 @@ def test_create_race(client, mock_conn):
     body = r.json()
     assert body["name"] == "Saturday Buoy Race"
     assert len(body["marks"]) == 2
+    assert body["start_at"] is None
     mock_conn.fetchrow.assert_awaited_once()
+
+
+def test_create_with_start_at(client, mock_conn):
+    """start_at round-trips through the API as ISO UTC."""
+    start = datetime(2026, 6, 14, 17, 30, tzinfo=timezone.utc)
+    mock_conn.fetchrow.return_value = _make_row(start_at=start)
+
+    payload = {
+        "name": "Saturday Buoy Race",
+        "mode": "inshore",
+        "boat_class": "J/105",
+        "marks": [],
+        "start_at": start.isoformat(),
+    }
+    r = client.post("/api/races", json=payload)
+
+    assert r.status_code == 201
+    body = r.json()
+    # FastAPI normalizes tz-aware datetimes to ISO. Parse back to compare
+    # value-equality without depending on a particular suffix style.
+    assert body["start_at"] is not None
+    assert datetime.fromisoformat(body["start_at"]) == start
 
 
 def test_create_rejects_invalid_mode(client, mock_conn):
@@ -211,6 +236,38 @@ def test_patch_replaces_marks(client, mock_conn):
 
     assert r.status_code == 200
     assert r.json()["marks"] == new_marks
+
+
+def test_patch_set_start_at(client, mock_conn):
+    """Setting start_at on an existing race that didn't have one."""
+    start = datetime(2026, 7, 4, 18, 0, tzinfo=timezone.utc)
+    row = _make_row(start_at=start)
+    mock_conn.fetchrow.return_value = row
+
+    r = client.patch(
+        f"/api/races/{row['id']}",
+        json={"start_at": start.isoformat()},
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["start_at"] is not None
+    assert datetime.fromisoformat(body["start_at"]) == start
+
+
+def test_patch_clear_start_at(client, mock_conn):
+    """Sending start_at: null clears the field. Distinct from omitting
+    the key entirely (which would leave the existing value untouched)."""
+    row = _make_row(start_at=None)
+    mock_conn.fetchrow.return_value = row
+
+    r = client.patch(
+        f"/api/races/{row['id']}",
+        json={"start_at": None},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["start_at"] is None
 
 
 def test_patch_empty_body_400(client, mock_conn):

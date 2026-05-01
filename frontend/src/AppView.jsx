@@ -1,10 +1,13 @@
 // AppView — post-login. Map fills the screen by default; the hamburger
 // menu lets users navigate to the races list, which can in turn open the
-// editor. View routing is a flat useState because we have three screens
-// and no URLs yet — react-router can land later if any screen needs to
-// be deep-linkable.
+// editor or load a race onto the map.
+//
+// "Active race" = the race rendered on the map (course + countdown).
+// Persisted to localStorage so it survives reloads, but cleared
+// automatically once the race is more than 6h past its start time —
+// no point keeping a finished race front-and-center the next morning.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiFetch } from "./api";
@@ -12,15 +15,34 @@ import { MapView } from "./components/MapView.jsx";
 import RacesListView from "./RacesListView.jsx";
 import RaceEditor from "./RaceEditor.jsx";
 
+const ACTIVE_RACE_KEY = "sailline.activeRaceId";
+
+// A race is "ongoing" until 6 hours past its scheduled start. After that,
+// drop it from active state so the next time the app opens it doesn't
+// resurrect a stale course. Also short-circuit if the backend has marked
+// the session ended (will happen once in-race tracking lands).
+const ONGOING_GRACE_MS = 6 * 60 * 60 * 1000;
+
+function isOngoing(race) {
+  if (!race) return false;
+  if (race.ended_at) return false;
+  if (!race.start_at) return true; // not yet scheduled — still "in planning"
+  const startMs = new Date(race.start_at).getTime();
+  if (Number.isNaN(startMs)) return true;
+  return Date.now() < startMs + ONGOING_GRACE_MS;
+}
+
 export default function AppView({ user }) {
   const [profile, setProfile] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [activeRace, setActiveRace] = useState(null);
 
   // view shape: { kind: "map" }
   //           | { kind: "races" }
-  //           | { kind: "editor", raceId: string | null }
+  //           | { kind: "editor", raceId: string | null, returnTo: "map" | "races" }
   const [view, setView] = useState({ kind: "map" });
 
+  // ── Profile ──────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
     apiFetch("/api/users/me")
@@ -31,12 +53,67 @@ export default function AppView({ user }) {
     };
   }, []);
 
+  // ── Restore active race from localStorage on first mount ─────────
+  // Strict-mode double-mount guard via ref. Drop the persisted ID if the
+  // race is past its window OR was deleted server-side OR fails to load.
+  const restoredRef = useRef(false);
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+
+    let cancelled = false;
+    let id;
+    try {
+      id = localStorage.getItem(ACTIVE_RACE_KEY);
+    } catch {
+      return;
+    }
+    if (!id) return;
+
+    apiFetch(`/api/races/${id}`)
+      .then((race) => {
+        if (cancelled) return;
+        if (isOngoing(race)) {
+          setActiveRace(race);
+        } else {
+          try {
+            localStorage.removeItem(ACTIVE_RACE_KEY);
+          } catch {
+            /* ignore */
+          }
+        }
+      })
+      .catch(() => {
+        try {
+          localStorage.removeItem(ACTIVE_RACE_KEY);
+        } catch {
+          /* ignore */
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ── Menu ESC ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!menuOpen) return;
     const onKey = (e) => e.key === "Escape" && setMenuOpen(false);
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [menuOpen]);
+
+  // ── Active-race helpers ──────────────────────────────────────────
+  const setActive = (race) => {
+    setActiveRace(race);
+    try {
+      if (race) localStorage.setItem(ACTIVE_RACE_KEY, race.id);
+      else localStorage.removeItem(ACTIVE_RACE_KEY);
+    } catch {
+      /* localStorage disabled */
+    }
+  };
 
   const goto = (next) => {
     setMenuOpen(false);
@@ -48,15 +125,34 @@ export default function AppView({ user }) {
       {/* Map is always mounted so it doesn't reinitialize when switching
           back from another view. The other screens render on top of it. */}
       <div style={{ ...styles.layer, zIndex: 0 }}>
-        <MapView />
+        <MapView
+          activeRace={activeRace}
+          onEditActive={() =>
+            activeRace &&
+            setView({
+              kind: "editor",
+              raceId: activeRace.id,
+              returnTo: "map",
+            })
+          }
+          onClearActive={() => setActive(null)}
+        />
       </div>
 
       {view.kind === "races" && (
         <div style={{ ...styles.layer, zIndex: 1 }}>
           <RacesListView
             onBack={() => setView({ kind: "map" })}
-            onCreate={() => setView({ kind: "editor", raceId: null })}
-            onOpen={(id) => setView({ kind: "editor", raceId: id })}
+            onCreate={() =>
+              setView({ kind: "editor", raceId: null, returnTo: "races" })
+            }
+            onOpen={(race) => {
+              setActive(race);
+              setView({ kind: "map" });
+            }}
+            onEdit={(id) =>
+              setView({ kind: "editor", raceId: id, returnTo: "races" })
+            }
           />
         </div>
       )}
@@ -65,9 +161,12 @@ export default function AppView({ user }) {
         <div style={{ ...styles.layer, zIndex: 2 }}>
           <RaceEditor
             raceId={view.raceId}
-            onClose={() => setView({ kind: "races" })}
-            onSaved={() => {
-              /* RacesListView refetches via its hook on remount */
+            onClose={() => setView({ kind: view.returnTo || "races" })}
+            onSaved={(race) => {
+              // After save, the just-saved race becomes active and we
+              // land on the map. Map = single pane of glass.
+              setActive(race);
+              setView({ kind: "map" });
             }}
           />
         </div>

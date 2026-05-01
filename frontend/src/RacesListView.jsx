@@ -1,11 +1,13 @@
-// RacesListView — the user's saved race plans. Entry point to the editor.
+// RacesListView — the user's saved race plans. Entry point to both the
+// map view (primary action: load a race onto the map) and the editor
+// (secondary: edit the plan).
 //
-// Hands navigation back to AppView via callbacks rather than owning routing
-// itself, which keeps this component dumb and reusable.
+// Hands navigation back to AppView via callbacks rather than owning
+// routing itself, which keeps this component dumb and reusable.
 
 import { useRaces } from "./hooks/useRaces";
 
-export default function RacesListView({ onBack, onOpen, onCreate }) {
+export default function RacesListView({ onBack, onOpen, onEdit, onCreate }) {
   const { races, error, remove } = useRaces();
 
   return (
@@ -44,7 +46,8 @@ export default function RacesListView({ onBack, onOpen, onCreate }) {
               <RaceCard
                 key={r.id}
                 race={r}
-                onOpen={() => onOpen(r.id)}
+                onOpen={() => onOpen(r)}
+                onEdit={() => onEdit(r.id)}
                 onDelete={async () => {
                   if (!confirm(`Delete "${r.name}"? This can't be undone.`)) return;
                   try {
@@ -62,10 +65,25 @@ export default function RacesListView({ onBack, onOpen, onCreate }) {
   );
 }
 
-function RaceCard({ race, onOpen, onDelete }) {
+function RaceCard({ race, onOpen, onEdit, onDelete }) {
+  // Card body click = the primary action (load on map). Edit and Delete
+  // are explicit buttons in the action cluster on the right. Keyboard
+  // users get the same primary action via Enter on the focused row.
+  const onKey = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onOpen();
+    }
+  };
   return (
     <li style={styles.card}>
-      <div style={styles.cardMain} onClick={onOpen} role="button" tabIndex={0}>
+      <div
+        style={styles.cardMain}
+        onClick={onOpen}
+        onKeyDown={onKey}
+        role="button"
+        tabIndex={0}
+      >
         <h3 style={styles.cardName}>{race.name}</h3>
         <div style={styles.cardMeta}>
           <span style={styles.badge}>{race.mode}</span>
@@ -76,7 +94,8 @@ function RaceCard({ race, onOpen, onDelete }) {
         </div>
       </div>
       <div style={styles.cardActions}>
-        <button onClick={onOpen} style={styles.editBtn}>Edit</button>
+        <button onClick={onOpen} style={styles.openBtn}>Open on map</button>
+        <button onClick={onEdit} style={styles.editBtn}>Edit</button>
         <button onClick={onDelete} style={styles.deleteBtn} aria-label="Delete race">
           Delete
         </button>
@@ -226,6 +245,17 @@ const styles = {
     display: "flex",
     gap: 8,
     flexShrink: 0,
+  },
+  openBtn: {
+    border: "none",
+    background: "var(--ink)",
+    color: "var(--paper)",
+    borderRadius: "var(--r-sm)",
+    padding: "8px 14px",
+    fontSize: 13,
+    fontWeight: 500,
+    cursor: "pointer",
+    fontFamily: "inherit",
   },
   editBtn: {
     border: "1px solid var(--rule)",

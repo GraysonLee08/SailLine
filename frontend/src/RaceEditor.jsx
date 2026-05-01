@@ -10,6 +10,11 @@
 //
 // Lat/lon input format (deg-min vs decimal) is user-toggleable and
 // persisted to localStorage. Storage and API are always decimal degrees.
+//
+// Race start time is captured as separate date + time inputs for
+// usability (matches how race notices are written), then combined into
+// a single ISO UTC timestamp on save. Empty inputs serialize as null —
+// users can save a course before scheduling is finalized.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -25,6 +30,7 @@ import {
   formatDecimal,
   parseCoord,
 } from "./lib/latlon";
+import { useCountdown } from "./hooks/useCountdown";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
@@ -39,6 +45,13 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   const [mode, setMode] = useState("inshore");
   const [boatClass, setBoatClass] = useState(BOAT_CLASSES[0]);
   const [marks, setMarks] = useState([]);
+
+  // Start time, split into local date + local time strings for the two
+  // <input> elements. Combined to ISO UTC only on save (and only when
+  // both halves are set). Storing them as strings rather than a Date
+  // means partial input ("date but no time yet") doesn't crash anything.
+  const [startDate, setStartDate] = useState(""); // "YYYY-MM-DD"
+  const [startTime, setStartTime] = useState(""); // "HH:mm"
 
   // 'dm' = deg-decimal-min (sailor default), 'decimal' = decimal degrees.
   // Persisted so it sticks across sessions / races.
@@ -75,6 +88,9 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         setMode(race.mode);
         setBoatClass(race.boat_class);
         setMarks(race.marks || []);
+        const parts = isoToLocalParts(race.start_at);
+        setStartDate(parts.date);
+        setStartTime(parts.time);
         setLoading(false);
       })
       .catch((e) => {
@@ -86,6 +102,14 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       cancelled = true;
     };
   }, [raceId, isNew]);
+
+  // Combine date + time into an ISO UTC string for the countdown and
+  // for the save payload. If either half is empty, the start is "unset".
+  const startAtIso = useMemo(
+    () => localPartsToIso(startDate, startTime),
+    [startDate, startTime],
+  );
+  const countdown = useCountdown(startAtIso);
 
   // ── Map init ──────────────────────────────────────────────────────
   const containerRef = useRef(null);
@@ -255,6 +279,11 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
     fittedRef.current = false;
   };
 
+  const clearStart = () => {
+    setStartDate("");
+    setStartTime("");
+  };
+
   // ── Save ──────────────────────────────────────────────────────────
   const handleSave = async () => {
     if (!name.trim()) {
@@ -274,17 +303,15 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
           lon: m.lon,
           ...(m.description ? { description: m.description } : {}),
         })),
+        start_at: startAtIso, // null when either half is unset
       };
-      if (isNew) {
-        await apiFetch("/api/races", { method: "POST", body: payload });
-      } else {
-        await apiFetch(`/api/races/${raceId}`, {
-          method: "PATCH",
-          body: payload,
-        });
-      }
-      onSaved?.();
-      onClose();
+      const saved = isNew
+        ? await apiFetch("/api/races", { method: "POST", body: payload })
+        : await apiFetch(`/api/races/${raceId}`, {
+            method: "PATCH",
+            body: payload,
+          });
+      onSaved?.(saved);
     } catch (e) {
       setError(e.message || String(e));
       setSaving(false);
@@ -305,6 +332,22 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
           {saving ? "Saving…" : "Save"}
         </button>
       </header>
+
+      {/* Countdown banner — only when a start is set. Subtle and out of
+          the way; the editor's job is course building, not scheduling. */}
+      {startAtIso && (
+        <div
+          style={{
+            ...styles.countdownBanner,
+            color: countdown.isPast ? "var(--ink-3)" : "#1a73e8",
+          }}
+        >
+          <span style={styles.countdownLabel}>
+            {countdown.isPast ? "STATUS" : "STARTS IN"}
+          </span>
+          <span style={styles.countdownValue}>{countdown.label}</span>
+        </div>
+      )}
 
       <div style={styles.workspace}>
         <div ref={containerRef} style={styles.map} />
@@ -339,6 +382,38 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
                   <option key={c} value={c}>{c}</option>
                 ))}
               </select>
+            </Section>
+
+            <Section
+              label="Start (local time)"
+              action={
+                (startDate || startTime) && (
+                  <button
+                    onClick={clearStart}
+                    style={styles.clearBtn}
+                    title="Clear start time"
+                  >
+                    Clear
+                  </button>
+                )
+              }
+            >
+              <div style={styles.startRow}>
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  style={styles.startInput}
+                  aria-label="Race date"
+                />
+                <input
+                  type="time"
+                  value={startTime}
+                  onChange={(e) => setStartTime(e.target.value)}
+                  style={styles.startInput}
+                  aria-label="Class start time"
+                />
+              </div>
             </Section>
 
             <Section label="MORF course preset">
@@ -603,6 +678,32 @@ function buildPopupHTML(mark) {
   `;
 }
 
+// ── Date/time helpers ────────────────────────────────────────────────
+//
+// The HTML5 date and time inputs deal in local wall-clock strings;
+// the API stores ISO UTC. These two helpers do the round trip while
+// keeping the user's local timezone semantics. Constructing a Date from
+// "YYYY-MM-DDTHH:mm" without a Z suffix triggers the browser's local
+// timezone interpretation, which is exactly what we want.
+
+function isoToLocalParts(iso) {
+  if (!iso) return { date: "", time: "" };
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return { date: "", time: "" };
+  const pad = (n) => String(n).padStart(2, "0");
+  return {
+    date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}`,
+  };
+}
+
+function localPartsToIso(date, time) {
+  if (!date || !time) return null;
+  const d = new Date(`${date}T${time}`);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
 // ── Styles ──────────────────────────────────────────────────────────
 
 const SIDEBAR_WIDTH = 380;
@@ -613,6 +714,19 @@ const styles = {
   cancelBtn: { border: "1px solid var(--rule)", background: "var(--paper)", borderRadius: "var(--r-sm)", padding: "8px 14px", fontSize: 13, color: "var(--ink)", cursor: "pointer" },
   topTitle: { flex: 1, fontSize: 15, color: "var(--ink-3)" },
   saveBtn: { border: "none", background: "var(--ink)", color: "var(--paper)", borderRadius: "var(--r-md)", padding: "10px 22px", fontSize: 14, fontWeight: 500, cursor: "pointer" },
+  countdownBanner: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 12,
+    padding: "8px 20px",
+    borderBottom: "1px solid var(--rule)",
+    background: "var(--paper)",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontVariantNumeric: "tabular-nums",
+    flexShrink: 0,
+  },
+  countdownLabel: { fontSize: 10, letterSpacing: "0.08em", fontWeight: 600, color: "var(--ink-3)" },
+  countdownValue: { fontSize: 14, fontWeight: 500 },
   workspace: { flex: 1, display: "flex", minHeight: 0 },
   map: { flex: 1, minWidth: 0 },
   sidebar: { width: SIDEBAR_WIDTH, flexShrink: 0, borderLeft: "1px solid var(--rule)", background: "var(--paper)", display: "flex", flexDirection: "column", overflow: "hidden" },
@@ -621,6 +735,9 @@ const styles = {
   sectionHeader: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 8 },
   label: { fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 },
   input: { width: "100%", height: 40, padding: "0 12px", border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 14, color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+  startRow: { display: "flex", gap: 8 },
+  startInput: { flex: 1, minWidth: 0, height: 40, padding: "0 10px", border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 14, color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+  clearBtn: { border: "none", background: "transparent", padding: 0, fontSize: 11, color: "var(--ink-3)", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.04em", fontFamily: "inherit", textDecoration: "underline", textDecorationColor: "var(--rule)", textUnderlineOffset: "2px" },
   radioGroup: { display: "flex", gap: 8 },
   radio: { flex: 1, height: 40, border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, cursor: "pointer", transition: "background 0.1s, border-color 0.1s, color 0.1s" },
   formatToggle: { display: "flex", border: "1px solid var(--rule)", borderRadius: "var(--r-sm)", overflow: "hidden" },

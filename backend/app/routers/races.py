@@ -8,6 +8,10 @@ Marks are stored as JSONB. asyncpg returns JSONB as a string by default
 json.dumps on the way in. Each mark is `{name, lat, lon, description?}`.
 The optional `description` lets the editor surface race book metadata for
 named marks (e.g. "205° - 1.3 miles from Four Mile Crib") in hover popups.
+
+`start_at` is the gun time for the race, stored as TIMESTAMPTZ. Nullable —
+the frontend treats null as "no start time set" rather than an error,
+which lets users save a course before scheduling is finalized.
 """
 from __future__ import annotations
 
@@ -43,15 +47,19 @@ class RaceCreate(BaseModel):
     mode: Literal["inshore", "distance"]
     boat_class: str = Field(min_length=1, max_length=80)
     marks: list[Mark] = Field(default_factory=list)
+    start_at: Optional[datetime] = None
 
 
 class RaceUpdate(BaseModel):
     """Partial update — every field is optional. PATCH semantics: send
-    only what you want to change."""
+    only what you want to change. Sending `start_at: null` explicitly
+    clears it (Pydantic distinguishes "field absent" from "field is
+    null" via `model_dump(exclude_unset=True)` in the SQL builder)."""
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     mode: Optional[Literal["inshore", "distance"]] = None
     boat_class: Optional[str] = Field(default=None, min_length=1, max_length=80)
     marks: Optional[list[Mark]] = None
+    start_at: Optional[datetime] = None
 
 
 class RaceOut(BaseModel):
@@ -60,6 +68,7 @@ class RaceOut(BaseModel):
     mode: str
     boat_class: str
     marks: list[Mark]
+    start_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     created_at: datetime
@@ -69,7 +78,7 @@ class RaceOut(BaseModel):
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 _SELECT_COLS = """
-    id, name, mode, boat_class, marks, started_at, ended_at,
+    id, name, mode, boat_class, marks, start_at, started_at, ended_at,
     created_at, updated_at
 """
 
@@ -90,6 +99,7 @@ def _row_to_race(row: asyncpg.Record) -> dict:
         "mode": row["mode"],
         "boat_class": row["boat_class"],
         "marks": _decode_marks(row["marks"]),
+        "start_at": row["start_at"],
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
         "created_at": row["created_at"],
@@ -135,8 +145,8 @@ async def create_race(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
-            INSERT INTO race_sessions (user_id, name, mode, boat_class, marks)
-            VALUES ($1, $2, $3, $4, $5::jsonb)
+            INSERT INTO race_sessions (user_id, name, mode, boat_class, marks, start_at)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
             RETURNING {_SELECT_COLS}
             """,
             user["uid"],
@@ -144,6 +154,7 @@ async def create_race(
             payload.mode,
             payload.boat_class,
             _marks_json(payload.marks),
+            payload.start_at,
         )
     return _row_to_race(row)
 
@@ -178,7 +189,11 @@ async def update_race(
 ):
     """Partial update. Marks, when present, replace the entire array — we
     don't try to merge by index because reorders + edits + adds happen in
-    the same form submit and a full replace is simpler + correct."""
+    the same form submit and a full replace is simpler + correct.
+
+    The dynamic SET clause iterates `model_dump(exclude_unset=True)` so
+    fields the client didn't send aren't touched, but fields explicitly
+    set to null (e.g. clearing start_at) ARE applied as null."""
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "no fields to update")
