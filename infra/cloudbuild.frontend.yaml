@@ -1,0 +1,54 @@
+# infra/cloudbuild.frontend.yaml
+# Frontend deploy pipeline. Mirrors the backend trigger but for Firebase Hosting.
+# Triggered on push to `main` with changes under `frontend/**`.
+steps:
+  # 1. Install dependencies
+  - name: 'node:20'
+    id: 'install'
+    dir: 'frontend'
+    entrypoint: npm
+    args: ['ci']
+
+  # 2. Materialize .env.production from Secret Manager.
+  #    Secret `sailline-frontend-env` holds the full file contents
+  #    (VITE_FIREBASE_*, VITE_MAPBOX_TOKEN). VITE_API_URL is intentionally
+  #    omitted — production uses relative paths via Firebase Hosting rewrites.
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'env'
+    dir: 'frontend'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        gcloud secrets versions access latest \
+          --secret=sailline-frontend-env > .env.production
+
+  # 3. Build the React app — Vite bakes VITE_* env vars into the bundle here.
+  - name: 'node:20'
+    id: 'build'
+    dir: 'frontend'
+    entrypoint: npm
+    args: ['run', 'build']
+
+  # 4. Deploy to Firebase Hosting using ADC (no CI token to rotate).
+  #    The build SA needs roles/firebasehosting.admin (granted one-time).
+  - name: 'node:20'
+    id: 'deploy'
+    dir: 'frontend'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        npm install -g firebase-tools
+        firebase deploy --only hosting \
+          --project sailline \
+          --non-interactive \
+          --force
+
+# Same SA as the backend pipeline
+serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/sailline-cloudbuild@$PROJECT_ID.iam.gserviceaccount.com'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 600s

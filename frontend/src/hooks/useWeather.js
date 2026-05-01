@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
-const API_URL =
-  import.meta.env.VITE_API_URL ||
-  "https://sailline-api-105706282249.us-central1.run.app";
+// In production, paths are relative — Firebase Hosting rewrites /api/** to
+// the sailline-api Cloud Run service (same-origin, no CORS).
+// In local dev, set VITE_API_URL=http://localhost:8080 in .env.local.
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 const REFRESH_MS = 5 * 60 * 1000; // refetch cadence — matches Cache-Control: max-age=300
 const TICK_MS = 60 * 1000;        // re-render cadence to keep ageMinutes fresh

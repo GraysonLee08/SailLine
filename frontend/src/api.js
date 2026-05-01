@@ -4,7 +4,10 @@
 
 import { auth } from "./firebase";
 
-const API_URL = import.meta.env.VITE_API_URL || "https://sailline-api-105706282249.us-central1.run.app";
+// In production, paths are relative — Firebase Hosting rewrites /api/** to
+// the sailline-api Cloud Run service (same-origin, no CORS).
+// In local dev, set VITE_API_URL=http://localhost:8080 in .env.local.
+const API_URL = import.meta.env.VITE_API_URL || "";
 
 export async function apiFetch(path, { method = "GET", body } = {}) {
   const user = auth.currentUser;
