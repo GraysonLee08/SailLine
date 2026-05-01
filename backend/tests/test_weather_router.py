@@ -152,35 +152,6 @@ def test_hrrr_on_hawaii_returns_400(client, mock_redis):
     mock_redis.get.assert_not_awaited()
 
 
-# -- Legacy fallback (great_lakes only, transitional) ---------------------
-
-def test_great_lakes_legacy_redis_fallback(client, mock_redis, fake_blob):
-    """During cutover, if the new region-scoped key is missing for great_lakes,
-    fall back to the legacy weather:{source}:latest key. Other regions don't
-    get this fallback."""
-    # First call (region-scoped key) misses, second call (legacy key) hits.
-    mock_redis.get.side_effect = [None, fake_blob]
-
-    r = client.get("/api/weather?region=great_lakes&source=hrrr")
-
-    assert r.status_code == 200
-    assert r.content == gzip.decompress(fake_blob)
-    calls = [c.args[0] for c in mock_redis.get.await_args_list]
-    assert calls == ["weather:hrrr:great_lakes:latest", "weather:hrrr:latest"]
-
-
-def test_chesapeake_does_not_use_legacy_fallback(client, mock_redis, monkeypatch):
-    """Non-legacy regions don't hit the legacy key path."""
-    mock_redis.get.return_value = None
-    monkeypatch.setattr(weather, "_read_latest_gcs", lambda src, region: None)
-
-    r = client.get("/api/weather?region=chesapeake&source=hrrr")
-
-    assert r.status_code == 503
-    calls = [c.args[0] for c in mock_redis.get.await_args_list]
-    assert calls == ["weather:hrrr:chesapeake:latest"]
-
-
 # -- GCS fallback ---------------------------------------------------------
 
 def test_gcs_fallback_when_redis_empty(client, mock_redis, fake_blob, monkeypatch):

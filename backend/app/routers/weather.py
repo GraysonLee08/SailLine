@@ -30,12 +30,6 @@ router = APIRouter(prefix="/api/weather", tags=["weather"])
 # enough that a fleet hitting the same URL collapses into one origin request.
 CACHE_CONTROL = "public, max-age=300"
 
-# TODO(post-rollout): remove the legacy great_lakes fallback after the first
-# region-scoped worker run has populated the new Redis key + GCS path. Tracked
-# in docs/multi-region-rollout.md. Until then this guards the deploy window
-# during which the new code is live but the new keys haven't been written yet.
-LEGACY_REGION = "great_lakes"
-
 
 @router.get("")
 async def get_weather(region: str, request: Request, source: str = "hrrr") -> Response:
@@ -54,10 +48,6 @@ async def get_weather(region: str, request: Request, source: str = "hrrr") -> Re
 
     key = f"weather:{source}:{region}:latest"
     blob = await _read_redis(key)
-
-    # Legacy fallback (great_lakes only) for the cutover window.
-    if blob is None and region == LEGACY_REGION:
-        blob = await _read_redis(f"weather:{source}:latest")
 
     if blob is None:
         log.warning("redis miss on %s, falling back to GCS", key)
@@ -102,8 +92,8 @@ async def _read_redis(key: str) -> bytes | None:
 def _read_latest_gcs(source: str, region: str) -> bytes | None:
     """Sync — list/download from GCS. Call via asyncio.to_thread.
 
-    Looks under {source}/{region}/. For great_lakes only, falls back to the
-    legacy {source}/ prefix (no region segment) for the rollout window.
+    Looks under {source}/{region}/. Filenames are YYYYMMDDTHHMMZ.json.gz
+    so lexicographic sort == reverse-chronological.
     """
     if not settings.gcs_weather_bucket:
         return None
@@ -112,35 +102,15 @@ def _read_latest_gcs(source: str, region: str) -> bytes | None:
         bucket = client.bucket(settings.gcs_weather_bucket)
 
         prefix = f"{source}/{region}/"
-        blob = _latest_blob_under(bucket, prefix)
-
-        if blob is None and region == LEGACY_REGION:
-            # Legacy layout: gs://.../{source}/{cycle}.json.gz with no region.
-            # Filter out the new region-prefixed objects so we don't list
-            # them twice once both layouts coexist briefly.
-            blob = _latest_blob_under(bucket, f"{source}/", skip_subdirs=True)
-
-        if blob is None:
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        if not blobs:
             return None
+        blobs.sort(key=lambda b: b.name, reverse=True)
+
         # raw_download=True keeps the bytes gzipped. Without it the GCS
         # client transparently decompresses because we set content_encoding
         # at upload time, and we'd be re-gzipping on the way out.
-        return blob.download_as_bytes(raw_download=True)
+        return blobs[0].download_as_bytes(raw_download=True)
     except Exception:
         log.exception("GCS fallback failed for source=%s region=%s", source, region)
         return None
-
-
-def _latest_blob_under(bucket, prefix: str, *, skip_subdirs: bool = False):
-    """Most recent blob (by name) under prefix. Filenames are
-    YYYYMMDDTHHMMZ.json.gz so lexicographic sort == reverse-chronological.
-    """
-    blobs = list(bucket.list_blobs(prefix=prefix))
-    if skip_subdirs:
-        # Legacy fallback: keep only files directly under the prefix, drop
-        # anything that has a slash in its name beyond the prefix itself.
-        blobs = [b for b in blobs if "/" not in b.name[len(prefix):]]
-    if not blobs:
-        return None
-    blobs.sort(key=lambda b: b.name, reverse=True)
-    return blobs[0]
