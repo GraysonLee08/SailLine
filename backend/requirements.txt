@@ -16,6 +16,12 @@ scipy==1.14.1
 asyncpg==0.30.0
 cloud-sql-python-connector[asyncpg]==1.11.0
 
+# Schema migrations (Alembic CLI only — runtime app still uses asyncpg).
+# psycopg is a sync driver; chosen here because migrations run from a shell,
+# not the event loop, and sync is simpler than mixing asyncpg with Alembic.
+alembic==1.13.3
+psycopg[binary]==3.2.3
+
 # Auth (week 1 — Firebase JWT verification)
 firebase-admin==6.5.0
 

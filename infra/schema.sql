@@ -1,50 +1,45 @@
 -- infra/schema.sql
--- Initial schema for SailLine. Idempotent — safe to re-run.
--- Apply from Cloud Shell:
+--
+-- One-time bootstrap for a SailLine database. Run this BEFORE running
+-- Alembic migrations on a fresh database. Idempotent — safe to re-run.
+--
+-- What lives here:
+--   - PostGIS extension
+--   - Default privileges so future tables auto-grant to the `sailline` user
+--   - Catch-up grants on any existing tables (handles the prod DB)
+--
+-- What does NOT live here (table DDL):
+--   - All `CREATE TABLE`, `CREATE INDEX`, and column changes go through
+--     Alembic migrations under `backend/migrations/versions/`. See
+--     `docs/migrations.md`. The whole reason Alembic exists in this repo
+--     is that `CREATE TABLE IF NOT EXISTS` here silently no-op'd against
+--     a drifted prod schema and cost us a debug session on 2026-04-30.
+--
+-- Apply from Cloud Shell as the `postgres` superuser:
 --   gcloud sql connect sailline-db --user=postgres --database=sailline_app < infra/schema.sql
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 
-CREATE TABLE IF NOT EXISTS user_profiles (
-    id              TEXT PRIMARY KEY,           -- Firebase Auth UID
-    tier            TEXT NOT NULL DEFAULT 'free'
-                    CHECK (tier IN ('free', 'pro', 'hardware')),
-    stripe_id       TEXT UNIQUE,
-    boat_class      TEXT,
-    handicap_system TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Race plans + (eventually) live/completed races. v1 uses this for pre-race
--- planning only; started_at / ended_at stay NULL until in-race mode lands
--- in week 6. `name` is added beyond the architecture.md spec for the list UI.
-CREATE TABLE IF NOT EXISTS race_sessions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id     TEXT NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,
-    mode        TEXT NOT NULL CHECK (mode IN ('inshore', 'distance')),
-    boat_class  TEXT NOT NULL,
-    marks       JSONB NOT NULL DEFAULT '[]'::jsonb,
-    started_at  TIMESTAMPTZ,
-    ended_at    TIMESTAMPTZ,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS race_sessions_user_idx
-    ON race_sessions(user_id, created_at DESC);
-
--- Grant the app user (`sailline`) access to existing and future tables.
--- These statements run as the schema owner (`postgres`) and only need to
--- happen once per database. Future tables auto-grant via DEFAULT PRIVILEGES.
-GRANT SELECT, INSERT, UPDATE, DELETE ON user_profiles TO sailline;
-GRANT SELECT, INSERT, UPDATE, DELETE ON race_sessions TO sailline;
-
+-- Default privileges: tables created hereafter (by Alembic, by hand,
+-- whoever) automatically grant DML to the app user. This is what lets
+-- migrations run as `sailline` without a follow-up GRANT step.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sailline;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO sailline;
 
--- Tables for track_points, telemetry_points are added in their respective
--- build weeks (see architecture.md §9).
+-- Schema-level: sailline needs CREATE on `public` so Alembic can create
+-- new tables and the `alembic_version` tracking table.
+GRANT USAGE, CREATE ON SCHEMA public TO sailline;
+
+-- Catch-up grants for any tables that already exist. DEFAULT PRIVILEGES
+-- only affects future objects, so existing tables (user_profiles,
+-- race_sessions on the prod DB) need their grants applied directly.
+-- Idempotent — re-running just re-grants what's already granted.
+DO $$
+BEGIN
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sailline';
+    EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO sailline';
+END
+$$;
