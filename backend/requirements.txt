@@ -31,9 +31,9 @@ redis==5.1.1
 
 # Testing
 pytest==8.3.3
+httpx==0.28.1
 
 
 # anthropic                         # Claude API (week 8)
 # stripe                            # Payments (week 7)
-# httpx                             # Async HTTP client for Datalastic (week 7)
 # sse-starlette                     # SSE for routing stream (week 6)
