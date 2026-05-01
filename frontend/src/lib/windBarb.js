@@ -1,5 +1,12 @@
 // Wind barb SVG generation — modern, clean styling.
 // Generates one icon per 5kt bucket; Mapbox rotates it via icon-rotate.
+//
+// Also: bilinear interpolation helpers for displaying barbs at finer
+// spacing than the native grid resolution. Source data is HRRR regridded
+// to ~0.1° (~11km at our latitudes); when zoomed past ~zoom 10 a
+// race-area-sized viewport contains 0–1 native points, so we interpolate
+// to keep the visualization useful. Interpolated values are smoother but
+// add no information beyond the native resolution.
 
 const COLOR = "#1f2937";       // slate-800: muted, modern, reads well on light maps
 const CALM_COLOR = "#94a3b8";  // slate-400: subdued for calm conditions
@@ -21,6 +28,88 @@ export function uvToSpeedDir(u, v) {
   const dirRad = Math.atan2(-u, -v);
   const dirDeg = ((dirRad * 180) / Math.PI + 360) % 360;
   return { speedKt, dirDeg };
+}
+
+/**
+ * Find index `i` in a monotonic array `arr` such that `target` falls
+ * between arr[i] and arr[i+1] (inclusive on the lower side). Handles both
+ * ascending and descending arrays — HRRR lats can come either direction.
+ *
+ * Returns -1 if `target` is outside the array's range.
+ */
+function findBracketIndex(arr, target) {
+  const n = arr.length;
+  if (n < 2) return -1;
+  const ascending = arr[n - 1] > arr[0];
+
+  if (ascending) {
+    if (target < arr[0] || target > arr[n - 1]) return -1;
+    let lo = 0;
+    let hi = n - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] <= target) lo = mid;
+      else hi = mid;
+    }
+    return lo;
+  } else {
+    if (target > arr[0] || target < arr[n - 1]) return -1;
+    let lo = 0;
+    let hi = n - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid] >= target) lo = mid;
+      else hi = mid;
+    }
+    return lo;
+  }
+}
+
+/**
+ * Bilinear interpolation of (u, v) at an arbitrary (lat, lon) from a
+ * regular lat/lon grid. Returns null if the point is outside the grid.
+ *
+ * @param {{lats: number[], lons: number[], u: number[][], v: number[][]}} weather
+ * @param {number} lat
+ * @param {number} lon
+ * @returns {{u: number, v: number} | null}
+ */
+export function bilerpUV(weather, lat, lon) {
+  const { lats, lons, u, v } = weather;
+
+  const i = findBracketIndex(lats, lat);
+  const j = findBracketIndex(lons, lon);
+  if (i < 0 || j < 0) return null;
+
+  const lat0 = lats[i];
+  const lat1 = lats[i + 1];
+  const lon0 = lons[j];
+  const lon1 = lons[j + 1];
+
+  // Normalized fractional position inside the cell. Works for both
+  // ascending and descending coord arrays because (target - lat0) and
+  // (lat1 - lat0) flip sign together.
+  const fy = (lat - lat0) / (lat1 - lat0);
+  const fx = (lon - lon0) / (lon1 - lon0);
+
+  const u00 = u[i][j];
+  const u01 = u[i][j + 1];
+  const u10 = u[i + 1][j];
+  const u11 = u[i + 1][j + 1];
+  const v00 = v[i][j];
+  const v01 = v[i][j + 1];
+  const v10 = v[i + 1][j];
+  const v11 = v[i + 1][j + 1];
+
+  const w00 = (1 - fx) * (1 - fy);
+  const w01 = fx * (1 - fy);
+  const w10 = (1 - fx) * fy;
+  const w11 = fx * fy;
+
+  return {
+    u: w00 * u00 + w01 * u01 + w10 * u10 + w11 * u11,
+    v: w00 * v00 + w01 * v01 + w10 * v10 + w11 * v11,
+  };
 }
 
 /**

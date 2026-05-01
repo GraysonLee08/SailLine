@@ -4,7 +4,7 @@ import "mapbox-gl/dist/mapbox-gl.css";
 
 import { useWeather } from "../hooks/useWeather";
 import { useGeolocation } from "../hooks/useGeolocation";
-import { uvToSpeedDir, generateBarbImages } from "../lib/windBarb";
+import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 
 // TODO(v1.x): wind particle / flow visualization. Two paths investigated and
 // shelved for v1:
@@ -19,13 +19,95 @@ import { uvToSpeedDir, generateBarbImages } from "../lib/windBarb";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
-// Render every Nth grid point in each axis. HRRR is ~100×191 (~19k points);
-// SUBSAMPLE=4 gives a readable, dense field at the default zoom.
-const SUBSAMPLE = 1;
+// Target on-screen spacing between barbs in CSS pixels. Drives both the
+// stride when zoomed out (decimates the native HRRR grid) and the
+// synthetic spacing when zoomed in (interpolates between native points).
+//
+// HRRR is regridded to ~0.1° (~11km at our latitudes), so a typical 4nm
+// race course at zoom 13 contains 0–1 native points. Below the native
+// resolution we synthesize intermediate barbs via bilinear interpolation
+// in windBarb.bilerpUV — visually smoother but adding no information
+// beyond ~11km. Honest meteorological caveat: the interpolated values
+// are a presentation layer, not new data.
+const TARGET_BARB_SPACING_PX = 70;
 
 // Lake Michigan fallback when GPS is denied / inland / unavailable.
 const DEFAULT_CENTER = [-87.0, 43.5];
 const DEFAULT_ZOOM = 13;
+
+/**
+ * Compute the wind barb features to render at the current map view.
+ *
+ * Adaptive density: aims for ~constant on-screen barb spacing
+ * (TARGET_BARB_SPACING_PX) regardless of zoom level.
+ */
+function computeFeatures(map, weather) {
+  const { lats, lons, u, v } = weather;
+  const zoom = map.getZoom();
+  const bounds = map.getBounds();
+  const centerLat = map.getCenter().lat;
+
+  // Web Mercator: 256 px per tile, 2^zoom tiles per world width, scaled
+  // by cos(lat) to convert longitude degrees to ground distance.
+  const pxPerDeg =
+    (256 * Math.pow(2, zoom) * Math.cos((centerLat * Math.PI) / 180)) / 360;
+  const targetDeg = TARGET_BARB_SPACING_PX / pxPerDeg;
+
+  const nativeLatStep = Math.abs(lats[1] - lats[0]);
+  const nativeLonStep = Math.abs(lons[1] - lons[0]);
+  const nativeStep = Math.max(nativeLatStep, nativeLonStep);
+
+  const south = bounds.getSouth();
+  const north = bounds.getNorth();
+  const west = bounds.getWest();
+  const east = bounds.getEast();
+
+  const features = [];
+
+  if (targetDeg >= nativeStep) {
+    // Zoomed out: native grid is denser than we want. Stride through it
+    // and clip to the visible viewport so we don't ship offscreen barbs
+    // to Mapbox.
+    const stride = Math.max(1, Math.round(targetDeg / nativeStep));
+    for (let i = 0; i < lats.length; i += stride) {
+      const lat = lats[i];
+      if (lat < south || lat > north) continue;
+      for (let j = 0; j < lons.length; j += stride) {
+        const lon = lons[j];
+        if (lon < west || lon > east) continue;
+        features.push(makeFeature(lon, lat, u[i][j], v[i][j]));
+      }
+    }
+  } else {
+    // Zoomed in: native grid is too sparse. Walk a synthetic grid at
+    // targetDeg spacing and bilerp u/v at each point.
+    //
+    // Snap the start lat/lon to a multiple of targetDeg so the grid
+    // doesn't shift while panning — keeps barb positions stable to the
+    // eye instead of crawling.
+    const startLat = Math.ceil(south / targetDeg) * targetDeg;
+    const startLon = Math.ceil(west / targetDeg) * targetDeg;
+
+    for (let lat = startLat; lat <= north; lat += targetDeg) {
+      for (let lon = startLon; lon <= east; lon += targetDeg) {
+        const sample = bilerpUV(weather, lat, lon);
+        if (sample) features.push(makeFeature(lon, lat, sample.u, sample.v));
+      }
+    }
+  }
+
+  return features;
+}
+
+function makeFeature(lon, lat, u, v) {
+  const { speedKt, dirDeg } = uvToSpeedDir(u, v);
+  const bucket = Math.min(Math.round(speedKt / 5) * 5, 65);
+  return {
+    type: "Feature",
+    geometry: { type: "Point", coordinates: [lon, lat] },
+    properties: { bucket, dir: dirDeg },
+  };
+}
 
 export function MapView() {
   const containerRef = useRef(null);
@@ -87,27 +169,26 @@ export function MapView() {
     };
   }, []);
 
-  // Push wind data into the source whenever a new payload lands.
+  // Recompute and push wind features whenever:
+  //   - a new weather payload lands
+  //   - the user pans or zooms (moveend covers both, fires once after
+  //     the gesture settles, so no extra debouncing needed)
   useEffect(() => {
     if (!styleLoaded || !weather) return;
     const map = mapRef.current;
     const source = map.getSource("wind");
     if (!source) return;
 
-    const { lats, lons, u, v } = weather;
-    const features = [];
-    for (let i = 0; i < lats.length; i += SUBSAMPLE) {
-      for (let j = 0; j < lons.length; j += SUBSAMPLE) {
-        const { speedKt, dirDeg } = uvToSpeedDir(u[i][j], v[i][j]);
-        const bucket = Math.min(Math.round(speedKt / 5) * 5, 65);
-        features.push({
-          type: "Feature",
-          geometry: { type: "Point", coordinates: [lons[j], lats[i]] },
-          properties: { bucket, dir: dirDeg },
-        });
-      }
-    }
-    source.setData({ type: "FeatureCollection", features });
+    const update = () => {
+      const features = computeFeatures(map, weather);
+      source.setData({ type: "FeatureCollection", features });
+    };
+
+    update();
+    map.on("moveend", update);
+    return () => {
+      map.off("moveend", update);
+    };
   }, [weather, styleLoaded]);
 
   // Recenter on browser GPS when it resolves. User can pan freely after.
