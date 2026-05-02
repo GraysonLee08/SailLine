@@ -1,18 +1,24 @@
 // MapView — the always-mounted base layer of the app.
 //
-// Renders wind barbs (adaptive density) for the user's current region, and
-// on top of that the course of the currently active race when one is set:
-// a dashed blue line through the marks plus numbered draggable-style
-// markers (these ones are read-only — drag/edit happens in RaceEditor).
+// Wind rendering is two-layered:
 //
-// Region is auto-detected (GPS → IP → great_lakes fallback) by useRegion.
-// When the region changes — either because detection completed, or because
-// a race in a different region was loaded — the map flies to the new
-// region's center and the wind data refetches automatically (useWeather
-// keys on region+source).
+//   1. BASE layer: HRRR @ 0.10° over CONUS, or GFS @ 0.25° over Hawaii.
+//      Always loaded. Covers everywhere a user might pan.
 //
-// The race overlay (top-center) shows the race name and a live countdown;
-// Edit jumps to the editor and ✕ clears the active race.
+//   2. VENUE layer (overlay): HRRR at native ~0.027° (~3 km), one per
+//      popular sailing area. Loaded only when zoom ≥ 11 AND the viewport
+//      center is inside a venue's bbox. Drawn on top of base.
+//
+// Where the venue covers, the base layer's barbs are suppressed in that
+// bbox so we don't render two densities on top of each other. Outside the
+// venue (or below zoom 11), only the base layer renders.
+//
+// Region-base auto-detection is in `useRegion`. Venue selection is here
+// because it depends on viewport state (which only the map knows).
+//
+// On top of wind, when an active race is set, we render a dashed blue
+// course-line through the marks plus numbered read-only markers.
+// Drag/edit happens in RaceEditor.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -22,7 +28,7 @@ import { useWeather } from "../hooks/useWeather";
 import { useGeolocation } from "../hooks/useGeolocation";
 import { useCountdown } from "../hooks/useCountdown";
 import { useRegion } from "../hooks/useRegion";
-import { regionCenter } from "../lib/regions";
+import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
 
@@ -40,30 +46,18 @@ import { formatLat, formatLon } from "../lib/latlon";
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
 // Target on-screen spacing between barbs in CSS pixels. Drives both the
-// stride when zoomed out (decimates the native HRRR grid) and the
-// synthetic spacing when zoomed in (interpolates between native points).
-//
-// HRRR is regridded to ~0.1° (~11km at our latitudes), so a typical 4nm
-// race course at zoom 13 contains 0–1 native points. Below the native
-// resolution we synthesize intermediate barbs via bilinear interpolation
-// in windBarb.bilerpUV — visually smoother but adding no information
-// beyond ~11km. Honest meteorological caveat: the interpolated values
-// are a presentation layer, not new data.
+// stride when zoomed out (decimates the native grid) and the synthetic
+// spacing when zoomed in (interpolates between native points).
 const TARGET_BARB_SPACING_PX = 70;
 
-// Map zoom levels used at various stages.
-//   REGION_FLY_ZOOM — overview of the resolved region (also used for initial
-//                     map mount, so the first render is already in the right place)
-//   GPS_FLY_ZOOM   — close-up around the user's reported position
+// Initial map zoom — the map mounts at the resolved base region's center.
 const REGION_FLY_ZOOM = 7;
 const GPS_FLY_ZOOM = 13;
 
-// Padding for fitBounds when an active race is loaded. Generous (140px)
-// so there's room around the course for the routing model output once it
-// lands, and so the top-center race overlay never covers a mark.
-// maxZoom: 12 keeps tight courses from zooming in absurdly close so the
-// user sees the whole route in context rather than two marks filling the
-// screen.
+// Padding for fitBounds when an active race is loaded. Generous (140px) so
+// there's room around the course and the top-center race overlay never
+// covers a mark. maxZoom: 12 keeps tight courses from zooming in absurdly
+// close so the user sees the whole route in context.
 const COURSE_FIT_PADDING = 140;
 const COURSE_FIT_MAX_ZOOM = 12;
 
@@ -72,8 +66,14 @@ const COURSE_FIT_MAX_ZOOM = 12;
  *
  * Adaptive density: aims for ~constant on-screen barb spacing
  * (TARGET_BARB_SPACING_PX) regardless of zoom level.
+ *
+ * @param {Map} map        Mapbox map instance
+ * @param {object} weather Wind grid payload with lats/lons/u/v
+ * @param {{minLat,maxLat,minLon,maxLon}|null} excludeBbox
+ *   When set, points falling inside this bbox are skipped. Used by the
+ *   base layer to avoid drawing barbs where the venue overlay covers.
  */
-function computeFeatures(map, weather) {
+function computeFeatures(map, weather, excludeBbox = null) {
   const { lats, lons, u, v } = weather;
   const zoom = map.getZoom();
   const bounds = map.getBounds();
@@ -94,6 +94,13 @@ function computeFeatures(map, weather) {
   const west = bounds.getWest();
   const east = bounds.getEast();
 
+  const inExcluded = (lat, lon) =>
+    excludeBbox &&
+    lat >= excludeBbox.minLat &&
+    lat <= excludeBbox.maxLat &&
+    lon >= excludeBbox.minLon &&
+    lon <= excludeBbox.maxLon;
+
   const features = [];
 
   if (targetDeg >= nativeStep) {
@@ -107,21 +114,21 @@ function computeFeatures(map, weather) {
       for (let j = 0; j < lons.length; j += stride) {
         const lon = lons[j];
         if (lon < west || lon > east) continue;
+        if (inExcluded(lat, lon)) continue;
         features.push(makeFeature(lon, lat, u[i][j], v[i][j]));
       }
     }
   } else {
     // Zoomed in: native grid is too sparse. Walk a synthetic grid at
-    // targetDeg spacing and bilerp u/v at each point.
-    //
-    // Snap the start lat/lon to a multiple of targetDeg so the grid
-    // doesn't shift while panning — keeps barb positions stable to the
-    // eye instead of crawling.
+    // targetDeg spacing and bilerp u/v at each point. Snap the start
+    // lat/lon to a multiple of targetDeg so the grid doesn't shift while
+    // panning — keeps barb positions stable to the eye.
     const startLat = Math.ceil(south / targetDeg) * targetDeg;
     const startLon = Math.ceil(west / targetDeg) * targetDeg;
 
     for (let lat = startLat; lat <= north; lat += targetDeg) {
       for (let lon = startLon; lon <= east; lon += targetDeg) {
+        if (inExcluded(lat, lon)) continue;
         const sample = bilerpUV(weather, lat, lon);
         if (sample) features.push(makeFeature(lon, lat, sample.u, sample.v));
       }
@@ -141,51 +148,62 @@ function makeFeature(lon, lat, u, v) {
   };
 }
 
+const EMPTY_FC = { type: "FeatureCollection", features: [] };
+
 export function MapView({ activeRace, onEditActive, onClearActive }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const courseMarkersRef = useRef([]);
-  // Tracks which race ID we've already fitBounds'd to, so re-renders
-  // (e.g. countdown tick triggering a new useMemo elsewhere) don't
-  // hijack the user's panning every second.
   const fittedRaceIdRef = useRef(null);
-  // One-shot guard for the initial GPS recenter — without it, an
-  // active race that resolves AFTER GPS would get its fitBounds
-  // overwritten when GPS later refires through a re-render.
   const gpsHandledRef = useRef(false);
-  // Tracks which region we've already flown to, so the flyTo only fires
-  // when the region actually changes (not on every re-render).
   const flownRegionRef = useRef(null);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
-  const region = useRegion(activeRace);
-  const source = region.defaultSource;
-  const { data: weather, validTime, ageMinutes } = useWeather(
-    region.name,
-    source,
+  // Viewport state — used to decide whether to load a venue overlay.
+  // Updated on `moveend` (covers pan + zoom, fires once per gesture).
+  const [viewport, setViewport] = useState(null); // { zoom, lat, lon }
+
+  // Resolve base region from user identity / race override.
+  const base = useRegion(activeRace);
+  const baseSource = base.defaultSource;
+
+  // Resolve venue from current viewport — only when zoomed in past the
+  // threshold AND the viewport center sits inside a venue's bbox.
+  const venue = useMemo(() => {
+    if (!viewport) return null;
+    if (viewport.zoom < VENUE_ZOOM_THRESHOLD) return null;
+    return venueForPoint(viewport.lat, viewport.lon);
+  }, [viewport]);
+
+  const { data: baseWeather, validTime, ageMinutes } = useWeather(
+    base.name,
+    baseSource,
   );
+  // Pass `null` when no venue → useWeather skips fetching.
+  const { data: venueWeather } = useWeather(venue?.name ?? null, "hrrr");
+
   const { position } = useGeolocation();
 
-  // Initialize map once. Assigning mapRef.current synchronously (before
-  // .on("load")) makes the strict-mode double-mount in dev bail on the
-  // second pass, which would otherwise cancel the style request.
-  //
-  // Initial center is the resolved region — useRegion returns synchronously
-  // from localStorage or DEFAULT_REGION, so we always have something here
-  // and avoid a flash-of-wrong-region for users outside the Great Lakes.
+  // Initialize map once. Center on the resolved base so the first paint
+  // is already in the right place — useRegion returns synchronously from
+  // localStorage or DEFAULT_BASE_REGION.
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/light-v11",
-      center: regionCenter(region),
+      center: regionCenter(base),
       zoom: REGION_FLY_ZOOM,
     });
     mapRef.current = map;
-    // Record the initial region so the flyTo effect below only fires on
-    // genuine region changes, not on first mount.
-    flownRegionRef.current = region.name;
+    flownRegionRef.current = base.name;
+
+    // Seed viewport state on load and update on moveend.
+    const pushViewport = () => {
+      const c = map.getCenter();
+      setViewport({ zoom: map.getZoom(), lat: c.lat, lon: c.lng });
+    };
 
     map.on("load", () => {
       const images = generateBarbImages();
@@ -197,15 +215,28 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         img.src = dataUrl;
       });
 
-      // Wind layer first.
-      map.addSource("wind", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
+      // Base wind layer — drawn first.
+      map.addSource("wind-base", { type: "geojson", data: EMPTY_FC });
       map.addLayer({
-        id: "wind-barbs",
+        id: "wind-barbs-base",
         type: "symbol",
-        source: "wind",
+        source: "wind-base",
+        layout: {
+          "icon-image": ["concat", "barb-", ["get", "bucket"]],
+          "icon-rotate": ["get", "dir"],
+          "icon-rotation-alignment": "map",
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+          "icon-size": 0.8,
+        },
+      });
+
+      // Venue overlay — drawn on top of base.
+      map.addSource("wind-venue", { type: "geojson", data: EMPTY_FC });
+      map.addLayer({
+        id: "wind-barbs-venue",
+        type: "symbol",
+        source: "wind-venue",
         layout: {
           "icon-image": ["concat", "barb-", ["get", "bucket"]],
           "icon-rotate": ["get", "dir"],
@@ -218,12 +249,8 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
 
       // Course-line on top — visually consistent with RaceEditor (blue
       // dashed). Last-added wins for layer order on a Mapbox style, so
-      // the course always draws over the barbs even when both are
-      // populated.
-      map.addSource("course", {
-        type: "geojson",
-        data: emptyLine(),
-      });
+      // the course always draws over both wind layers even when populated.
+      map.addSource("course", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "course-line",
         type: "line",
@@ -235,6 +262,9 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
+      pushViewport();
+      map.on("moveend", pushViewport);
+
       setStyleLoaded(true);
     });
 
@@ -242,52 +272,62 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       map.remove();
       mapRef.current = null;
     };
+    // Only ever run once per mount. `base` is captured for the initial
+    // center; subsequent base changes are handled by the flyTo effect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Recompute and push wind features whenever:
-  //   - a new weather payload lands
-  //   - the user pans or zooms (moveend covers both, fires once after
-  //     the gesture settles, so no extra debouncing needed)
+  // Push base wind features whenever the base payload, the viewport, or
+  // the active venue changes. Excludes points that fall inside the active
+  // venue's bbox so we don't double-render where the high-res overlay
+  // takes over.
   useEffect(() => {
-    if (!styleLoaded || !weather) return;
+    if (!styleLoaded || !baseWeather) return;
     const map = mapRef.current;
-    const source = map.getSource("wind");
-    if (!source) return;
+    const src = map.getSource("wind-base");
+    if (!src) return;
 
-    const update = () => {
-      const features = computeFeatures(map, weather);
-      source.setData({ type: "FeatureCollection", features });
-    };
+    const features = computeFeatures(map, baseWeather, venue?.bbox ?? null);
+    src.setData({ type: "FeatureCollection", features });
+  }, [baseWeather, viewport, venue, styleLoaded]);
 
-    update();
-    map.on("moveend", update);
-    return () => {
-      map.off("moveend", update);
-    };
-  }, [weather, styleLoaded]);
+  // Push venue wind features whenever the venue payload or viewport
+  // changes. When venue is null/data is null, push empty so any prior
+  // overlay clears immediately.
+  useEffect(() => {
+    if (!styleLoaded) return;
+    const map = mapRef.current;
+    const src = map.getSource("wind-venue");
+    if (!src) return;
 
-  // Fly to the region center when the region changes. Skipped if an
-  // active race is set (the race's fitBounds wins) and skipped if a GPS
-  // flyTo is about to fire for a precise location (more useful than the
-  // region center). Only fires once per region transition.
+    if (!venueWeather) {
+      src.setData(EMPTY_FC);
+      return;
+    }
+    const features = computeFeatures(map, venueWeather);
+    src.setData({ type: "FeatureCollection", features });
+  }, [venueWeather, viewport, styleLoaded]);
+
+  // Fly to the base region center when the base changes. Skipped if an
+  // active race is set (the race's fitBounds wins) or if GPS will handle
+  // precise centering. Only fires once per region transition.
   useEffect(() => {
     if (!mapRef.current) return;
-    if (flownRegionRef.current === region.name) return;
-    flownRegionRef.current = region.name;
+    if (flownRegionRef.current === base.name) return;
+    flownRegionRef.current = base.name;
 
-    if (activeRace) return; // race claim wins
-    if (position) return;   // GPS will handle precise centering below
+    if (activeRace) return;
+    if (position) return;
 
     mapRef.current.flyTo({
-      center: regionCenter(region),
+      center: regionCenter(base),
       zoom: REGION_FLY_ZOOM,
       duration: 1200,
     });
-  }, [region, activeRace, position]);
+  }, [base, activeRace, position]);
 
   // Recenter on browser GPS when it resolves — but only once, and only
-  // if there's no active race claiming the viewport. An active race's
-  // fitBounds always wins.
+  // if there's no active race. An active race's fitBounds always wins.
   useEffect(() => {
     if (!mapRef.current || !position) return;
     if (gpsHandledRef.current) return;
@@ -301,10 +341,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   }, [position, activeRace]);
 
   // Render / clear the active race's course + markers.
-  // syncKey changes whenever the marks themselves change (e.g. user
-  // edited the race and came back); fittedRaceIdRef gates the initial
-  // fitBounds so it only runs when we switch RACES, not on every
-  // re-render of the same race.
   const syncKey = useMemo(() => {
     if (!activeRace) return "";
     return (
@@ -321,15 +357,14 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     const map = mapRef.current;
     if (!map) return;
 
-    // Always tear down old markers first.
     courseMarkersRef.current.forEach((m) => m.remove());
     courseMarkersRef.current = [];
 
-    const source = map.getSource("course");
-    if (!source) return;
+    const src = map.getSource("course");
+    if (!src) return;
 
     if (!activeRace || !activeRace.marks?.length) {
-      source.setData(emptyLine());
+      src.setData(emptyLine());
       fittedRaceIdRef.current = null;
       return;
     }
@@ -347,7 +382,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       });
       el.addEventListener("mouseleave", () => popup.remove());
 
-      // Read-only: no draggable. Edits happen in RaceEditor.
       const marker = new mapboxgl.Marker({ element: el })
         .setLngLat([mark.lon, mark.lat])
         .addTo(map);
@@ -355,7 +389,7 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       courseMarkersRef.current.push(marker);
     });
 
-    source.setData({
+    src.setData({
       type: "Feature",
       properties: {},
       geometry: {
@@ -375,7 +409,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     <div style={styles.shell}>
       <div ref={containerRef} style={styles.map} />
 
-      {/* Race overlay — top center, only when a race is active. */}
       {activeRace && (
         <RaceOverlay
           race={activeRace}
@@ -385,11 +418,11 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       )}
 
       {/* Wind status — top left. Shows the active source label and
-          freshness. Region label is intentionally not shown — the map
+          freshness. Region label is intentionally omitted — the map
           itself is the indicator. */}
-      {weather && (
+      {baseWeather && (
         <div style={styles.windOverlay}>
-          <span style={styles.label}>{source.toUpperCase()}</span>
+          <span style={styles.label}>{baseSource.toUpperCase()}</span>
           <span style={styles.value}>
             valid {validTime?.toISOString().slice(11, 16)}Z
           </span>

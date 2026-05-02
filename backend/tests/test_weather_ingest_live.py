@@ -9,7 +9,9 @@ URL scheme, or .idx structure. NOT run in CI (slow + flaky by design).
     python -m pytest tests/test_weather_ingest_live.py -v
 
 Expect ~30-60s per source (downloads real GRIB2 byte ranges from NOMADS).
-Output written to backend/ingest_output/ (gitignored).
+HRRR conus is significantly slower (~3-5 min) because the regridding pass
+operates on HRRR's full ~1.9M-point native LCC grid. Output written to
+backend/ingest_output/ (gitignored).
 """
 from __future__ import annotations
 
@@ -31,13 +33,13 @@ pytestmark = [
 
 
 @pytest.mark.parametrize("source", ["gfs", "hrrr"])
-def test_real_noaa_end_to_end(source: str):
+def test_real_noaa_conus_end_to_end(source: str):
     """Hit real NOAA, parse the freshest cycle, validate payload shape.
 
     Uses dry_run=True so Redis/GCS aren't touched. The payload still goes
     through the full fetch -> download -> parse -> clip -> serialize path —
     that's what we want to catch if NOAA breaks something."""
-    payload = ingest(source, region_name="great_lakes", dry_run=True)
+    payload = ingest(source, region_name="conus", dry_run=True)
 
     # Schema sanity — guards against silent shape drift
     assert set(payload) == {
@@ -55,9 +57,22 @@ def test_real_noaa_end_to_end(source: str):
     assert speed.max() < 100, f"max wind {speed.max()} m/s — unphysical, parse broke?"
     assert 0.5 < speed.mean() < 25, f"mean wind {speed.mean()} m/s looks wrong"
 
-    # Bbox matches the great_lakes registry entry
-    expected = REGIONS["great_lakes"].bbox
+    # Bbox matches the conus registry entry
+    expected = REGIONS["conus"].bbox
     assert payload["bbox"]["min_lat"] == expected[0]
     assert payload["bbox"]["max_lat"] == expected[1]
     assert payload["bbox"]["min_lon"] == expected[2]
     assert payload["bbox"]["max_lon"] == expected[3]
+
+
+def test_real_noaa_venue_native_resolution():
+    """Venue HRRR runs at native 0.027° (~3 km). Verifies the high-res path
+    actually produces a denser grid than CONUS HRRR would for the same area."""
+    payload = ingest("hrrr", region_name="sf_bay", dry_run=True)
+
+    # sf_bay bbox is 0.8° lat × 0.7° lon. At 0.027° step, we should see
+    # roughly 30×26 = ~800 grid cells. Anything much smaller means the
+    # resolution arg didn't propagate.
+    rows, cols = payload["shape"]
+    assert rows >= 25, f"too few lat rows ({rows}) — resolution may not have propagated"
+    assert cols >= 20, f"too few lon cols ({cols}) — resolution may not have propagated"

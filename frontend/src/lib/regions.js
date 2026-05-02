@@ -1,119 +1,198 @@
 // Region registry — mirrors backend/app/regions.py.
 //
-// When you add a region, edit BOTH files. The names below are the public
-// contract for /api/weather?region=... — they must match the backend.
+// Two kinds of regions:
+//   - "base"  — always-on coverage. conus (HRRR @ 0.10° + GFS @ 0.25°) and
+//               hawaii (GFS only). Frontend always loads one.
+//   - "venue" — high-res HRRR overlay at native 0.027° (~3 km), one per
+//               popular sailing area. Loaded only when zoom ≥ 11 AND
+//               viewport center is inside the venue's bbox.
 //
-// `defaultSource` is what the map requests by default for this region.
-// Hawaii is GFS-only (HRRR doesn't cover it); everything else defaults to
-// HRRR for higher resolution, with GFS available as a fallback.
+// When you add or rename a region, edit BOTH files. Names below are the
+// public contract for /api/weather?region=... and must match the backend.
 
 export const REGIONS = {
-  great_lakes: {
-    name: "great_lakes",
-    label: "Great Lakes",
-    bbox: { minLat: 40.0, maxLat: 50.0, minLon: -94.0, maxLon: -75.0 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  chesapeake: {
-    name: "chesapeake",
-    label: "Chesapeake Bay",
-    bbox: { minLat: 36.5, maxLat: 39.5, minLon: -77.5, maxLon: -75.5 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  long_island_sound: {
-    name: "long_island_sound",
-    label: "Long Island Sound",
-    bbox: { minLat: 40.5, maxLat: 41.5, minLon: -74.0, maxLon: -71.5 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  new_england: {
-    name: "new_england",
-    label: "New England",
-    bbox: { minLat: 40.5, maxLat: 43.5, minLon: -72.0, maxLon: -69.0 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  florida: {
-    name: "florida",
-    label: "South Florida",
-    bbox: { minLat: 24.0, maxLat: 26.5, minLon: -82.0, maxLon: -79.5 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  gulf_coast: {
-    name: "gulf_coast",
-    label: "Gulf Coast",
-    bbox: { minLat: 27.0, maxLat: 30.5, minLon: -94.0, maxLon: -82.0 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  socal: {
-    name: "socal",
-    label: "Southern California",
-    bbox: { minLat: 32.5, maxLat: 34.5, minLon: -120.5, maxLon: -117.0 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  sf_bay: {
-    name: "sf_bay",
-    label: "San Francisco Bay",
-    bbox: { minLat: 37.0, maxLat: 38.5, minLon: -123.5, maxLon: -121.5 },
-    sources: ["hrrr", "gfs"],
-    defaultSource: "hrrr",
-  },
-  pnw: {
-    name: "pnw",
-    label: "Pacific Northwest",
-    bbox: { minLat: 47.0, maxLat: 49.0, minLon: -124.0, maxLon: -122.0 },
+  // ── Base regions ──────────────────────────────────────────────────
+  conus: {
+    name: "conus",
+    label: "Continental US",
+    kind: "base",
+    bbox: { minLat: 24.0, maxLat: 50.0, minLon: -126.0, maxLon: -66.0 },
     sources: ["hrrr", "gfs"],
     defaultSource: "hrrr",
   },
   hawaii: {
     name: "hawaii",
     label: "Hawaii",
+    kind: "base",
     bbox: { minLat: 18.5, maxLat: 22.5, minLon: -161.0, maxLon: -154.5 },
     sources: ["gfs"], // outside HRRR's CONUS domain
     defaultSource: "gfs",
   },
+
+  // ── Venues: Great Lakes ───────────────────────────────────────────
+  chicago: {
+    name: "chicago",
+    label: "Chicago / Lake Michigan South",
+    kind: "venue",
+    bbox: { minLat: 41.6, maxLat: 42.5, minLon: -88.0, maxLon: -87.2 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  milwaukee: {
+    name: "milwaukee",
+    label: "Milwaukee Bay",
+    kind: "venue",
+    bbox: { minLat: 42.7, maxLat: 43.4, minLon: -88.1, maxLon: -87.5 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  detroit: {
+    name: "detroit",
+    label: "Lake St. Clair / Detroit",
+    kind: "venue",
+    bbox: { minLat: 41.9, maxLat: 43.0, minLon: -83.4, maxLon: -82.4 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  cleveland: {
+    name: "cleveland",
+    label: "Lake Erie Central",
+    kind: "venue",
+    bbox: { minLat: 41.4, maxLat: 42.3, minLon: -82.5, maxLon: -81.4 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+
+  // ── Venues: West Coast ────────────────────────────────────────────
+  sf_bay: {
+    name: "sf_bay",
+    label: "San Francisco Bay",
+    kind: "venue",
+    bbox: { minLat: 37.4, maxLat: 38.2, minLon: -122.6, maxLon: -121.9 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  long_beach: {
+    name: "long_beach",
+    label: "Long Beach / LA",
+    kind: "venue",
+    bbox: { minLat: 33.5, maxLat: 33.9, minLon: -118.4, maxLon: -117.9 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  san_diego: {
+    name: "san_diego",
+    label: "San Diego",
+    kind: "venue",
+    bbox: { minLat: 32.5, maxLat: 32.9, minLon: -117.4, maxLon: -117.0 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  puget_sound: {
+    name: "puget_sound",
+    label: "Puget Sound",
+    kind: "venue",
+    bbox: { minLat: 47.0, maxLat: 48.9, minLon: -122.8, maxLon: -122.3 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+
+  // ── Venues: East Coast ────────────────────────────────────────────
+  annapolis: {
+    name: "annapolis",
+    label: "Chesapeake / Annapolis",
+    kind: "venue",
+    bbox: { minLat: 38.7, maxLat: 39.3, minLon: -76.7, maxLon: -76.2 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  newport_ri: {
+    name: "newport_ri",
+    label: "Newport / Narragansett",
+    kind: "venue",
+    bbox: { minLat: 41.2, maxLat: 41.7, minLon: -71.6, maxLon: -71.0 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  buzzards_bay: {
+    name: "buzzards_bay",
+    label: "Buzzards Bay",
+    kind: "venue",
+    bbox: { minLat: 41.4, maxLat: 41.8, minLon: -71.2, maxLon: -70.6 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  marblehead: {
+    name: "marblehead",
+    label: "Marblehead / Boston",
+    kind: "venue",
+    bbox: { minLat: 42.3, maxLat: 42.7, minLon: -71.0, maxLon: -70.6 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  charleston: {
+    name: "charleston",
+    label: "Charleston",
+    kind: "venue",
+    bbox: { minLat: 32.5, maxLat: 32.9, minLon: -80.0, maxLon: -79.5 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+
+  // ── Venues: Gulf / Florida ────────────────────────────────────────
+  biscayne_bay: {
+    name: "biscayne_bay",
+    label: "Miami / Biscayne Bay",
+    kind: "venue",
+    bbox: { minLat: 25.4, maxLat: 25.9, minLon: -80.3, maxLon: -80.0 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
+  corpus_christi: {
+    name: "corpus_christi",
+    label: "Corpus Christi",
+    kind: "venue",
+    bbox: { minLat: 27.5, maxLat: 27.9, minLon: -97.5, maxLon: -97.0 },
+    sources: ["hrrr"],
+    defaultSource: "hrrr",
+  },
 };
 
-export const DEFAULT_REGION = "great_lakes";
+// Default base if GPS + IP geolocation both fail. CONUS is the safest
+// because it covers ~95% of plausible US users.
+export const DEFAULT_BASE_REGION = "conus";
 
-/**
- * Find the region whose bbox contains (lat, lon). Returns the region object
- * or null if no region contains the point.
- */
-export function regionFromPoint(lat, lon) {
+// Zoom threshold at which the venue overlay activates. At zoom 11 the
+// visible viewport is ~50 nm wide, which is the boundary between
+// "passage planning" (CONUS-resolution is fine) and "tactical detail
+// matters" (need native HRRR).
+export const VENUE_ZOOM_THRESHOLD = 11;
+
+const _baseRegions = () =>
+  Object.values(REGIONS).filter((r) => r.kind === "base");
+const _venues = () => Object.values(REGIONS).filter((r) => r.kind === "venue");
+
+function _contains(region, lat, lon) {
+  const { minLat, maxLat, minLon, maxLon } = region.bbox;
+  return lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
+}
+
+/** Find the base region (conus or hawaii) containing this point. Null if neither. */
+export function baseRegionForPoint(lat, lon) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  for (const region of Object.values(REGIONS)) {
-    const { minLat, maxLat, minLon, maxLon } = region.bbox;
-    if (lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon) {
-      return region;
-    }
-  }
+  for (const r of _baseRegions()) if (_contains(r, lat, lon)) return r;
   return null;
 }
 
-/**
- * Center coordinate of a region — for `flyTo`. [lon, lat] order to match
- * Mapbox's expected input.
- */
-export function regionCenter(region) {
-  const { minLat, maxLat, minLon, maxLon } = region.bbox;
-  return [(minLon + maxLon) / 2, (minLat + maxLat) / 2];
+/** Find the venue (if any) containing this point. */
+export function venueForPoint(lat, lon) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  for (const r of _venues()) if (_contains(r, lat, lon)) return r;
+  return null;
 }
 
-/**
- * Compute centroid of a list of marks (race course) and look up the
- * containing region. Used to override the user's home region when they
- * load a race that's elsewhere.
- *
- * Returns null if marks is empty/invalid or no region contains the centroid.
- */
-export function regionFromMarks(marks) {
+/** Centroid of an array of marks, or null if invalid/empty. */
+export function marksCentroid(marks) {
   if (!Array.isArray(marks) || marks.length === 0) return null;
   let latSum = 0;
   let lonSum = 0;
@@ -125,10 +204,15 @@ export function regionFromMarks(marks) {
       n += 1;
     }
   }
-  if (n === 0) return null;
-  return regionFromPoint(latSum / n, lonSum / n);
+  return n === 0 ? null : { lat: latSum / n, lon: lonSum / n };
+}
+
+/** Center [lon, lat] of a region — for Mapbox's flyTo. */
+export function regionCenter(region) {
+  const { minLat, maxLat, minLon, maxLon } = region.bbox;
+  return [(minLon + maxLon) / 2, (minLat + maxLat) / 2];
 }
 
 export function getRegion(name) {
-  return REGIONS[name] || REGIONS[DEFAULT_REGION];
+  return REGIONS[name] || REGIONS[DEFAULT_BASE_REGION];
 }

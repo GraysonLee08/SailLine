@@ -1,32 +1,41 @@
-// useRegion — derives the active region from (in priority order):
-//   1. activeRace marks centroid (overrides; not persisted)
-//   2. localStorage "sailline.region" (persisted home region)
-//   3. browser GPS (one-shot via useGeolocation)
-//   4. IP geolocation (ipapi.co, free tier, no key)
-//   5. great_lakes fallback (only if everything else fails)
+// useRegion — derives the user's BASE region (conus or hawaii) from:
+//   1. activeRace marks centroid — overrides; not persisted
+//   2. localStorage "sailline.region" — last detected, persisted
+//   3. browser GPS — one-shot via useGeolocation
+//   4. IP geolocation — ipapi.co, free, no key
+//   5. DEFAULT_BASE_REGION (conus) — fallback if everything fails
 //
-// The user never picks a region — it's inferred. Once detected, the home
-// region is persisted so subsequent loads are instant. Race overrides
-// don't persist; clearing the race returns to the home region.
+// The user never picks a region. Once detected, the home base is persisted
+// so subsequent loads are instant. Race overrides don't persist; clearing
+// the race returns to the home base.
+//
+// VENUES are NOT handled here — they're driven by viewport position and
+// zoom level, which only MapView knows. MapView calls venueForPoint() on
+// each moveend to figure out whether to load a venue overlay. That
+// separation keeps useRegion's concern simple ("what's the user's base
+// coverage?") and avoids circular dependencies between hook and map.
 
 import { useEffect, useRef, useState } from "react";
 import { useGeolocation } from "./useGeolocation";
 import {
-  DEFAULT_REGION,
+  DEFAULT_BASE_REGION,
   REGIONS,
+  baseRegionForPoint,
   getRegion,
-  regionFromMarks,
-  regionFromPoint,
+  marksCentroid,
 } from "../lib/regions";
 
 const STORAGE_KEY = "sailline.region";
 const IPAPI_URL = "https://ipapi.co/json/";
 const IPAPI_TIMEOUT_MS = 4000;
+const GPS_GRACE_MS = 3000;
 
 function readPersisted() {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    return v && REGIONS[v] ? v : null;
+    // Validate against the registry AND require kind="base" — older
+    // builds wrote venue names here; ignore those silently.
+    return v && REGIONS[v]?.kind === "base" ? v : null;
   } catch {
     return null;
   }
@@ -40,16 +49,10 @@ function writePersisted(name) {
   }
 }
 
-/**
- * Best-effort IP geolocation. Returns {lat, lon} or null on any failure.
- * ipapi.co's free tier is 30k requests/day with no API key. We do one
- * request per page load at most, so this is well within budget.
- */
 async function fetchIpLocation(signal) {
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), IPAPI_TIMEOUT_MS);
-    // Compose external signal + timeout signal.
     if (signal) {
       signal.addEventListener("abort", () => ctrl.abort(), { once: true });
     }
@@ -68,29 +71,26 @@ async function fetchIpLocation(signal) {
 
 /**
  * @param {object|null} activeRace - if provided and has marks, the race's
- *   centroid takes precedence over the user's home region.
- * @returns {object} - the resolved Region object (always defined).
+ *   centroid takes precedence over the user's home base. Useful when a
+ *   user in CONUS loads a Hawaii race or vice versa.
+ * @returns {object} the resolved BASE Region object (always defined).
  */
 export function useRegion(activeRace) {
-  // Home region: persisted across sessions, derived from GPS/IP. Lazy
-  // init from localStorage so the first render already has *something*.
+  // Lazy init from localStorage so the first render already has something
+  // sensible — avoids a flash from CONUS to (e.g.) Hawaii on second load
+  // for users who've already been detected.
   const [homeRegionName, setHomeRegionName] = useState(
-    () => readPersisted() || DEFAULT_REGION,
+    () => readPersisted() || DEFAULT_BASE_REGION,
   );
 
-  // Track whether we've ever resolved from a real signal (GPS or IP),
-  // so we don't keep re-running detection if the user has already been
-  // placed somewhere.
   const detectedRef = useRef(Boolean(readPersisted()));
-
   const { position } = useGeolocation();
 
-  // GPS-driven region detection. Fires when GPS resolves; updates and
-  // persists if it lands in a known region.
+  // GPS detection.
   useEffect(() => {
     if (detectedRef.current) return;
     if (!position) return;
-    const region = regionFromPoint(position.lat, position.lon);
+    const region = baseRegionForPoint(position.lat, position.lon);
     if (region) {
       detectedRef.current = true;
       setHomeRegionName(region.name);
@@ -98,10 +98,7 @@ export function useRegion(activeRace) {
     }
   }, [position]);
 
-  // IP geolocation fallback — only runs if (a) we haven't persisted a
-  // region and (b) GPS hasn't resolved within ~3s. The geolocation hook
-  // is one-shot, so if `position` is still null after that grace period,
-  // it likely won't ever arrive (denied / unsupported / timed out).
+  // IP geolocation fallback after a grace period in case GPS is denied/slow.
   useEffect(() => {
     if (detectedRef.current) return;
 
@@ -113,16 +110,17 @@ export function useRegion(activeRace) {
       const loc = await fetchIpLocation(ctrl.signal);
       if (cancelled || detectedRef.current) return;
       if (loc) {
-        const region = regionFromPoint(loc.lat, loc.lon);
+        const region = baseRegionForPoint(loc.lat, loc.lon);
         if (region) {
           detectedRef.current = true;
           setHomeRegionName(region.name);
           writePersisted(region.name);
         }
       }
-      // If neither GPS nor IP geo placed the user in a registered region,
-      // we silently leave homeRegionName at DEFAULT_REGION (great_lakes).
-    }, 3000);
+      // Outside any base region (international user) — leave
+      // homeRegionName at DEFAULT_BASE_REGION so the user at least sees
+      // the map.
+    }, GPS_GRACE_MS);
 
     return () => {
       cancelled = true;
@@ -131,9 +129,16 @@ export function useRegion(activeRace) {
     };
   }, []);
 
-  // Race override: if the active race's marks centroid falls in a region,
-  // use that. Don't persist — race overrides are transient.
-  const raceRegion = activeRace ? regionFromMarks(activeRace.marks) : null;
+  // Race override. Doesn't persist — only affects the current view while
+  // a race is active. Falls back to the home base if the race is in an
+  // unrecognized region (e.g. a user-defined race in international waters).
+  if (activeRace) {
+    const c = marksCentroid(activeRace.marks);
+    if (c) {
+      const raceBase = baseRegionForPoint(c.lat, c.lon);
+      if (raceBase) return raceBase;
+    }
+  }
 
-  return raceRegion || getRegion(homeRegionName);
+  return getRegion(homeRegionName);
 }

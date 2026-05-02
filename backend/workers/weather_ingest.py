@@ -4,14 +4,17 @@ Production: runs as a Cloud Run Job per (source, region), writes to Redis + GCS.
 Local: --dry-run flag writes JSON to ./ingest_output/ instead.
 
 Usage (from backend/):
-    python -m workers.weather_ingest gfs --dry-run
-    python -m workers.weather_ingest hrrr --region chesapeake --dry-run
+    python -m workers.weather_ingest gfs --region conus --dry-run
+    python -m workers.weather_ingest hrrr --region conus --dry-run
+    python -m workers.weather_ingest hrrr --region sf_bay --dry-run
     python -m workers.weather_ingest gfs --region hawaii --fhour 12 --dry-run
 
---region defaults to great_lakes so existing infra (the original
-sailline-ingest-{source} Cloud Run Jobs that don't yet pass --region)
-continues to work after deploy. New region-specific jobs pass --region
-explicitly. See docs/multi-region-rollout.md.
+The target resolution is per-region (e.g. CONUS HRRR = 0.10°, venue HRRR =
+0.027° native). It comes from ``app.regions`` — never hardcode it here.
+
+Each (source, region) pair gets its own Cloud Run Job, named
+``sailline-ingest-{source}-{region}`` (with ``_`` → ``-`` for the region).
+See ``docs/conus-migration.md`` for the rollout runbook.
 """
 from __future__ import annotations
 
@@ -36,15 +39,15 @@ import numpy as np
 from app.regions import REGIONS, Region
 from app.services.grib import WindGrid, parse_grib_to_wind_grid
 
-# Kept for back-compat with tests/test_weather_ingest_live.py and any caller
-# that imported it. New code should reach into app.regions instead.
-DEFAULT_BBOX = REGIONS["great_lakes"].bbox
-
 WIND_FIELDS = (":UGRD:10 m above ground:", ":VGRD:10 m above ground:")
 
 
 # ---------------------------------------------------------------------------
 # Source configuration
+#
+# Resolution lives on the Region (per-source), not on the Source. Source
+# carries the cycle/lag/TTL knobs that are intrinsic to NOAA's release
+# schedule for each model.
 
 
 def gfs_url(date: str, cycle: int, fhour: int) -> str:
@@ -70,13 +73,12 @@ class Source:
     cycle_step_hours: int
     publish_lag_hours: int
     default_fhour: int
-    cache_ttl_seconds: int        # Redis TTL
-    target_resolution_deg: float  # used only for curvilinear (HRRR); GFS ignores
+    cache_ttl_seconds: int  # Redis TTL
 
 
 SOURCES: dict[str, Source] = {
-    "gfs":  Source("gfs",  gfs_url,  6, 5, 6,  cache_ttl_seconds=6 * 3600, target_resolution_deg=0.25),
-    "hrrr": Source("hrrr", hrrr_url, 1, 2, 1,  cache_ttl_seconds=1 * 3600, target_resolution_deg=0.10),
+    "gfs":  Source("gfs",  gfs_url,  6, 5, 6, cache_ttl_seconds=6 * 3600),
+    "hrrr": Source("hrrr", hrrr_url, 1, 2, 1, cache_ttl_seconds=1 * 3600),
 }
 
 
@@ -206,7 +208,7 @@ def _write_gcs(source_name: str, region_name: str, cycle_iso: str, blob: bytes) 
 
 def ingest(
     source_name: str,
-    region_name: str = "great_lakes",
+    region_name: str,
     fhour: int | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -227,11 +229,13 @@ def ingest(
         fhour = source.default_fhour
 
     bbox = region.bbox
+    target_resolution = region.resolution_for(source_name)
 
     date, cycle = latest_cycle(source)
     grib_url = source.url_fn(date, cycle, fhour)
-    print(f"[{source.name}/{region.name}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
-    print(f"[{source.name}/{region.name}] url={grib_url}", flush=True)
+    tag = f"{source.name}/{region.name}@{target_resolution}°"
+    print(f"[{tag}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
+    print(f"[{tag}] url={grib_url}", flush=True)
 
     ranges = fetch_ranges(f"{grib_url}.idx", WIND_FIELDS)
     if not ranges:
@@ -243,15 +247,14 @@ def ingest(
     try:
         download_grib(grib_url, ranges, tmp_path)
         print(
-            f"[{source.name}/{region.name}] downloaded "
-            f"{tmp_path.stat().st_size / 1024:.1f} KB",
+            f"[{tag}] downloaded {tmp_path.stat().st_size / 1024:.1f} KB",
             flush=True,
         )
         grid = parse_grib_to_wind_grid(
             tmp_path,
             source=source.name,
             target_bbox=bbox,
-            target_resolution_deg=source.target_resolution_deg,
+            target_resolution_deg=target_resolution,
         )
     finally:
         try:
@@ -261,7 +264,7 @@ def ingest(
 
     payload = clip_and_serialize(grid, bbox)
     print(
-        f"[{source.name}/{region.name}] grid {payload['shape'][0]}x{payload['shape'][1]} "
+        f"[{tag}] grid {payload['shape'][0]}x{payload['shape'][1]} "
         f"({payload['lats'][0]:.2f}..{payload['lats'][-1]:.2f}N, "
         f"{payload['lons'][0]:.2f}..{payload['lons'][-1]:.2f}E)",
         flush=True,
@@ -270,7 +273,7 @@ def ingest(
     payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_gz = gzip.compress(payload_json)
     print(
-        f"[{source.name}/{region.name}] payload {len(payload_json) / 1024:.1f} KB "
+        f"[{tag}] payload {len(payload_json) / 1024:.1f} KB "
         f"-> gz {len(payload_gz) / 1024:.1f} KB",
         flush=True,
     )
@@ -280,7 +283,7 @@ def ingest(
         out_dir.mkdir(exist_ok=True)
         out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
         out_path.write_bytes(payload_gz)
-        print(f"[{source.name}/{region.name}] dry-run -> {out_path}", flush=True)
+        print(f"[{tag}] dry-run -> {out_path}", flush=True)
     else:
         cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
         _write_redis(
@@ -290,8 +293,7 @@ def ingest(
         )
         gcs_uri = _write_gcs(source.name, region.name, cycle_iso, payload_gz)
         print(
-            f"[{source.name}/{region.name}] redis ttl={source.cache_ttl_seconds}s "
-            f"gcs={gcs_uri}",
+            f"[{tag}] redis ttl={source.cache_ttl_seconds}s gcs={gcs_uri}",
             flush=True,
         )
 
@@ -303,9 +305,9 @@ def main() -> None:
     parser.add_argument("source", choices=sorted(SOURCES.keys()))
     parser.add_argument(
         "--region",
-        default="great_lakes",
+        required=True,
         choices=sorted(REGIONS.keys()),
-        help="Region to clip to (default: great_lakes)",
+        help="Region to clip to (see app/regions.py)",
     )
     parser.add_argument("--fhour", type=int, help="Forecast hour (default: source-specific)")
     parser.add_argument(

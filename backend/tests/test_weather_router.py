@@ -33,10 +33,10 @@ def fake_blob():
         "source": "hrrr",
         "reference_time": "2026-04-29T16:00:00+00:00",
         "valid_time": "2026-04-29T17:00:00+00:00",
-        "bbox": {"min_lat": 40.0, "max_lat": 50.0, "min_lon": -94.0, "max_lon": -75.0},
+        "bbox": {"min_lat": 24.0, "max_lat": 50.0, "min_lon": -126.0, "max_lon": -66.0},
         "shape": [2, 2],
-        "lats": [40.0, 50.0],
-        "lons": [-94.0, -75.0],
+        "lats": [24.0, 50.0],
+        "lons": [-126.0, -66.0],
         "u": [[1.0, 2.0], [3.0, 4.0]],
         "v": [[0.5, 0.6], [0.7, 0.8]],
     }
@@ -62,7 +62,7 @@ def mock_redis(monkeypatch):
 def test_returns_gzipped_payload_with_headers(client, mock_redis, fake_blob, expected_etag):
     mock_redis.get.return_value = fake_blob
 
-    r = client.get("/api/weather?region=great_lakes&source=hrrr")
+    r = client.get("/api/weather?region=conus&source=hrrr")
 
     assert r.status_code == 200
     assert r.headers["content-encoding"] == "gzip"
@@ -70,25 +70,26 @@ def test_returns_gzipped_payload_with_headers(client, mock_redis, fake_blob, exp
     assert r.headers["cache-control"] == "public, max-age=300"
     assert r.headers["vary"] == "Accept-Encoding"
     assert r.content == gzip.decompress(fake_blob)
-    mock_redis.get.assert_awaited_once_with("weather:hrrr:great_lakes:latest")
+    mock_redis.get.assert_awaited_once_with("weather:hrrr:conus:latest")
 
 
-def test_gfs_source_uses_region_scoped_gfs_key(client, mock_redis, fake_blob):
+def test_conus_gfs_uses_region_scoped_key(client, mock_redis, fake_blob):
     mock_redis.get.return_value = fake_blob
 
-    r = client.get("/api/weather?region=great_lakes&source=gfs")
+    r = client.get("/api/weather?region=conus&source=gfs")
 
     assert r.status_code == 200
-    mock_redis.get.assert_awaited_once_with("weather:gfs:great_lakes:latest")
+    mock_redis.get.assert_awaited_once_with("weather:gfs:conus:latest")
 
 
-def test_chesapeake_uses_region_scoped_key(client, mock_redis, fake_blob):
+def test_venue_uses_region_scoped_key(client, mock_redis, fake_blob):
+    """Venue regions follow the same key shape as base regions."""
     mock_redis.get.return_value = fake_blob
 
-    r = client.get("/api/weather?region=chesapeake&source=hrrr")
+    r = client.get("/api/weather?region=sf_bay&source=hrrr")
 
     assert r.status_code == 200
-    mock_redis.get.assert_awaited_once_with("weather:hrrr:chesapeake:latest")
+    mock_redis.get.assert_awaited_once_with("weather:hrrr:sf_bay:latest")
 
 
 def test_hawaii_uses_region_scoped_gfs_key(client, mock_redis, fake_blob):
@@ -106,7 +107,7 @@ def test_if_none_match_match_returns_304(client, mock_redis, fake_blob, expected
     mock_redis.get.return_value = fake_blob
 
     r = client.get(
-        "/api/weather?region=great_lakes&source=hrrr",
+        "/api/weather?region=conus&source=hrrr",
         headers={"If-None-Match": expected_etag},
     )
 
@@ -120,7 +121,7 @@ def test_if_none_match_mismatch_returns_200(client, mock_redis, fake_blob):
     mock_redis.get.return_value = fake_blob
 
     r = client.get(
-        "/api/weather?region=great_lakes&source=hrrr",
+        "/api/weather?region=conus&source=hrrr",
         headers={"If-None-Match": '"deadbeefdeadbeef"'},
     )
 
@@ -138,7 +139,7 @@ def test_unknown_region_returns_404(client, mock_redis):
 
 
 def test_unknown_source_returns_400(client, mock_redis):
-    r = client.get("/api/weather?region=great_lakes&source=ecmwf")
+    r = client.get("/api/weather?region=conus&source=ecmwf")
 
     assert r.status_code == 400
     mock_redis.get.assert_not_awaited()
@@ -147,6 +148,14 @@ def test_unknown_source_returns_400(client, mock_redis):
 def test_hrrr_on_hawaii_returns_400(client, mock_redis):
     """Hawaii is GFS-only — HRRR doesn't cover it."""
     r = client.get("/api/weather?region=hawaii&source=hrrr")
+
+    assert r.status_code == 400
+    mock_redis.get.assert_not_awaited()
+
+
+def test_gfs_on_venue_returns_400(client, mock_redis):
+    """Venues are HRRR-only — GFS native is too coarse for buoy racing."""
+    r = client.get("/api/weather?region=sf_bay&source=gfs")
 
     assert r.status_code == 400
     mock_redis.get.assert_not_awaited()
@@ -164,17 +173,17 @@ def test_gcs_fallback_when_redis_empty(client, mock_redis, fake_blob, monkeypatc
 
     monkeypatch.setattr(weather, "_read_latest_gcs", fake_gcs)
 
-    r = client.get("/api/weather?region=chesapeake&source=hrrr")
+    r = client.get("/api/weather?region=sf_bay&source=hrrr")
 
     assert r.status_code == 200
     assert r.content == gzip.decompress(fake_blob)
-    assert captured["args"] == ("hrrr", "chesapeake")
+    assert captured["args"] == ("hrrr", "sf_bay")
 
 
 def test_503_when_redis_and_gcs_both_empty(client, mock_redis, monkeypatch):
     mock_redis.get.return_value = None
     monkeypatch.setattr(weather, "_read_latest_gcs", lambda src, region: None)
 
-    r = client.get("/api/weather?region=great_lakes&source=hrrr")
+    r = client.get("/api/weather?region=conus&source=hrrr")
 
     assert r.status_code == 503
