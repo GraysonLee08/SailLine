@@ -332,7 +332,8 @@ def test_ingest_writes_conus_keys(
     key, ttl, _ = mock_redis_inst.setex.call_args[0]
     assert key == "weather:gfs:conus:latest"
     assert ttl == 6 * 3600
-    mock_bucket.blob.assert_called_with("gfs/conus/20260429T0600Z.json.gz")
+    mock_bucket.blob.assert_any_call("gfs/conus/20260429T0600Z.json.gz")
+    mock_bucket.blob.assert_any_call("gfs/conus/latest.json.gz")
 
 
 @patch("workers.weather_ingest.storage.Client")
@@ -366,7 +367,8 @@ def test_ingest_writes_venue_keys(
     key, ttl, _ = mock_redis_inst.setex.call_args[0]
     assert key == "weather:hrrr:sf_bay:latest"
     assert ttl == 1 * 3600
-    mock_bucket.blob.assert_called_with("hrrr/sf_bay/20260429T1200Z.json.gz")
+    mock_bucket.blob.assert_any_call("hrrr/sf_bay/20260429T1200Z.json.gz")
+    mock_bucket.blob.assert_any_call("hrrr/sf_bay/latest.json.gz")
 
 
 @patch("workers.weather_ingest.storage.Client")
@@ -399,7 +401,8 @@ def test_ingest_writes_hawaii_keys(
 
     key, _, _ = mock_redis_inst.setex.call_args[0]
     assert key == "weather:gfs:hawaii:latest"
-    mock_bucket.blob.assert_called_with("gfs/hawaii/20260429T1800Z.json.gz")
+    mock_bucket.blob.assert_any_call("gfs/hawaii/20260429T1800Z.json.gz")
+    mock_bucket.blob.assert_any_call("gfs/hawaii/latest.json.gz")
 
 
 @patch("workers.weather_ingest.fetch_ranges")

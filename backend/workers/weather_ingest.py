@@ -196,14 +196,32 @@ def _write_redis(key: str, ttl: int, blob: bytes) -> None:
 
 
 def _write_gcs(source_name: str, region_name: str, cycle_iso: str, blob: bytes) -> str:
+    """Upload twice: timestamped archive object + stable latest.json.gz pointer.
+
+    The archive object preserves the per-cycle history for audit/debug; the
+    pointer lets the API fallback do a single ``get_blob`` instead of a
+    ``list_blobs`` + in-memory sort that scales with archive depth.
+
+    Order matters: archive first, then pointer. If the second upload fails,
+    the archive is still on disk for manual recovery and the next cycle
+    overwrites the pointer correctly. The reverse order would risk pointing
+    `latest.json.gz` at bytes that have no archive companion.
+
+    Returns the archive URI (the pointer URI is implied by the path scheme).
+    """
     bucket_name = os.environ["GCS_WEATHER_BUCKET"]
     client = storage.Client()
     bucket = client.bucket(bucket_name)
-    path = f"{source_name}/{region_name}/{cycle_iso}.json.gz"
-    obj = bucket.blob(path)
-    obj.content_encoding = "gzip"
-    obj.upload_from_string(blob, content_type="application/json")
-    return f"gs://{bucket_name}/{path}"
+
+    archive_path = f"{source_name}/{region_name}/{cycle_iso}.json.gz"
+    latest_path = f"{source_name}/{region_name}/latest.json.gz"
+
+    for path in (archive_path, latest_path):
+        obj = bucket.blob(path)
+        obj.content_encoding = "gzip"
+        obj.upload_from_string(blob, content_type="application/json")
+
+    return f"gs://{bucket_name}/{archive_path}"
 
 
 def ingest(
