@@ -19,6 +19,11 @@
 // On top of wind, when an active race is set, we render a dashed blue
 // course-line through the marks plus numbered read-only markers.
 // Drag/edit happens in RaceEditor.
+//
+// On top of *that*, when the user hits Record, we render a green
+// breadcrumb of GPS points captured by `useTrackRecorder`. The recorder
+// owns its own buffer + offline queue; this view just consumes its
+// `points` array and pushes them to a Mapbox GeoJSON source.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -28,6 +33,7 @@ import { useWeather } from "../hooks/useWeather";
 import { useGeolocation } from "../hooks/useGeolocation";
 import { useCountdown } from "../hooks/useCountdown";
 import { useRegion } from "../hooks/useRegion";
+import { useTrackRecorder } from "../hooks/useTrackRecorder";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
@@ -184,6 +190,10 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
 
   const { position } = useGeolocation();
 
+  // Track recorder. Disabled when there's no active race — start() will
+  // surface an error if the user somehow hits the button without one.
+  const recorder = useTrackRecorder(activeRace?.id ?? null);
+
   // Initialize map once. Center on the resolved base so the first paint
   // is already in the right place — useRegion returns synchronously from
   // localStorage or DEFAULT_BASE_REGION.
@@ -247,9 +257,9 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      // Course-line on top — visually consistent with RaceEditor (blue
-      // dashed). Last-added wins for layer order on a Mapbox style, so
-      // the course always draws over both wind layers even when populated.
+      // Course-line on top of wind — visually consistent with RaceEditor
+      // (blue dashed). Last-added wins for layer order on a Mapbox style,
+      // so the course always draws over wind.
       map.addSource("course", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "course-line",
@@ -259,6 +269,21 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           "line-color": "#1a73e8",
           "line-width": 3,
           "line-dasharray": [2, 1.5],
+        },
+      });
+
+      // GPS breadcrumb on top of course. Solid green so it visually
+      // contrasts with the dashed-blue planned course — at a glance the
+      // user can see "this is what I planned vs this is what I sailed".
+      map.addSource("track", { type: "geojson", data: emptyLine() });
+      map.addLayer({
+        id: "track-line",
+        type: "line",
+        source: "track",
+        paint: {
+          "line-color": "#22a06b",
+          "line-width": 3.5,
+          "line-opacity": 0.92,
         },
       });
 
@@ -405,6 +430,30 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncKey, styleLoaded]);
 
+  // Push the recorder's breadcrumb to the `track` source whenever a new
+  // point lands. Empty array clears the line — handles the
+  // user-cleared-the-race case as well as the recorder-was-stopped case.
+  useEffect(() => {
+    if (!styleLoaded) return;
+    const map = mapRef.current;
+    if (!map) return;
+    const src = map.getSource("track");
+    if (!src) return;
+
+    if (recorder.points.length === 0) {
+      src.setData(emptyLine());
+      return;
+    }
+    src.setData({
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "LineString",
+        coordinates: recorder.points.map((p) => [p.lon, p.lat]),
+      },
+    });
+  }, [recorder.points, styleLoaded]);
+
   return (
     <div style={styles.shell}>
       <div ref={containerRef} style={styles.map} />
@@ -412,6 +461,12 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       {activeRace && (
         <RaceOverlay
           race={activeRace}
+          recording={recorder.recording}
+          queueLength={recorder.queueLength}
+          recorderError={recorder.error}
+          onToggleRecord={() =>
+            recorder.recording ? recorder.stop() : recorder.start()
+          }
           onEdit={onEditActive}
           onClear={onClearActive}
         />
@@ -433,7 +488,15 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   );
 }
 
-function RaceOverlay({ race, onEdit, onClear }) {
+function RaceOverlay({
+  race,
+  recording,
+  queueLength,
+  recorderError,
+  onToggleRecord,
+  onEdit,
+  onClear,
+}) {
   const cd = useCountdown(race.start_at);
   return (
     <div style={styles.raceOverlay}>
@@ -456,8 +519,32 @@ function RaceOverlay({ race, onEdit, onClear }) {
             ? cd.label
             : `Starts in ${cd.label}`}
         </div>
+        {recording && queueLength > 0 && (
+          <div style={styles.queueHint}>
+            {queueLength} pt{queueLength === 1 ? "" : "s"} pending
+            {recorderError ? " · offline" : ""}
+          </div>
+        )}
+        {!recording && recorderError && (
+          <div style={styles.recordError}>{recorderError}</div>
+        )}
       </div>
       <div style={styles.raceActions}>
+        <button
+          onClick={onToggleRecord}
+          style={recording ? styles.recordBtnOn : styles.recordBtn}
+          aria-label={recording ? "Stop recording" : "Start recording"}
+          aria-pressed={recording}
+          title={recording ? "Stop recording" : "Start recording"}
+        >
+          <span
+            style={recording ? styles.recordDotOn : styles.recordDot}
+            aria-hidden
+          />
+          <span style={styles.recordLabel}>
+            {recording ? "Rec" : "Record"}
+          </span>
+        </button>
         <button onClick={onEdit} style={styles.raceEditBtn}>
           Edit
         </button>
@@ -616,11 +703,80 @@ const styles = {
     fontVariantNumeric: "tabular-nums",
     fontWeight: 500,
   },
+  queueHint: {
+    fontSize: 11,
+    color: "var(--ink-3)",
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    marginTop: 2,
+  },
+  recordError: {
+    fontSize: 11,
+    color: "#b00020",
+    marginTop: 2,
+    maxWidth: 220,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
   raceActions: {
     display: "flex",
     gap: 6,
     flexShrink: 0,
+    alignItems: "center",
   },
+  // Big finger-sized record button. 44px tall meets Apple HIG tap target;
+  // padding generous so it doesn't feel cramped next to Edit/Clear.
+  recordBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    height: 44,
+    minWidth: 80,
+    padding: "0 14px",
+    border: "1px solid var(--rule)",
+    background: "var(--paper)",
+    borderRadius: "var(--r-sm)",
+    fontSize: 13,
+    color: "var(--ink)",
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontWeight: 500,
+  },
+  recordBtnOn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    height: 44,
+    minWidth: 80,
+    padding: "0 14px",
+    border: "1px solid #b00020",
+    background: "#fff5f6",
+    borderRadius: "var(--r-sm)",
+    fontSize: 13,
+    color: "#b00020",
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontWeight: 600,
+  },
+  // Solid red circle while recording (will pulse via CSS animation later).
+  // Outline version when idle so the button reads as "ready to record".
+  recordDot: {
+    display: "inline-block",
+    width: 10,
+    height: 10,
+    borderRadius: "50%",
+    border: "2px solid #b00020",
+    background: "transparent",
+  },
+  recordDotOn: {
+    display: "inline-block",
+    width: 10,
+    height: 10,
+    borderRadius: "50%",
+    background: "#b00020",
+    boxShadow: "0 0 0 2px rgba(176, 0, 32, 0.18)",
+  },
+  recordLabel: { fontVariantNumeric: "tabular-nums" },
   raceEditBtn: {
     border: "1px solid var(--rule)",
     background: "var(--paper)",
