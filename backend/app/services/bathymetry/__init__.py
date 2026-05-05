@@ -3,10 +3,18 @@
 Depth grids are produced by ``backend/workers/bathymetry_ingest.py`` from
 NOAA NCEI sources (Great Lakes bathymetry, Coastal Relief Model volumes)
 and stored as compressed ``.npz`` files at ``bathymetry/{region}/depth.npz``
-in the ingest GCS bucket.
+in the project's GCS bucket.
+
+NOTE: v1 reuses the existing ``sailline-weather`` bucket via
+``settings.gcs_weather_bucket``. That bucket has a 30-day delete-all
+lifecycle rule (set up for GRIB cleanup), which means bathymetry files
+get auto-deleted monthly. The ingest worker run is cheap (~10s with
+cached download) so re-running monthly is fine for v1. Long-term fix:
+either split into a dedicated bucket or change the lifecycle rule to
+only match ``gfs/`` and ``hrrr/`` prefixes.
 
 Each region's grid is loaded into memory once on first ``for_region(name)``
-call and cached for the life of the process. Grids are 50–150 MB each;
+call and cached for the life of the process. Grids are typically 2–100 MB;
 Cloud Run containers run with 512 MB+ memory and the grids load in
 hundreds of milliseconds.
 
@@ -17,7 +25,7 @@ surface). Land returns negative or zero. The router asks "is depth at
 Datum: Lake Michigan grids use Low Water Datum (IGLD85). CRM volumes use
 MLLW for ocean coverage. Both are conservative — the actual water surface
 is typically above datum, so quoted depths are lower bounds. Lake-level /
-tide correction is a v1.x feature (see TODO at the bottom of this file).
+tide correction is a v1.x feature.
 """
 from __future__ import annotations
 
@@ -120,12 +128,12 @@ def _load_from_gcs(region: str) -> Optional[DepthGrid]:
     Raises on any other GCS error so the caller can surface infrastructure
     problems rather than silently routing without depth data.
     """
-    if not settings.gcs_bucket:
-        log.error("GCS_BUCKET not configured; bathymetry disabled")
+    if not settings.gcs_weather_bucket:
+        log.error("GCS_WEATHER_BUCKET not configured; bathymetry disabled")
         return None
 
     client = storage.Client()
-    bucket = client.bucket(settings.gcs_bucket)
+    bucket = client.bucket(settings.gcs_weather_bucket)
     blob = bucket.blob(_gcs_path(region))
 
     try:
@@ -183,14 +191,6 @@ def invalidate_cache(region: Optional[str] = None) -> None:
             _CACHE.clear()
         else:
             _CACHE.pop(region, None)
-
-
-# TODO(v1.x): water-level correction.
-# Lake Michigan: query NOAA CO-OPS station 9087044 (Calumet Harbor) hourly
-# at app startup, add (current_level - LWD) to all depths in
-# DepthGrid.sample. Ocean: tide prediction at the nearest CO-OPS station.
-# For Saturday's open-lake passage at 50+m depths, this matters less than
-# 0.1% — defer.
 
 
 __all__ = ["DepthGrid", "BathymetryUnavailable", "for_region", "invalidate_cache"]

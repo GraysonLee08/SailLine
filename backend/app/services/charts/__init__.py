@@ -2,9 +2,13 @@
 
 Hazard polygons are produced by ``backend/workers/enc_ingest.py`` from
 NOAA ENC Direct REST queries and stored as a single GeoJSON
-FeatureCollection at ``charts/{region}/hazards.geojson`` in the ingest
-bucket. Each region's hazards are loaded into a shapely ``STRtree`` on
+FeatureCollection at ``charts/{region}/hazards.geojson`` in the project's
+GCS bucket. Each region's hazards are loaded into a shapely ``STRtree`` on
 first ``for_region(name)`` call and cached for the life of the process.
+
+Storage: shares the ``sailline-weather`` bucket via
+``settings.gcs_weather_bucket`` for v1. See the equivalent note in
+``app.services.bathymetry`` about the bucket's lifecycle rule.
 
 Layers we extract from ENC:
 
@@ -18,15 +22,9 @@ Layers we extract from ENC:
 A point is "hazardous" iff it falls inside any of these polygons. The
 predicate is monotonic across layers — adding more layers only increases
 the no-go area, never reduces it.
-
-Future work: handle point and line ENC features (buoys, cables) with a
-buffer distance per feature type. v1 polygons-only is sufficient for the
-May 9 delivery; ENC gives us LNDARE polygons for the entire western
-shore which solves the screenshot problem cleanly.
 """
 from __future__ import annotations
 
-import io
 import json
 import logging
 import threading
@@ -66,7 +64,6 @@ class HazardIndex:
         if not self.polygons:
             return False
         point = Point(lon, lat)
-        # shapely 2.x: query returns ndarray of integer indices
         for idx in self.tree.query(point):
             if self.polygons[int(idx)].covers(point):
                 return True
@@ -95,12 +92,12 @@ def _gcs_path(region: str) -> str:
 
 
 def _load_from_gcs(region: str) -> Optional[HazardIndex]:
-    if not settings.gcs_bucket:
-        log.error("GCS_BUCKET not configured; charts disabled")
+    if not settings.gcs_weather_bucket:
+        log.error("GCS_WEATHER_BUCKET not configured; charts disabled")
         return None
 
     client = storage.Client()
-    bucket = client.bucket(settings.gcs_bucket)
+    bucket = client.bucket(settings.gcs_weather_bucket)
     blob = bucket.blob(_gcs_path(region))
 
     try:
@@ -120,8 +117,6 @@ def _load_from_gcs(region: str) -> Optional[HazardIndex]:
             continue
         if geom.is_empty:
             continue
-        # Accept Polygon and MultiPolygon. Lines/Points are skipped at
-        # v1 (handled when we add buffered hazards).
         gt = geom.geom_type
         if gt not in ("Polygon", "MultiPolygon"):
             continue

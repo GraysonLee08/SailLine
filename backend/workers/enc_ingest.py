@@ -193,9 +193,9 @@ def merge_layers(
 
 
 def upload_to_gcs(blob_bytes: bytes, region: str) -> str:
-    bucket_name = os.environ.get("GCS_BUCKET")
+    bucket_name = os.environ.get("GCS_WEATHER_BUCKET")
     if not bucket_name:
-        raise RuntimeError("GCS_BUCKET env var not set")
+        raise RuntimeError("GCS_WEATHER_BUCKET env var not set")
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(f"charts/{region}/hazards.geojson")
