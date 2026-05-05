@@ -6,27 +6,37 @@ bbox, packs to a compressed ``.npz``, and uploads to GCS at
 
 Sources:
 
-  - **Lake Michigan**: NCEI Great Lakes Bathymetry, 3 arc-second grid
-    https://www.ngdc.noaa.gov/mgg/greatlakes/michigan.html
-    Datum: Low Water Datum (IGLD85)
+  - **Lake Michigan**: NCEI Great Lakes Bathymetry, 3 arc-second grid.
+    Distributed as ``.grd.gz`` (gzipped GMT NetCDF). Worker decompresses
+    on-disk before xarray reads it.
+    https://www.ncei.noaa.gov/products/great-lakes-bathymetry
+    Datum: Low Water Datum (LWD)
 
-  - **Coastal regions**: NOAA Coastal Relief Model volumes 1–10, 3 arc-
-    second grids covering US coastlines from Maine to Hawaii.
+  - **Coastal regions**: NOAA Coastal Relief Model volumes 1–10, 1 or 3
+    arc-second grids covering US coastlines from Maine to Hawaii. CRM
+    volumes 1–5, 7, 8, 9, 10 were refreshed 2023–2025 to 1 arc-second.
+    Volume 6 (Southern California) is currently under refresh and only
+    available as the 2012 1as v2 release.
     https://www.ncei.noaa.gov/products/coastal-relief-model
     Datum: MLLW
 
-Run as a one-shot Cloud Run Job, manually for now. CRM/NCEI updates
-on multi-year cycles, so this isn't on a scheduler.
+URLs verified against the NCEI THREDDS catalog 2026-05-05. NOAA does
+sometimes move data; if a URL 404s, browse to the product landing page,
+find the "NetCDF" link in the data-access table, and update SOURCES.
 
-Usage:
+Run as a one-shot Cloud Run Job, manually for now.
 
-    # Lake Michigan (covers chicago, milwaukee venues + great-lakes routes)
-    python -m workers.bathymetry_ingest --region conus --source ncei_great_lakes
+Usage (PowerShell — use backticks for line continuation, NOT backslashes):
 
-    # SoCal coast (covers long_beach, san_diego venues)
-    python -m workers.bathymetry_ingest --region conus --source ncei_crm_vol6
+    python -m workers.bathymetry_ingest `
+        --region conus `
+        --source ncei_great_lakes `
+        --target-resolution-deg 0.005 `
+        --dry-run
 
-    # Etc. for other CRM volumes — see SOURCES below.
+Or single-line on any shell:
+
+    python -m workers.bathymetry_ingest --region conus --source ncei_great_lakes --target-resolution-deg 0.005 --dry-run
 
 Environment:
 
@@ -41,9 +51,11 @@ than any draft" and avoids it naturally.
 from __future__ import annotations
 
 import argparse
+import gzip
 import io
 import logging
 import os
+import shutil
 import sys
 import urllib.request
 from dataclasses import dataclass
@@ -68,76 +80,100 @@ log = logging.getLogger("bathymetry_ingest")
 
 @dataclass(frozen=True)
 class BathySource:
-    """A NOAA bathymetric data product we know how to ingest."""
+    """A NOAA bathymetric data product we know how to ingest.
+
+    ``url``: direct download URL. ``.gz`` suffixes are auto-decompressed.
+    ``filename``: used for the local cache file (after decompression).
+    """
     name: str
     url: str
+    filename: str
     datum: str
     description: str
 
 
-# CRM volume URLs are the NCEI THREDDS NetCDF endpoints. Each volume is
-# served as a single .nc file at native 3 arc-sec resolution.
+# URLs verified 2026-05-05 against NCEI product pages. If NOAA renames or
+# moves these, the worker will 404 with a clear message — go to the
+# product page, copy the new NetCDF link, update here.
 SOURCES: dict[str, BathySource] = {
     "ncei_great_lakes": BathySource(
         name="ncei_great_lakes",
-        url=(
-            "https://www.ngdc.noaa.gov/thredds/fileServer/regional/"
-            "michigan_lld.nc"
-        ),
+        url="https://www.ngdc.noaa.gov/mgg/greatlakes/michigan/data/netcdf/michigan_lld.grd.gz",
+        filename="michigan_lld.grd",
         datum="LWD",
         description="NCEI Great Lakes — Lake Michigan, 3 arc-sec",
     ),
+    # CRM volumes — refreshed 2023–2025, 1 arc-sec native resolution.
+    # File names follow the pattern crm_<region>_1as[_versN].nc.
     "ncei_crm_vol1": BathySource(
         name="ncei_crm_vol1",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol1.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_neatl_1as_vers2.nc",
+        filename="crm_neatl_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 1 — Northeast Atlantic (Maine to NJ)",
     ),
     "ncei_crm_vol2": BathySource(
         name="ncei_crm_vol2",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol2.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_seatl_1as_vers2.nc",
+        filename="crm_seatl_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 2 — Southeast Atlantic (NJ to FL)",
     ),
     "ncei_crm_vol3": BathySource(
         name="ncei_crm_vol3",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol3.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_egulf_1as_vers2.nc",
+        filename="crm_egulf_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 3 — Florida and East Gulf",
     ),
     "ncei_crm_vol4": BathySource(
         name="ncei_crm_vol4",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol4.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_cgulf_1as_vers2.nc",
+        filename="crm_cgulf_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 4 — Central Gulf",
     ),
     "ncei_crm_vol5": BathySource(
         name="ncei_crm_vol5",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol5.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_wgulf_1as_vers2.nc",
+        filename="crm_wgulf_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 5 — Western Gulf (TX/LA)",
     ),
     "ncei_crm_vol6": BathySource(
         name="ncei_crm_vol6",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol6.nc",
+        # Vol 6 (SoCal) is still on the older 2012 v2 release as of
+        # 2026-05; NCEI's note says a refresh is in progress.
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_socal_1as_vers2.nc",
+        filename="crm_socal_1as_vers2.nc",
         datum="MLLW",
-        description="CRM Vol 6 — Southern California",
+        description="CRM Vol 6 — Southern California (2012 v2 — refresh pending)",
     ),
     "ncei_crm_vol7": BathySource(
         name="ncei_crm_vol7",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol7.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_cpac_1as_vers2.nc",
+        filename="crm_cpac_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 7 — Central Pacific (CA-OR)",
     ),
     "ncei_crm_vol8": BathySource(
         name="ncei_crm_vol8",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol8.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_npac_1as_vers2.nc",
+        filename="crm_npac_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 8 — Northwest Pacific (WA)",
     ),
+    "ncei_crm_vol9": BathySource(
+        name="ncei_crm_vol9",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_prvi_1as_vers2.nc",
+        filename="crm_prvi_1as_vers2.nc",
+        datum="MLLW",
+        description="CRM Vol 9 — Puerto Rico / U.S. Virgin Islands",
+    ),
     "ncei_crm_vol10": BathySource(
         name="ncei_crm_vol10",
-        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_vol10.nc",
+        url="https://www.ngdc.noaa.gov/thredds/fileServer/crm/crm_hawaii_1as_vers2.nc",
+        filename="crm_hawaii_1as_vers2.nc",
         datum="MLLW",
         description="CRM Vol 10 — Hawaii",
     ),
@@ -147,15 +183,35 @@ SOURCES: dict[str, BathySource] = {
 # ─── Pipeline ───────────────────────────────────────────────────────────
 
 
-def download(source: BathySource, dest: Path) -> None:
-    """Stream the NetCDF to disk. NCEI grids are 100MB–2GB depending on volume."""
-    log.info("downloading %s → %s", source.url, dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(source.url, timeout=600) as resp, dest.open("wb") as out:
+def download(source: BathySource, dest_dir: Path) -> Path:
+    """Download (and gunzip if applicable) the source NetCDF into dest_dir.
+
+    Returns the path to the ready-to-read .nc file.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    is_gzipped = source.url.endswith(".gz")
+    raw_path = dest_dir / (source.filename + (".gz" if is_gzipped else ""))
+    final_path = dest_dir / source.filename
+
+    if final_path.exists():
+        log.info("using cached %s (%.1f MB)", final_path, final_path.stat().st_size / 1e6)
+        return final_path
+
+    log.info("downloading %s → %s", source.url, raw_path)
+    with urllib.request.urlopen(source.url, timeout=600) as resp, raw_path.open("wb") as out:
         # 1 MB chunks
         while chunk := resp.read(1 << 20):
             out.write(chunk)
-    log.info("downloaded %.1f MB", dest.stat().st_size / 1e6)
+    log.info("downloaded %.1f MB", raw_path.stat().st_size / 1e6)
+
+    if is_gzipped:
+        log.info("decompressing %s → %s", raw_path, final_path)
+        with gzip.open(raw_path, "rb") as gz, final_path.open("wb") as out:
+            shutil.copyfileobj(gz, out, length=1 << 20)
+        raw_path.unlink()  # keep cache lean
+        log.info("decompressed %.1f MB", final_path.stat().st_size / 1e6)
+
+    return final_path
 
 
 def parse_and_clip(
@@ -165,20 +221,18 @@ def parse_and_clip(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Read NetCDF, normalize to (lats, lons, depth_m_positive_down), clip to bbox.
 
-    NCEI NetCDFs use varied variable names depending on volume — we probe
-    common candidates rather than hardcoding. ``Band1`` is the GMT NetCDF
-    convention; ``z`` is the COARDS convention; ``elevation`` is what
-    newer GeoTIFF-derived NetCDFs use.
+    NCEI NetCDFs use varied variable names. ``Band1`` is the GMT GeoTIFF
+    convention; ``z`` is the GMT .grd / COARDS convention; ``elevation``
+    is what newer NetCDF-from-GeoTIFF derived files use. We probe.
 
-    If ``target_resolution_deg`` is set, downsample after clipping. Useful
-    for CRM volumes whose native res produces 200+ MB region grids.
+    If ``target_resolution_deg`` is set, downsample after clipping.
     """
     log.info("opening %s", nc_path)
     ds = xr.open_dataset(nc_path)
     try:
         # Find depth variable
         depth_var = None
-        for cand in ("Band1", "z", "elevation", "depth"):
+        for cand in ("Band1", "z", "elevation", "depth", "topo"):
             if cand in ds.data_vars:
                 depth_var = cand
                 break
@@ -201,6 +255,11 @@ def parse_and_clip(
                 break
         if lat_var is None or lon_var is None:
             raise ValueError(f"no lat/lon coords in {nc_path}; coords={list(ds.coords)}")
+
+        log.info(
+            "detected vars: depth=%s, lat=%s, lon=%s",
+            depth_var, lat_var, lon_var,
+        )
 
         lats = np.asarray(ds[lat_var].values, dtype=np.float64)
         lons = np.asarray(ds[lon_var].values, dtype=np.float64)
@@ -226,7 +285,11 @@ def parse_and_clip(
         lat_mask = (lats >= min_lat) & (lats <= max_lat)
         lon_mask = (lons >= min_lon) & (lons <= max_lon)
         if not lat_mask.any() or not lon_mask.any():
-            raise ValueError(f"bbox {bbox} produced empty grid for {nc_path}")
+            raise ValueError(
+                f"bbox {bbox} produced empty grid for {nc_path}. "
+                f"Source lat range: {lats[0]:.2f}..{lats[-1]:.2f}, "
+                f"lon range: {lons[0]:.2f}..{lons[-1]:.2f}"
+            )
         lats = lats[lat_mask]
         lons = lons[lon_mask]
         elev = elev[np.ix_(lat_mask, lon_mask)]
@@ -310,13 +373,13 @@ def ingest(
     region = REGIONS[region_name]
     source = SOURCES[source_name]
 
-    download_dir = download_dir or Path("/tmp/sailline_bathy")
-    nc_path = download_dir / f"{source.name}.nc"
+    # Default to a temp dir that works on Windows ("/tmp" doesn't exist
+    # by default on Windows; fall back to %TEMP% via tempfile).
+    if download_dir is None:
+        import tempfile
+        download_dir = Path(tempfile.gettempdir()) / "sailline_bathy"
 
-    if not nc_path.exists():
-        download(source, nc_path)
-    else:
-        log.info("using cached download %s (%.1f MB)", nc_path, nc_path.stat().st_size / 1e6)
+    nc_path = download(source, download_dir)
 
     lats, lons, depth = parse_and_clip(
         nc_path, bbox=region.bbox, target_resolution_deg=target_resolution_deg,
@@ -353,9 +416,10 @@ def main() -> None:
     parser.add_argument("--source", required=True, help=f"data source ({sorted(SOURCES)})")
     parser.add_argument(
         "--target-resolution-deg", type=float, default=None,
-        help="optional downsample resolution. Native is ~0.0008° (3 arc-sec). "
-             "For CONUS-wide runs at native res grids exceed 1 GB; pass 0.005 (~500m) "
-             "to keep the packed file under 100 MB.",
+        help="optional downsample resolution. Native NCEI Great Lakes is ~0.0008° "
+             "(3 arc-sec); CRM volumes are 0.000277° (1 arc-sec). "
+             "For CONUS-wide runs at native res grids exceed 1 GB; pass 0.005 "
+             "(~500m) to keep the packed file under 100 MB.",
     )
     parser.add_argument("--dry-run", action="store_true", help="skip GCS upload, write locally")
     args = parser.parse_args()
