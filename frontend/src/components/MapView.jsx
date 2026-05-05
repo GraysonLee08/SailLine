@@ -34,6 +34,8 @@ import { useGeolocation } from "../hooks/useGeolocation";
 import { useCountdown } from "../hooks/useCountdown";
 import { useRegion } from "../hooks/useRegion";
 import { useTrackRecorder } from "../hooks/useTrackRecorder";
+import { useRouting } from "../hooks/useRouting";
+import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
@@ -194,6 +196,10 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   // surface an error if the user somehow hits the button without one.
   const recorder = useTrackRecorder(activeRace?.id ?? null);
 
+  // Routing — POST /api/routing/compute against the current HRRR wind.
+  // Disabled when no active race; UI gates the button.
+  const routing = useRouting(activeRace?.id ?? null);
+
   // Initialize map once. Center on the resolved base so the first paint
   // is already in the right place — useRegion returns synchronously from
   // localStorage or DEFAULT_BASE_REGION.
@@ -284,6 +290,20 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           "line-color": "#22a06b",
           "line-width": 3.5,
           "line-opacity": 0.92,
+        },
+      });
+
+      // Computed isochrone route — magenta, thinner than the track line
+      // so the actual sailed track stays prominent during a race.
+      map.addSource("route", { type: "geojson", data: emptyLine() });
+      map.addLayer({
+        id: "route-line",
+        type: "line",
+        source: "route",
+        paint: {
+          "line-color": "#c026d3",
+          "line-width": 3,
+          "line-opacity": 0.85,
         },
       });
 
@@ -454,6 +474,23 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     });
   }, [recorder.points, styleLoaded]);
 
+  // Push the computed isochrone route to the magenta line source whenever
+  // the routing hook produces a new GeoJSON Feature. Empty-data path
+  // clears the line on logout / race-cleared / fresh-recompute-error.
+  useEffect(() => {
+    if (!styleLoaded) return;
+    const map = mapRef.current;
+    if (!map) return;
+    const src = map.getSource("route");
+    if (!src) return;
+
+    if (!routing.route) {
+      src.setData(emptyLine());
+      return;
+    }
+    src.setData(routing.route);
+  }, [routing.route, styleLoaded]);
+
   return (
     <div style={styles.shell}>
       <div ref={containerRef} style={styles.map} />
@@ -469,6 +506,7 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           }
           onEdit={onEditActive}
           onClear={onClearActive}
+          routing={routing}
         />
       )}
 
@@ -496,6 +534,7 @@ function RaceOverlay({
   onToggleRecord,
   onEdit,
   onClear,
+  routing,
 }) {
   const cd = useCountdown(race.start_at);
   return (
@@ -509,15 +548,15 @@ function RaceOverlay({
             color: cd.isUnset
               ? "var(--ink-3)"
               : cd.isPast
-              ? "var(--ink-3)"
-              : "#1a73e8",
+                ? "var(--ink-3)"
+                : "#1a73e8",
           }}
         >
           {cd.isUnset
             ? "No start time set"
             : cd.isPast
-            ? cd.label
-            : `Starts in ${cd.label}`}
+              ? cd.label
+              : `Starts in ${cd.label}`}
         </div>
         {recording && queueLength > 0 && (
           <div style={styles.queueHint}>
@@ -528,8 +567,18 @@ function RaceOverlay({
         {!recording && recorderError && (
           <div style={styles.recordError}>{recorderError}</div>
         )}
+        {routing && (
+          <RouteStatus meta={routing.meta} error={routing.error} />
+        )}
       </div>
       <div style={styles.raceActions}>
+        {routing && (
+          <ComputeRouteButton
+            loading={routing.loading}
+            hasRoute={!!routing.route}
+            onClick={routing.compute}
+          />
+        )}
         <button
           onClick={onToggleRecord}
           style={recording ? styles.recordBtnOn : styles.recordBtn}

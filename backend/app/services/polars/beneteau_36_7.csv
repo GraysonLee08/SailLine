@@ -1,0 +1,24 @@
+# Beneteau First 36.7 polar — boat speed (kts) by True Wind Angle (rows) and True Wind Speed (cols).
+# Header row: twa\tws followed by TWS values in knots.
+# Each data row: TWA in degrees, then boat speed at each TWS column.
+# TWA is symmetric — values cover 0–180; for TWA > 180 fold to 360 - TWA.
+#
+# Values below are typical published 36.7 numbers and should be verified against
+# docs/First_36.7.pdf before Saturday. Spot-check: upwind VMG at 12 kt TWS, ~40°
+# TWA, expect ~5.5 kt boat speed.
+#
+# To swap in different numbers: edit the table. The reader accepts any
+# rectangular grid; non-uniform TWA/TWS spacing is fine (bilinear interp handles it).
+twa\tws,6,8,10,12,14,16,20
+36,3.0,4.0,4.7,5.1,5.3,5.4,5.5
+40,3.4,4.5,5.2,5.5,5.7,5.8,5.9
+50,4.0,5.0,5.6,5.9,6.1,6.3,6.4
+60,4.2,5.3,5.9,6.2,6.4,6.6,6.7
+75,4.4,5.5,6.1,6.4,6.7,6.9,7.0
+90,4.4,5.5,6.1,6.5,6.8,7.1,7.3
+110,4.3,5.4,6.0,6.4,6.8,7.1,7.5
+120,4.1,5.2,5.8,6.3,6.7,7.1,7.6
+135,3.8,4.9,5.6,6.1,6.6,7.0,7.7
+150,3.4,4.5,5.2,5.8,6.4,6.8,7.5
+165,2.9,3.9,4.6,5.2,5.7,6.2,6.9
+180,2.5,3.5,4.2,4.8,5.3,5.7,6.4
