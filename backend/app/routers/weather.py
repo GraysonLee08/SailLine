@@ -17,6 +17,7 @@ from asyncio import to_thread
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from google.cloud import storage
+from google.cloud.exceptions import NotFound
 
 from app import redis_client
 from app.config import settings
@@ -90,27 +91,29 @@ async def _read_redis(key: str) -> bytes | None:
 
 
 def _read_latest_gcs(source: str, region: str) -> bytes | None:
-    """Sync — list/download from GCS. Call via asyncio.to_thread.
+    """Sync — single get_blob on the per-(source, region) latest pointer.
 
-    Looks under {source}/{region}/. Filenames are YYYYMMDDTHHMMZ.json.gz
-    so lexicographic sort == reverse-chronological.
+    Worker writes both a timestamped archive object and a stable
+    ``{source}/{region}/latest.json.gz`` alongside it. We only need the
+    pointer here — no list, no sort, O(1) regardless of archive depth.
+    NotFound is the cold-start case (no cycle has run yet) and degrades
+    gracefully to None so the caller returns 503.
+
+    Call via ``asyncio.to_thread`` — the GCS client is sync.
     """
     if not settings.gcs_weather_bucket:
         return None
     try:
         client = storage.Client()
-        bucket = client.bucket(settings.gcs_weather_bucket)
-
-        prefix = f"{source}/{region}/"
-        blobs = list(bucket.list_blobs(prefix=prefix))
-        if not blobs:
-            return None
-        blobs.sort(key=lambda b: b.name, reverse=True)
-
+        blob = client.bucket(settings.gcs_weather_bucket).blob(
+            f"{source}/{region}/latest.json.gz"
+        )
         # raw_download=True keeps the bytes gzipped. Without it the GCS
         # client transparently decompresses because we set content_encoding
         # at upload time, and we'd be re-gzipping on the way out.
-        return blobs[0].download_as_bytes(raw_download=True)
+        return blob.download_as_bytes(raw_download=True)
+    except NotFound:
+        return None
     except Exception:
         log.exception("GCS fallback failed for source=%s region=%s", source, region)
         return None
