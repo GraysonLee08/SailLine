@@ -15,11 +15,23 @@ Layers we extract from ENC:
   - LNDARE   — Land area (most important; subsumes the hand-eyeballed shoreline)
   - UWTROC   — Underwater rocks awash or above water
   - OBSTRN   — Generic obstructions (pilings, mooring fields, etc.)
-  - WRECKS   — Submerged wrecks (with depth attribute, but we treat all as hazards)
+  - WRECKS   — Submerged wrecks
   - PIPSOL   — Submerged pipelines
-  - RESARE   — Restricted areas (security zones, naval ranges, no-go zones)
 
-A point is "hazardous" iff it falls inside any of these polygons. The
+Layers we DROP at load time:
+
+  - RESARE   — Restricted areas. The ENC RESARE layer mixes navigation-
+    critical zones (security exclusion areas, naval ranges) with
+    plenty of non-blockers (fishing zones, anchoring restrictions,
+    water-intake protection zones). Without filtering by the CATREA
+    subcategory we'd treat all of them as no-go, which over-blocks
+    routes — observed near Naval Station Great Lakes where RESARE
+    polygons walled off the entire western Lake Michigan shore.
+    Proper handling is a v1.x feature: load the layer, parse CATREA
+    per feature, and only treat the genuinely navigation-blocking
+    subcategories as hazards.
+
+A point is "hazardous" iff it falls inside any retained polygon. The
 predicate is monotonic across layers — adding more layers only increases
 the no-go area, never reduces it.
 """
@@ -40,6 +52,12 @@ from shapely.strtree import STRtree
 from app.config import settings
 
 log = logging.getLogger(__name__)
+
+
+# Layers we drop at load time. Add to this set to widen the filter
+# without re-ingesting the GeoJSON. Removing entries requires nothing
+# beyond a process restart since the GeoJSON on GCS contains all layers.
+SKIP_LAYERS: frozenset[str] = frozenset({"RESARE"})
 
 
 # ─── Data class ─────────────────────────────────────────────────────────
@@ -109,6 +127,7 @@ def _load_from_gcs(region: str) -> Optional[HazardIndex]:
     fc = json.loads(raw.decode("utf-8"))
     polygons: list[BaseGeometry] = []
     layers_seen: set[str] = set()
+    skipped_counts: dict[str, int] = {}
 
     for feat in fc.get("features", []):
         try:
@@ -118,15 +137,35 @@ def _load_from_gcs(region: str) -> Optional[HazardIndex]:
         if geom.is_empty:
             continue
         gt = geom.geom_type
+        # Accept Polygon and MultiPolygon. Lines/Points are skipped at
+        # v1 (handled when we add buffered hazards).
         if gt not in ("Polygon", "MultiPolygon"):
             continue
-        polygons.append(geom)
+
         layer = feat.get("properties", {}).get("layer")
+
+        # Drop layers in the skip set. Tracked separately so we can log
+        # the count for visibility.
+        if layer in SKIP_LAYERS:
+            skipped_counts[layer] = skipped_counts.get(layer, 0) + 1
+            continue
+
+        polygons.append(geom)
         if layer:
             layers_seen.add(layer)
 
+    if skipped_counts:
+        log.info(
+            "region=%s skipped layers: %s",
+            region,
+            ", ".join(f"{k}={v}" for k, v in sorted(skipped_counts.items())),
+        )
+
     if not polygons:
-        log.info("region=%s loaded 0 hazard polygons (file present but empty)", region)
+        log.info(
+            "region=%s loaded 0 hazard polygons (file present but empty after filters)",
+            region,
+        )
         return HazardIndex(
             polygons=[], tree=STRtree([]),
             region=region, source_layers=(), feature_count=0,
@@ -171,4 +210,4 @@ def invalidate_cache(region: Optional[str] = None) -> None:
             _CACHE.pop(region, None)
 
 
-__all__ = ["HazardIndex", "HazardsUnavailable", "for_region", "invalidate_cache"]
+__all__ = ["HazardIndex", "HazardsUnavailable", "for_region", "invalidate_cache", "SKIP_LAYERS"]
