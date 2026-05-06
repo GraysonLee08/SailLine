@@ -10,6 +10,11 @@ time-aware WindForecast spanning the race window, runs the isochrone
 engine threading simulated time, and returns a GeoJSON Feature plus
 diagnostic metadata.
 
+Region resolution returns a (base_region, venue) pair. base_region drives
+wind + bathymetry lookup (always set; defaults to 'conus'). venue is set
+only when the marks centroid falls inside a high-res venue bbox — that's
+the trigger to load harbour-scale ENC hazards alongside the base ones.
+
 Forecast not yet available: returns HTTP 425 (Too Early) with
 { available_at, hours_until_available }. The frontend schedules a
 refetch at that timestamp.
@@ -31,7 +36,7 @@ from pydantic import BaseModel, Field
 
 from app import db, redis_client
 from app.auth import get_current_user
-from app.regions import REGIONS, base_region_for_point
+from app.regions import REGIONS, base_region_for_point, venue_for_point
 from app.services.bathymetry import BathymetryUnavailable
 from app.services.boats import spec_for_class
 from app.services.polars import load_polar
@@ -69,6 +74,7 @@ class RouteMeta(BaseModel):
     iterations: int
     nodes_explored: int
     region: str
+    venue: Optional[str] = None
     forecast_quality: str            # "hrrr", "gfs", "hrrr+gfs"
     race_start: Optional[str]
     polar: str
@@ -93,18 +99,29 @@ class ForecastPendingOut(BaseModel):
 
 
 # Bump on any change to engine inputs/outputs (polar, mask, algorithm).
-ENGINE_VERSION = "v6-rolling-forecast"
+ENGINE_VERSION = "v7-venue-hazards"
 
 ROUTE_CACHE_TTL_S = 3600
 
 
-def _resolve_region(marks: list[dict]) -> str:
+def _resolve_region(marks: list[dict]) -> tuple[str, Optional[str]]:
+    """Return (base_region, venue_or_None) for the centroid of the marks.
+
+    Base region drives wind + bathymetry lookup (always set, defaults to
+    'conus'). Venue is set only when the centroid falls inside one of
+    the high-res venue bboxes — that's the trigger for loading
+    harbour-scale ENC hazards.
+    """
     if not marks:
-        return "conus"
+        return "conus", None
     lat_c = sum(m["lat"] for m in marks) / len(marks)
     lon_c = sum(m["lon"] for m in marks) / len(marks)
     base = base_region_for_point(lat_c, lon_c)
-    return base.name if base is not None else "conus"
+    venue = venue_for_point(lat_c, lon_c)
+    return (
+        base.name if base is not None else "conus",
+        venue.name if venue is not None else None,
+    )
 
 
 async def _assert_race_owned(
@@ -159,18 +176,20 @@ async def compute_route(
     if race_start.tzinfo is None:
         race_start = race_start.replace(tzinfo=timezone.utc)
 
-    region = _resolve_region(marks)
+    region, venue = _resolve_region(marks)
     if region not in REGIONS:
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             f"resolved region {region!r} not in registry",
         )
 
-    log.warning("ROUTING DEBUG region=%s has_gfs=%s race_start=%s now+18h=%s",
-            region,
-            "gfs" in REGIONS[region].sources,
-            race_start.isoformat(),
-            (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat())
+    log.warning(
+        "ROUTING DEBUG region=%s venue=%s has_gfs=%s race_start=%s now+18h=%s",
+        region, venue,
+        "gfs" in REGIONS[region].sources,
+        race_start.isoformat(),
+        (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat(),
+    )
 
     spec = spec_for_class(race["boat_class"])
     polar_path = f"app/services/polars/{spec.polar_csv}"
@@ -200,7 +219,9 @@ async def compute_route(
     # per scheduled gun time. Forecast quality string captures whether
     # this is HRRR-only, GFS-only, or hybrid — not strictly needed for
     # correctness but it disambiguates routes computed against different
-    # forecast horizons even within the same cycle.
+    # forecast horizons even within the same cycle. Venue is part of the
+    # key so a venue-hazard ingest invalidates cached routes for that
+    # venue without touching base-region routes.
     redis = redis_client.get_client()
     snapshot_sources = "+".join(
         sorted({s.source or "?" for s in forecast.snapshots})
@@ -209,7 +230,7 @@ async def compute_route(
         f"route:{ENGINE_VERSION}:{payload.race_id}:"
         f"{race_start.isoformat()}:"
         f"{forecast.snapshots[0].reference_time}:{forecast.snapshots[-1].valid_time}:"
-        f"{snapshot_sources}:{payload.safety_factor:.2f}"
+        f"{snapshot_sources}:{payload.safety_factor:.2f}:venue={venue or '-'}"
     )
     cached_blob = await redis.get(cache_key)
     if cached_blob is not None:
@@ -223,6 +244,7 @@ async def compute_route(
             region=region,
             draft_m=spec.draft_m,
             safety_factor=payload.safety_factor,
+            venue=venue,
         )
     except BathymetryUnavailable as exc:
         raise HTTPException(
@@ -234,9 +256,9 @@ async def compute_route(
     finish = (marks[-1]["lat"], marks[-1]["lon"])
 
     log.info(
-        "compute route race_id=%s region=%s polar=%s race_start=%s "
+        "compute route race_id=%s region=%s venue=%s polar=%s race_start=%s "
         "forecast_quality=%s start=%s finish=%s",
-        payload.race_id, region, polar.name, race_start.isoformat(),
+        payload.race_id, region, venue, polar.name, race_start.isoformat(),
         forecast.quality, start, finish,
     )
 
@@ -259,6 +281,7 @@ async def compute_route(
             "draft_m": spec.draft_m,
             "min_depth_m": min_depth_m,
             "region": region,
+            "venue": venue,
             "race_start": race_start.isoformat(),
             "forecast_quality": forecast.quality,
         },
@@ -273,6 +296,7 @@ async def compute_route(
             "iterations": result.iterations,
             "nodes_explored": result.nodes_explored,
             "region": region,
+            "venue": venue,
             "forecast_quality": forecast.quality,
             "race_start": race_start.isoformat(),
             "polar": polar.name,

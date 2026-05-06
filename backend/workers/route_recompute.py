@@ -9,6 +9,13 @@ best, and publishes a notification when the improvement clears the threshold.
 Frontend opens an SSE stream on /api/routing/notifications/{race_id} that
 tails the per-race Redis pub/sub channel and surfaces the popup.
 
+Region resolution mirrors the user-facing endpoint: the marks centroid
+picks both a base region (drives wind + bathymetry) and an optional
+venue (drives harbour-scale ENC hazard loading). Background recomputes
+must use the same hazard set as the synchronous endpoint or "better"
+routes could cut through breakwalls the user-facing route avoids — that
+would surface as alerts the user immediately distrusts.
+
 Trigger options (pick one when wiring infra):
     A. Cloud Scheduler job runs this 5 min after each ingest cycle.
     B. ingest_cycle() publishes 'cycles:updated' on Redis; this worker
@@ -32,7 +39,7 @@ from uuid import UUID
 import asyncpg
 
 from app import db, redis_client
-from app.regions import base_region_for_point
+from app.regions import base_region_for_point, venue_for_point
 from app.services.bathymetry import BathymetryUnavailable
 from app.services.boats import spec_for_class
 from app.services.polars import load_polar
@@ -96,6 +103,22 @@ async def _list_active_races(conn: asyncpg.Connection) -> list[_ActiveRace]:
     return races
 
 
+def _resolve_region(marks: list[dict]) -> tuple[str, Optional[str]]:
+    """Return (base_region, venue_or_None) for the marks centroid.
+
+    Matches the synchronous endpoint's resolver so background recomputes
+    use the same hazard set as user-facing computes.
+    """
+    lat_c = sum(m["lat"] for m in marks) / len(marks)
+    lon_c = sum(m["lon"] for m in marks) / len(marks)
+    base = base_region_for_point(lat_c, lon_c)
+    venue = venue_for_point(lat_c, lon_c)
+    return (
+        base.name if base is not None else "conus",
+        venue.name if venue is not None else None,
+    )
+
+
 async def _read_last_total_minutes(race_id: UUID) -> Optional[float]:
     """Last total_minutes we notified about (or computed) for this race."""
     redis = redis_client.get_client()
@@ -136,11 +159,7 @@ async def _publish_better_route(race: _ActiveRace, route_feature: dict,
 
 
 async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
-    region_obj = base_region_for_point(
-        sum(m["lat"] for m in race.marks) / len(race.marks),
-        sum(m["lon"] for m in race.marks) / len(race.marks),
-    )
-    region = region_obj.name if region_obj else "conus"
+    region, venue = _resolve_region(race.marks)
 
     try:
         spec = spec_for_class(race.boat_class)
@@ -164,6 +183,7 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
         is_navigable = make_navigable_predicate(
             region=region, draft_m=spec.draft_m,
             safety_factor=DEFAULT_SAFETY_FACTOR,
+            venue=venue,
         )
     except BathymetryUnavailable:
         log.warning("race=%s skip: no bathymetry for region=%s", race.id, region)
@@ -172,6 +192,11 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
     polar = load_polar(f"app/services/polars/{spec.polar_csv}")
     start = (race.marks[0]["lat"], race.marks[0]["lon"])
     finish = (race.marks[-1]["lat"], race.marks[-1]["lon"])
+
+    log.info(
+        "recompute race=%s region=%s venue=%s polar=%s",
+        race.id, region, venue, polar.name,
+    )
 
     result = compute_isochrone_route(
         start=start, finish=finish,
@@ -199,6 +224,8 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
         "race_start": race.start_at.isoformat(),
         "forecast_quality": forecast.quality,
         "polar": polar.name,
+        "region": region,
+        "venue": venue,
     })
     await _publish_better_route(race, feature, last, result.total_minutes)
     await _store_last_total_minutes(race.id, result.total_minutes)
