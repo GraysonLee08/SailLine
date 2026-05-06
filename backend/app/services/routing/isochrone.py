@@ -11,20 +11,28 @@ Time-step fan algorithm:
        - Project the boat forward ``speed × dt`` along the heading
        - Reject candidates that fail the ``is_navigable`` predicate
          (depth + ENC hazards)
-  3. Cull dominated candidates: bin by angular bearing from the start,
-     keep only the candidate furthest from start in each bin
+  3. **Destination-focused culling**: bin candidates by their bearing
+     FROM THE FINISH. Per bin, keep the candidate CLOSEST to finish.
+     This preserves spatial diversity around the destination — offshore
+     candidates approaching from a different bearing get their own
+     bin and survive even when shore-hugging candidates are temporarily
+     faster. Compare with the older bearing-from-start / max-distance
+     formulation, which is greedy toward "fastest" and gets stuck on
+     local obstacles when the optimal-by-VMG path runs into land.
   4. Stop when any frontier point is within ``finish_radius_nm`` of the
      finish, or ``max_iterations`` is reached
   5. Trace back through parent pointers, build the path
-
-The angular-bin domination check is the standard isochrone trick — it
-keeps the frontier from exploding without sacrificing optimality at the
-chosen bin resolution. 72 bins (5°) at v1; tunable.
 
 The ``is_navigable`` callback is the single integration point with
 bathymetry + chart hazards. The engine has no opinion about *why* a
 point is unsafe — the predicate decides. Build it via
 ``app.services.routing.make_navigable_predicate``.
+
+Algorithm references: this is a variant of standard sector-culling
+isochrone routing (Hagiwara 1989). Substituting bearing-from-finish for
+bearing-from-source as the bin axis is the obstacle-aware variant —
+keeps the search admissible to alternate approach paths around
+coastline / depth constraints.
 """
 from __future__ import annotations
 
@@ -252,7 +260,7 @@ def compute_isochrone_route(
     Args:
         start: (lat, lon) of the race start
         finish: (lat, lon) of the finish mark
-        polar: Polar object with a ``boat_speed_kt(twa, tws_kt)`` method
+        polar: Polar object with a ``boat_speed(twa, tws_kt)`` method
         wind: WindField with u/v components
         is_navigable: optional (lat, lon) -> bool. False rejects the
             candidate point. None means no land/depth checks (for tests
@@ -264,8 +272,8 @@ def compute_isochrone_route(
         max_iterations: hard ceiling. 240 × 5 min = 20 hours.
         finish_radius_nm: how close is "reached." 0.5 nm catches typical
             finish-line widths.
-        angular_bins: domination culling bin count. More bins = larger
-            frontier = slower but more accurate.
+        angular_bins: domination culling bin count. Bins by bearing-from-
+            finish; per bin, keeps the candidate closest to the finish.
 
     Returns:
         RouteResult. ``reached=False`` if the search ran out of iterations
@@ -292,6 +300,7 @@ def compute_isochrone_route(
     dt_seconds = dt_minutes * 60.0
     finish_radius_m = finish_radius_nm / M_TO_NM
     heading_count = int(round(360.0 / heading_step_deg))
+    bin_width = 360.0 / angular_bins
 
     # All explored nodes flat list. parent_idx points into this list.
     all_nodes: list[_Node] = [
@@ -335,18 +344,21 @@ def compute_isochrone_route(
             # Wholly trapped — no frontier extensions survived. Done.
             break
 
-        # Domination culling: per angular bin from start, keep the
-        # candidate that's furthest from start. This is the standard
-        # isochrone outer-envelope trick.
-        bin_width = 360.0 / angular_bins
+        # Destination-focused culling: bin by bearing FROM the finish,
+        # keep the candidate CLOSEST to finish per bin. This preserves
+        # spatial diversity around the destination so candidates from
+        # different approach bearings (e.g. shore-hugging vs offshore)
+        # both survive even when one is temporarily faster — the slower
+        # one gets a chance to overtake later when the faster one runs
+        # into a wall.
         best_per_bin: dict[int, tuple[float, _Node]] = {}
         for cand in candidates:
-            bearing = _bearing_deg(start_lat, start_lon, cand.lat, cand.lon)
+            bearing = _bearing_deg(finish_lat, finish_lon, cand.lat, cand.lon)
             bin_idx = int(bearing // bin_width) % angular_bins
-            dist = _haversine_m(start_lat, start_lon, cand.lat, cand.lon)
+            dist_to_finish = _haversine_m(cand.lat, cand.lon, finish_lat, finish_lon)
             cur = best_per_bin.get(bin_idx)
-            if cur is None or dist > cur[0]:
-                best_per_bin[bin_idx] = (dist, cand)
+            if cur is None or dist_to_finish < cur[0]:
+                best_per_bin[bin_idx] = (dist_to_finish, cand)
 
         new_frontier_indices: list[int] = []
         for _, cand in best_per_bin.values():
@@ -366,18 +378,22 @@ def compute_isochrone_route(
         if reached_idx is not None:
             break
 
-    # If we reached, pick the best (earliest iteration, closest to finish).
+    # If we reached, great. Otherwise return the closest-to-finish node
+    # we ever explored (the standard isochrone "closest approach" fallback).
     if reached_idx is None:
-        # Fall back: return the frontier point closest to the finish, so
-        # the user sees something rather than nothing.
-        best = min(
-            frontier,
-            key=lambda idx: _haversine_m(
-                all_nodes[idx].lat, all_nodes[idx].lon, finish_lat, finish_lon
+        # Search across ALL nodes, not just the final frontier — earlier
+        # iterations might have gotten closer to the finish than the
+        # current frontier (which has been culled toward "spread around
+        # the destination").
+        best_node_idx = min(
+            range(len(all_nodes)),
+            key=lambda i: _haversine_m(
+                all_nodes[i].lat, all_nodes[i].lon, finish_lat, finish_lon
             ),
-            default=None,
         )
-        if best is None:
+        # If even the start is closer than any explored node (degenerate
+        # case where frontier never extended), bail with just [start].
+        if best_node_idx == 0 and len(all_nodes) == 1:
             return RouteResult(
                 path=[start],
                 headings=[0.0],
@@ -386,7 +402,7 @@ def compute_isochrone_route(
                 iterations=iteration,
                 nodes_explored=nodes_explored,
             )
-        reached_idx = best
+        reached_idx = best_node_idx
         reached = False
     else:
         reached = True

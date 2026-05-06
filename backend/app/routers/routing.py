@@ -91,7 +91,7 @@ class ComputeRouteOut(BaseModel):
 
 
 # Bump on any change to engine inputs/outputs (polar, mask, algorithm).
-ENGINE_VERSION = "v3-bathy-2" # was "v3-bathy"
+ENGINE_VERSION = "v5-finish-bin"   # was "v4-multileg"
 
 ROUTE_CACHE_TTL_S = 3600
 
