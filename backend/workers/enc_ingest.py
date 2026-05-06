@@ -33,6 +33,7 @@ Usage:
 """
 from __future__ import annotations
 
+import tempfile
 import argparse
 import json
 import logging
@@ -218,7 +219,7 @@ def ingest(region_name: str, dry_run: bool = False) -> dict:
     log.info("serialized GeoJSON: %.1f MB", len(blob) / 1e6)
 
     if dry_run:
-        out_path = Path("/tmp/sailline_enc") / f"{region.name}_hazards.geojson"
+        out_path = Path(tempfile.gettempdir()) / "sailline_enc" / f"{region.name}_hazards.geojson"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(blob)
         log.info("dry-run: wrote %s", out_path)
