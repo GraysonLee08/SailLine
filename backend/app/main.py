@@ -6,7 +6,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import auth, db, redis_client
-from app.routers import health, races, routing, tracks, users, weather
+from app.routers import (
+    health,
+    races,
+    routing,
+    routing_notifications,
+    tracks,
+    users,
+    weather,
+)
 
 
 @asynccontextmanager
@@ -33,7 +41,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — allow the React dev server and the deployed Firebase Hosting
+# CORS - allow the React dev server and the deployed Firebase Hosting
 # origins to call the API. The pattern catches both `sailline.web.app`
 # and `sailline.firebaseapp.com`, plus any future *.web.app preview
 # channels Firebase Hosting may issue. Add a custom domain here when
@@ -54,15 +62,16 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(users.router, prefix="/api")
-app.include_router(weather.router)  # router carries its own /api/weather prefix
-app.include_router(races.router)    # router carries its own /api/races prefix
-app.include_router(tracks.router)   # router carries its own /api/races/{id}/track prefix
-app.include_router(routing.router)  # router carries its own /api/routing prefix
+app.include_router(weather.router)              # router carries its own /api/weather prefix
+app.include_router(races.router)                # router carries its own /api/races prefix
+app.include_router(tracks.router)               # router carries its own /api/races/{id}/track prefix
+app.include_router(routing.router)              # /api/routing - compute endpoint
+app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
 
 
 @app.get("/")
 async def root():
-    """Root endpoint — returns a hello message and confirms cfgrib is importable."""
+    """Root endpoint - returns a hello message and confirms cfgrib is importable."""
     # Importing cfgrib here (rather than at module top) lets the app start even
     # if eccodes is missing. The /health endpoint will report the failure clearly.
     try:

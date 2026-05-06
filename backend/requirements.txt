@@ -39,6 +39,11 @@ pytest-asyncio==1.3.0
 httpx==0.28.1
 
 
+# SSE for routing stream
+sse-starlette==2.1.3
+
+
+
+
 # anthropic                         # Claude API (week 8)
 # stripe                            # Payments (week 7)
-# sse-starlette                     # SSE for routing stream (week 6)
