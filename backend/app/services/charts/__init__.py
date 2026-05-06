@@ -10,13 +10,8 @@ Storage: shares the ``sailline-weather`` bucket via
 ``settings.gcs_weather_bucket`` for v1. See the equivalent note in
 ``app.services.bathymetry`` about the bucket's lifecycle rule.
 
-Layers we extract from ENC:
-
-  - LNDARE   — Land area (most important; subsumes the hand-eyeballed shoreline)
-  - UWTROC   — Underwater rocks awash or above water
-  - OBSTRN   — Generic obstructions (pilings, mooring fields, etc.)
-  - WRECKS   — Submerged wrecks
-  - PIPSOL   — Submerged pipelines
+Layers we extract from ENC: see workers/enc_ingest.py (the layer table
+lives there since it's per-service and tied to ingest behaviour).
 
 Layers we DROP at load time:
 
@@ -31,9 +26,12 @@ Layers we DROP at load time:
     per feature, and only treat the genuinely navigation-blocking
     subcategories as hazards.
 
-A point is "hazardous" iff it falls inside any retained polygon. The
-predicate is monotonic across layers — adding more layers only increases
-the no-go area, never reduces it.
+The HazardIndex exposes two query methods. ``intersects(lat, lon)`` is
+the cheap point check; useful for spot-checking a candidate position.
+``crosses_line(lat1, lon1, lat2, lon2)`` is the exact segment check —
+catches thin polygons (breakwalls, narrow islands) that a sparse point
+sampler would miss between samples. The engine uses crosses_line for
+every isochrone segment.
 """
 from __future__ import annotations
 
@@ -45,7 +43,7 @@ from typing import Optional
 
 from google.cloud import storage
 from google.cloud.exceptions import NotFound
-from shapely.geometry import Point, shape
+from shapely.geometry import LineString, Point, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.strtree import STRtree
 
@@ -84,6 +82,29 @@ class HazardIndex:
         point = Point(lon, lat)
         for idx in self.tree.query(point):
             if self.polygons[int(idx)].covers(point):
+                return True
+        return False
+
+    def crosses_line(
+        self, lat1: float, lon1: float, lat2: float, lon2: float,
+    ) -> bool:
+        """True iff the line segment crosses (or touches) any hazard polygon.
+
+        Exact intersection test — catches thin polygons that a sparse
+        point sampler would skip over between samples. STRtree narrows
+        the candidate set by bounding-box first, so the per-segment cost
+        is one tree query plus a handful of intersection tests.
+
+        GeoJSON convention: shapely uses (x, y) = (lon, lat).
+        """
+        if not self.polygons:
+            return False
+        # Degenerate zero-length "segment" — fall back to point check.
+        if lat1 == lat2 and lon1 == lon2:
+            return self.intersects(lat1, lon1)
+        line = LineString([(lon1, lat1), (lon2, lat2)])
+        for idx in self.tree.query(line):
+            if self.polygons[int(idx)].intersects(line):
                 return True
         return False
 

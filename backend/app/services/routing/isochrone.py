@@ -5,21 +5,15 @@ Each iteration of dt_minutes:
   - For each frontier point, sweep headings 0..360 by heading_step_deg
   - Sample wind at (lat, lon, valid_time = race_start + iter*dt)
   - Compute TWA, get boat speed from polar, project forward
-  - Reject candidates whose segment from parent fails the is_navigable
-    predicate at any sample along it (NOT just at the endpoint —
-    thin obstacles like breakwalls or narrow islands can fall between
-    two endpoints that are both individually navigable)
+  - Reject candidates whose segment from parent fails the navigability
+    check. The engine prefers an exact ``is_navigable.segment(lat1,
+    lon1, lat2, lon2)`` line check when available (catches thin
+    obstacles regardless of width) and falls back to per-point
+    sampling along the segment when the predicate has no such
+    attribute (legacy callers, simple test fixtures).
   - Cull by bearing-from-finish bins (Hagiwara variant)
-  - Stop when within finish_radius_nm or max_iterations exhausted
-
-Segment sampling — added v7.1 after we observed routes cutting through
-Navy Pier breakwall (~20 m wide) and Northerly Island. At 5kt with a
-5-minute stride the boat moves ~770 m; sampling every ~100 m means the
-endpoint check is performed ~8 times along the segment instead of once.
-Cost is roughly N samples per candidate (where N = stride / step), but
-both the depth grid sample and the STRtree.query for hazard polygons
-are sub-millisecond, so the practical slowdown is small (~5–10×) and
-worth the correctness.
+  - Stop when within finish_radius_nm AND the final approach segment
+    is itself navigable
 
 Time threading: when race_start is provided, the wind argument can be a
 WindForecast (multiple snapshots). The engine just calls
@@ -42,11 +36,10 @@ EARTH_RADIUS_M = 6_371_000.0
 KT_TO_MS = 0.514_444
 M_PER_NM = 1852.0
 
-# Sampling resolution for segment navigability checks. 100 m catches
-# any obstacle wider than ~50 m reliably (Nyquist), which covers all
-# real-world breakwalls and small islands. Drop to 50 m if pier-finger
-# precision becomes important for inshore racing.
-SEGMENT_CHECK_STEP_M = 100.0
+# Used only for the per-point fallback path (legacy callers without
+# a `.segment` attribute). The production predicate uses exact line-
+# vs-polygon intersection, where this constant doesn't apply.
+SEGMENT_FALLBACK_STEP_M = 100.0
 
 
 # ─── Geometry primitives (public — tests + scripts import these) ────────
@@ -103,52 +96,33 @@ def _twa(heading_deg_: float, wind_dir_from_deg: float) -> float:
     return diff
 
 
-def _segment_navigable(
-    lat1: float, lon1: float,
-    heading: float, distance_m: float,
+def _segment_check(
+    lat1: float, lon1: float, lat2: float, lon2: float,
     is_navigable: Callable[[float, float], bool],
-) -> Optional[tuple[float, float]]:
-    """Check is_navigable along a heading-projected segment.
+) -> bool:
+    """Verify a segment is navigable end-to-end.
 
-    Samples the segment at SEGMENT_CHECK_STEP_M intervals and returns
-    the endpoint (lat2, lon2) iff every sample passes. Returns None if
-    any sample fails — the candidate move is blocked.
-
-    The endpoint is always the final sample, so callers don't need to
-    re-project after this returns.
+    Prefers the exact line-vs-polygon check exposed as
+    ``is_navigable.segment(...)`` by ``make_navigable_predicate``.
+    Falls back to per-point sampling at SEGMENT_FALLBACK_STEP_M
+    intervals for legacy callers (tests with hand-rolled lambdas etc.).
     """
+    seg = getattr(is_navigable, "segment", None)
+    if seg is not None:
+        return seg(lat1, lon1, lat2, lon2)
+
+    # Fallback: per-point sampling.
+    distance_m = haversine_m(lat1, lon1, lat2, lon2)
     if distance_m <= 0:
-        return lat1, lon1
-    n_checks = max(1, int(math.ceil(distance_m / SEGMENT_CHECK_STEP_M)))
-    last_lat = lat1
-    last_lon = lon1
+        return is_navigable(lat2, lon2)
+    n_checks = max(1, int(math.ceil(distance_m / SEGMENT_FALLBACK_STEP_M)))
+    heading = bearing_deg(lat1, lon1, lat2, lon2)
     for i in range(1, n_checks + 1):
         d = distance_m * i / n_checks
         chk_lat, chk_lon = project(lat1, lon1, heading, d)
         if not is_navigable(chk_lat, chk_lon):
-            return None
-        last_lat, last_lon = chk_lat, chk_lon
-    return last_lat, last_lon
-
-
-def _segment_navigable_to_point(
-    lat1: float, lon1: float,
-    lat2: float, lon2: float,
-    is_navigable: Callable[[float, float], bool],
-) -> bool:
-    """Variant of _segment_navigable that takes an explicit endpoint.
-
-    Used for the final approach to the finish mark (whose position is a
-    fixed lat/lon, not a heading-projected node). Returns True iff
-    every sample along the (lat1, lon1) -> (lat2, lon2) great circle
-    passes the navigability check.
-    """
-    distance_m = haversine_m(lat1, lon1, lat2, lon2)
-    if distance_m <= 0:
-        return is_navigable(lat2, lon2)
-    heading = bearing_deg(lat1, lon1, lat2, lon2)
-    result = _segment_navigable(lat1, lon1, heading, distance_m, is_navigable)
-    return result is not None
+            return False
+    return True
 
 
 # ─── Wind field ─────────────────────────────────────────────────────────
@@ -319,15 +293,13 @@ def compute_isochrone_route(
                 if speed_kt <= 0:
                     continue
                 distance_m = speed_kt * KT_TO_MS * dt_seconds
-                # Sample the segment at SEGMENT_CHECK_STEP_M intervals,
-                # not just the endpoint. Returns the endpoint (lat, lon)
-                # if the whole segment is clear; None if blocked.
-                seg_end = _segment_navigable(
-                    parent.lat, parent.lon, heading, distance_m, is_navigable,
-                )
-                if seg_end is None:
+                new_lat, new_lon = project(parent.lat, parent.lon, heading, distance_m)
+                # Whole-segment check — exact line-vs-polygon when the
+                # predicate exposes .segment, per-point fallback otherwise.
+                if not _segment_check(
+                    parent.lat, parent.lon, new_lat, new_lon, is_navigable,
+                ):
                     continue
-                new_lat, new_lon = seg_end
                 candidates.append(_Node(
                     lat=new_lat, lon=new_lon,
                     heading_deg=heading,
@@ -354,14 +326,13 @@ def compute_isochrone_route(
         new_frontier = [v[0] for v in by_bin.values()]
         # Check finish hit on the kept set. Require the final approach
         # segment (from the candidate node to the finish mark itself)
-        # to be navigable end-to-end — same stride-skip concern as the
-        # main loop. A node within finish_radius is irrelevant if the
-        # path between it and the mark crosses land.
+        # to be navigable end-to-end — a node within finish_radius is
+        # irrelevant if the path between it and the mark crosses land.
         for idx in new_frontier:
             n = all_nodes[idx]
             if haversine_m(n.lat, n.lon, finish_lat, finish_lon) > finish_radius_m:
                 continue
-            if not _segment_navigable_to_point(
+            if not _segment_check(
                 n.lat, n.lon, finish_lat, finish_lon, is_navigable,
             ):
                 continue
