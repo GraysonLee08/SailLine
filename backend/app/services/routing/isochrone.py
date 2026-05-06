@@ -317,7 +317,7 @@ def compute_isochrone_route(
             for k in range(heading_count):
                 heading = k * heading_step_deg
                 twa = _twa(heading, wind_from_deg)
-                speed_kt = polar.boat_speed_kt(twa, tws_kt)
+                speed_kt = polar.boat_speed(twa, tws_kt)
                 if speed_kt <= 0:
                     continue
                 distance_m = speed_kt * KT_TO_MS * dt_seconds
