@@ -3,7 +3,15 @@
 // Three ways to add marks:
 //   1. Pick a MORF course preset (T1, O1, ...) → fills start/marks/finish.
 //   2. Click on the map → drops an unnamed mark at that point.
-//   3. Type lat/lon directly into a row's inputs (decimal or deg-min).
+//   3. Add an empty mark and type its lat/lon directly into the inputs.
+//
+// Empty marks have lat=null, lon=null. They're invisible on the map (no
+// marker, no contribution to the course-line) until the user fills in
+// coordinates. This avoids the (0, 0) Atlantic-Ocean default that
+// stretched the course line halfway across the world.
+//
+// Save validates that every mark has real coordinates before posting —
+// the API requires float lat/lon and would 422 on null otherwise.
 //
 // Hovering a marker on the map shows a popup with its name, formatted
 // coords, and (for library marks) the race-book description.
@@ -37,6 +45,12 @@ mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 const DEFAULT_CENTER = [-87.55, 41.85]; // Centered on SA7
 const DEFAULT_ZOOM = 11;
 const COORD_FORMAT_KEY = "sailline.coordFormat";
+
+// A mark counts as "placed" iff both lat and lon are real numbers.
+// Null/undefined/NaN means the user hasn't filled it in yet — render
+// nothing on the map, exclude it from the course line, fail to save.
+const isPlaced = (m) =>
+  Number.isFinite(m?.lat) && Number.isFinite(m?.lon);
 
 export default function RaceEditor({ raceId, onClose, onSaved }) {
   const isNew = !raceId;
@@ -159,8 +173,12 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   }, []);
 
   // ── Sync markers + course line whenever positions/order change ────
+  // Unplaced marks (null lat/lon) are invisible: no marker, no segment.
   const syncKey = useMemo(
-    () => marks.map((m) => `${m.name}|${m.lat}|${m.lon}`).join("~"),
+    () =>
+      marks
+        .map((m) => `${m.name}|${m.lat ?? "_"}|${m.lon ?? "_"}`)
+        .join("~"),
     [marks],
   );
 
@@ -172,7 +190,12 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
     markersRef.current.forEach((m) => m.remove());
     markersRef.current = [];
 
+    // Build markers only for placed marks. Track each marker's index in
+    // the FULL marks array so dragend can update the right entry even
+    // when some earlier marks are unplaced.
     marks.forEach((mark, i) => {
+      if (!isPlaced(mark)) return;
+
       const el = createMarkerElement(i + 1);
       const popup = new mapboxgl.Popup({
         offset: 18,
@@ -203,6 +226,11 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       markersRef.current.push(marker);
     });
 
+    // Course line connects only the placed marks, in order.
+    const placedCoords = marks
+      .filter(isPlaced)
+      .map((m) => [m.lon, m.lat]);
+
     const src = map.getSource("course");
     if (src) {
       src.setData({
@@ -210,13 +238,16 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         properties: {},
         geometry: {
           type: "LineString",
-          coordinates: marks.map((m) => [m.lon, m.lat]),
+          coordinates: placedCoords,
         },
       });
     }
 
-    if (!fittedRef.current && marks.length > 0) {
-      fitToMarks(map, marks);
+    if (!fittedRef.current && placedCoords.length > 0) {
+      fitToMarks(
+        map,
+        marks.filter(isPlaced),
+      );
       fittedRef.current = true;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -254,10 +285,12 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       ),
     );
 
+  // New marks start unplaced — null lat/lon. The user fills in coords
+  // via the inputs, or by dragging once a coord is entered.
   const addEmptyMark = () =>
     setMarks((prev) => [
       ...prev,
-      { name: defaultMarkName(prev.length), lat: 0, lon: 0 },
+      { name: defaultMarkName(prev.length), lat: null, lon: null },
     ]);
 
   const applyCourseTemplate = (courseId) => {
@@ -288,6 +321,17 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   const handleSave = async () => {
     if (!name.trim()) {
       setError("Give the race a name before saving.");
+      return;
+    }
+    // Reject before hitting the API: the Pydantic Mark model requires
+    // float lat/lon and would 422 with a noisy error message. Friendlier
+    // to surface it inline with the offending mark name.
+    const unplaced = marks.find((m) => !isPlaced(m));
+    if (unplaced) {
+      setError(
+        `Mark "${unplaced.name || "(unnamed)"}" is missing coordinates. ` +
+          `Type a lat/lon, drag the marker, or remove the mark before saving.`,
+      );
       return;
     }
     setSaving(true);
@@ -481,6 +525,17 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 }
 
 // ── Mark row (local string state, commits on blur) ──────────────────
+//
+// Three states for each coord input:
+//
+//   - placed:    valid number → format and display ("41 51.17 N", etc.)
+//   - unplaced:  null         → input renders empty
+//   - in-flight: user typing  → local string until blur/Enter, then commit
+//
+// The commit logic preserves nullness: if the user blurs an empty input
+// and the underlying value was null, it stays null (no "0.00000" appears).
+// If they enter junk and the underlying value was a real number, the
+// input snaps back to the formatted current value.
 
 function MarkRow({
   index, mark, format, isFirst, isLast,
@@ -489,23 +544,44 @@ function MarkRow({
   // Pick formatters based on the active format. parseCoord handles both
   // formats regardless, so users can still paste decimal into a deg-min
   // input (or vice versa) — we just re-format on commit.
-  const fmtLat = format === "dm" ? formatLatInput : formatDecimal;
-  const fmtLon = format === "dm" ? formatLonInput : formatDecimal;
+  const fmtLat = (v) =>
+    !Number.isFinite(v)
+      ? ""
+      : format === "dm"
+        ? formatLatInput(v)
+        : formatDecimal(v);
+  const fmtLon = (v) =>
+    !Number.isFinite(v)
+      ? ""
+      : format === "dm"
+        ? formatLonInput(v)
+        : formatDecimal(v);
 
   const [latStr, setLatStr] = useState(fmtLat(mark.lat));
   const [lonStr, setLonStr] = useState(fmtLon(mark.lon));
 
   // Resync local strings whenever the underlying value or the active
   // format changes (e.g. drag, course load, format toggle).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { setLatStr(fmtLat(mark.lat)); }, [mark.lat, format]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { setLonStr(fmtLon(mark.lon)); }, [mark.lon, format]);
 
   const commit = (str, setStr, current, fmt, onCommit) => {
-    const v = parseCoord(str);
+    const trimmed = str.trim();
+    // Empty input → null. Lets the user clear a mark's coord.
+    if (trimmed === "") {
+      onCommit(null);
+      setStr("");
+      return;
+    }
+    const v = parseCoord(trimmed);
     if (Number.isFinite(v)) {
       onCommit(v);
       setStr(fmt(v));
     } else {
+      // Junk input: revert display. If current is null the input goes
+      // empty; if current is a number it snaps to the formatted value.
       setStr(fmt(current));
     }
   };
@@ -516,14 +592,29 @@ function MarkRow({
   const placeholderLat = format === "dm" ? "41 51.17 N" : "41.85283";
   const placeholderLon = format === "dm" ? "87 33.41 W" : "-87.55683";
 
+  // Visual cue that this mark hasn't been placed yet — italic name input,
+  // dotted-border coord inputs. Subtle enough not to be noisy, clear
+  // enough at a glance.
+  const unplaced = !Number.isFinite(mark.lat) || !Number.isFinite(mark.lon);
+
   return (
     <li style={styles.markRow}>
       <div style={styles.markRowTop}>
-        <span style={styles.markIdx}>{index + 1}</span>
+        <span
+          style={{
+            ...styles.markIdx,
+            background: unplaced ? "var(--ink-3)" : styles.markIdx.background,
+          }}
+        >
+          {index + 1}
+        </span>
         <input
           value={mark.name}
           onChange={(e) => onRename(e.target.value)}
-          style={styles.markName}
+          style={{
+            ...styles.markName,
+            fontStyle: unplaced ? "italic" : "normal",
+          }}
           title={mark.description || ""}
         />
         <button onClick={onUp} disabled={isFirst} style={styles.iconBtn} title="Move up">↑</button>
@@ -537,7 +628,10 @@ function MarkRow({
           onBlur={onLatBlur}
           onKeyDown={onKey}
           placeholder={placeholderLat}
-          style={styles.coordInput}
+          style={{
+            ...styles.coordInput,
+            borderStyle: unplaced ? "dashed" : "solid",
+          }}
           title="Decimal (41.85283) or deg-min (41 51.17 N) both accepted"
         />
         <input
@@ -546,7 +640,10 @@ function MarkRow({
           onBlur={onLonBlur}
           onKeyDown={onKey}
           placeholder={placeholderLon}
-          style={styles.coordInput}
+          style={{
+            ...styles.coordInput,
+            borderStyle: unplaced ? "dashed" : "solid",
+          }}
           title="Decimal (-87.55683) or deg-min (87 33.41 W) both accepted"
         />
       </div>
@@ -624,15 +721,25 @@ function emptyLine() {
 }
 
 function fitToMarks(map, marks) {
-  if (marks.length === 1) {
-    map.flyTo({ center: [marks[0].lon, marks[0].lat], zoom: 11, duration: 0 });
+  // Caller is expected to pass only placed marks; defensively filter
+  // again so a stray unplaced mark never widens the bounds.
+  const placed = marks.filter(
+    (m) => Number.isFinite(m?.lat) && Number.isFinite(m?.lon),
+  );
+  if (placed.length === 0) return;
+  if (placed.length === 1) {
+    map.flyTo({
+      center: [placed[0].lon, placed[0].lat],
+      zoom: 11,
+      duration: 0,
+    });
     return;
   }
   const bounds = new mapboxgl.LngLatBounds(
-    [marks[0].lon, marks[0].lat],
-    [marks[0].lon, marks[0].lat],
+    [placed[0].lon, placed[0].lat],
+    [placed[0].lon, placed[0].lat],
   );
-  marks.forEach((m) => bounds.extend([m.lon, m.lat]));
+  placed.forEach((m) => bounds.extend([m.lon, m.lat]));
   map.fitBounds(bounds, { padding: 100, duration: 0 });
 }
 
