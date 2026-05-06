@@ -4,41 +4,40 @@ Pulls hazard polygons from NOAA's ENC Direct REST service for a region's
 bbox, merges layers into a single GeoJSON FeatureCollection, and uploads
 to GCS at ``charts/{region}/hazards.geojson``.
 
-REST endpoint: NOAA ENC Direct ArcGIS REST service exposes ENC features
-as queryable layers. We hit each layer's ``/query`` endpoint with the
-region bbox and ``f=geojson``. Server returns features in EPSG:4326.
+Two services are used, picked automatically based on ``region.kind``:
 
-ENC Direct rate-limits aggressively. Worker uses ~1s sleeps between layer
-queries; if NOAA changes its limits, expect 429s and back off. Run this
-once per region — output is static for months at a time (ENC updates
-weekly but most layers we consume don't churn).
+  * ``base`` regions (conus, hawaii) hit the **enc_general** service
+    (scale 1:600k–1:1.5M). Coarse, but covers the full continent in a
+    single ingest. Good enough for offshore-passage routing where
+    venue-scale obstructions are far below the noise floor anyway.
 
-Layers ingested (per IHO S-101 / S-57 codes):
+  * ``venue`` regions (chicago, sf_bay, ...) hit the **enc_harbour**
+    service (scale 1:5k–1:50k). This is where breakwalls, jetties,
+    piers, and small-craft facility boundaries actually exist as
+    polygons. The smaller venue bboxes also fit comfortably inside ENC
+    Direct's per-query feature cap.
 
-    LNDARE  — Land area (the big one; subsumes shorelines)
-    UWTROC  — Underwater rocks awash or above water
-    OBSTRN  — Generic obstructions
-    WRECKS  — Submerged wrecks
-    PIPSOL  — Submerged pipelines (kedging risk)
-    RESARE  — Restricted areas (security zones, naval ranges)
+Each ENC Direct layer has a numeric ID inside its parent service. IDs
+are stable per service — but they are NOT the same across services, so
+every layer table here is paired with the service it's valid for. If
+NOAA renumbers anything, the worker logs ``0 features — possible ID
+drift`` and the fix is a one-line table edit. To verify current IDs,
+hit ``{ENC_BASE}/{service}/MapServer?f=json`` in a browser.
 
-Each ENC Direct layer has a numeric ID. The mapping below is from
-ENC Direct's published service definition; if NOAA renumbers we'll get
-empty responses and a clear log message — easy to detect.
-
-Usage:
+Usage (run from backend/):
 
     python -m workers.enc_ingest --region conus
-    python -m workers.enc_ingest --region conus --dry-run
+    python -m workers.enc_ingest --region chicago
+    python -m workers.enc_ingest --region chicago --dry-run
 """
 from __future__ import annotations
 
-import tempfile
 import argparse
 import json
 import logging
 import os
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -50,49 +49,77 @@ from google.cloud import storage
 # Make `app.regions` importable when running from backend/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.regions import REGIONS  # noqa: E402
+from app.regions import REGIONS, Region  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("enc_ingest")
 
 
-# ─── Config ─────────────────────────────────────────────────────────────
+# ─── Service config ──────────────────────────────────────────────────────
 
 
-# NOAA ENC Direct REST root. Layer IDs follow this base.
-ENC_BASE = (
-    "https://encdirect.noaa.gov/arcgis/rest/services/encdirect/"
-    "enc_general/MapServer"
-)
+# NOAA ENC Direct REST root. The trailing service name is filled in
+# per-region (general for base, harbour for venue).
+ENC_BASE = "https://encdirect.noaa.gov/arcgis/rest/services/encdirect"
 
-# (layer_id, layer_name) — ENC Direct publishes layer names that match
-# IHO S-57 acronyms. Layer IDs are stable but if they shift, update here.
-HAZARD_LAYERS: list[tuple[int, str]] = [
-    # NOTE: layer IDs below are reasonable defaults from ENC Direct's
-    # published service definition as of 2025–2026. The worker logs a
-    # clear warning if a layer returns 0 features so we notice ID drift.
-    (4,  "LNDARE"),    # land area
-    (38, "UWTROC"),    # underwater rocks
-    (33, "OBSTRN"),    # obstructions
-    (40, "WRECKS"),    # wrecks
-    (24, "PIPSOL"),    # pipelines (submerged)
-    (29, "RESARE"),    # restricted areas
+
+# Polygon layers in the **enc_general** service (CONUS / open-ocean
+# scale). Verified against the live MapServer manifest, May 2026.
+#
+# We deliberately skip:
+#   - point-only layers (UWTROC, PIPSOL at this scale exist only as
+#     points, not polygons — the engine uses point-in-polygon checks)
+#   - administrative or descriptive polygons (Sea_Area_Named, EEZ,
+#     Coverage_area, ...) — see the navigability module's docstring for
+#     the rationale on what counts as a hazard
+GENERAL_HAZARD_LAYERS: list[tuple[int, str]] = [
+    (121, "LNDARE"),    # General.Land_Area
+    (83,  "OBSTRN"),    # General.Obstruction_area
+    (84,  "WRECKS"),    # General.Wreck_area
+    (82,  "CTNARE"),    # General.Caution_Area
+    (86,  "MIPARE"),    # General.Military_Practice_Area
+    (102, "RESARE"),    # General.Restricted_Area (filtered at load time)
 ]
 
-# Per-request timeout. ENC Direct can take 30–60s on big bboxes.
-REQUEST_TIMEOUT_S = 90
 
-# Sleep between layer requests to play nice with ENC Direct.
-LAYER_SLEEP_S = 1.0
+# Polygon layers in the **enc_harbour** service (1:5k–1:50k). Includes
+# the layers that don't exist at smaller scales — most importantly
+# SLCONS (shoreline construction = breakwalls, jetties, piers).
+HARBOUR_HAZARD_LAYERS: list[tuple[int, str]] = [
+    (138, "SLCONS"),    # Harbor.Shoreline_Construction_area — breakwalls
+    (233, "LNDARE"),    # Harbor.Land_Area
+    (156, "OBSTRN"),    # Harbor.Obstruction_area
+    (158, "WRECKS"),    # Harbor.Wreck_area
+    (154, "CTNARE"),    # Harbor.Caution_Area
+    (162, "MIPARE"),    # Harbor.Military_Practice_Area
+    (175, "DYKCON"),    # Harbor.Dyke_area — seawalls/levees
+    (155, "FSHFAC"),    # Harbor.Fishing_Facility_area — fish traps, weirs
+    (197, "RESARE"),    # Harbor.Restricted_Area_area (filtered at load time)
+]
 
-# Max features to request per page. ENC Direct caps responses around 1000.
-PAGE_SIZE = 1000
+
+def _service_for(region: Region) -> tuple[str, list[tuple[int, str]]]:
+    """Pick (service-name, layer-table) for a region based on its kind."""
+    if region.kind == "venue":
+        return "enc_harbour", HARBOUR_HAZARD_LAYERS
+    if region.kind == "base":
+        return "enc_general", GENERAL_HAZARD_LAYERS
+    raise ValueError(f"unknown region kind {region.kind!r} for {region.name}")
 
 
-# ─── REST client ────────────────────────────────────────────────────────
+# ─── Knobs ───────────────────────────────────────────────────────────────
+
+
+REQUEST_TIMEOUT_S = 90      # ENC Direct can take 30–60s on big bboxes
+LAYER_SLEEP_S = 1.0         # Be nice to ENC Direct between layers
+PAGE_SIZE = 1000            # ENC Direct caps single-response features
+
+
+# ─── REST client ─────────────────────────────────────────────────────────
 
 
 def query_layer_geojson(
+    service: str,
     layer_id: int,
     bbox: tuple[float, float, float, float],
 ) -> dict:
@@ -118,50 +145,49 @@ def query_layer_geojson(
     while True:
         params = dict(base_params)
         params["resultOffset"] = str(offset)
-        url = f"{ENC_BASE}/{layer_id}/query?{urllib.parse.urlencode(params)}"
+        url = f"{ENC_BASE}/{service}/MapServer/{layer_id}/query?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "sailline-enc-ingest/0.1"},
+            url, headers={"User-Agent": "sailline-enc-ingest/0.2"},
         )
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
             page = json.loads(resp.read().decode("utf-8"))
 
         if "error" in page:
-            raise RuntimeError(f"ENC Direct error for layer {layer_id}: {page['error']}")
+            raise RuntimeError(
+                f"ENC Direct error ({service} layer {layer_id}): {page['error']}"
+            )
 
         features = page.get("features", [])
         all_features.extend(features)
 
-        # exceededTransferLimit: more pages available
         if not page.get("exceededTransferLimit") or not features:
             break
         offset += len(features)
 
-    return {
-        "type": "FeatureCollection",
-        "features": all_features,
-    }
+    return {"type": "FeatureCollection", "features": all_features}
 
 
-# ─── Pipeline ───────────────────────────────────────────────────────────
+# ─── Pipeline ────────────────────────────────────────────────────────────
 
 
 def merge_layers(
+    service: str,
     bbox: tuple[float, float, float, float],
     layers: list[tuple[int, str]],
 ) -> dict:
     """Query each hazard layer, merge into one FeatureCollection.
 
-    Annotates each feature with its source layer name in properties.layer
-    so the API can report which layers contributed.
+    Annotates each feature with its source layer name in
+    ``properties.layer`` so the API can report which layers contributed
+    and the chart loader can apply the SKIP_LAYERS filter.
     """
     merged: list[dict] = []
     layer_counts: dict[str, int] = {}
 
     for layer_id, layer_name in layers:
-        log.info("querying layer %s (%s)", layer_id, layer_name)
+        log.info("querying %s layer %s (%s)", service, layer_id, layer_name)
         try:
-            fc = query_layer_geojson(layer_id, bbox)
+            fc = query_layer_geojson(service, layer_id, bbox)
         except Exception as exc:  # noqa: BLE001
             log.warning("layer %s (%s) failed: %s", layer_id, layer_name, exc)
             layer_counts[layer_name] = 0
@@ -175,6 +201,10 @@ def merge_layers(
                 "layer %s (%s) returned 0 features — possible ID drift",
                 layer_id, layer_name,
             )
+        elif n >= PAGE_SIZE:
+            # Pagination should have caught this, but log when we hit
+            # the cap so unexplained low counts get surfaced.
+            log.info("  → %s features (pagination active)", n)
         else:
             log.info("  → %s features", n)
 
@@ -208,23 +238,33 @@ def upload_to_gcs(blob_bytes: bytes, region: str) -> str:
 
 def ingest(region_name: str, dry_run: bool = False) -> dict:
     if region_name not in REGIONS:
-        raise SystemExit(f"unknown region {region_name!r}. Valid: {sorted(REGIONS)}")
+        raise SystemExit(
+            f"unknown region {region_name!r}. valid: {sorted(REGIONS)}"
+        )
 
     region = REGIONS[region_name]
-    fc = merge_layers(region.bbox, HAZARD_LAYERS)
+    service, layers = _service_for(region)
+    log.info("ingesting region=%s kind=%s service=%s",
+             region.name, region.kind, service)
+
+    fc = merge_layers(service, region.bbox, layers)
     n = len(fc["features"])
-    log.info("merged %s features across %s layers", n, len(HAZARD_LAYERS))
+    log.info("merged %s features across %s layers", n, len(layers))
 
     blob = json.dumps(fc).encode("utf-8")
     log.info("serialized GeoJSON: %.1f MB", len(blob) / 1e6)
 
     if dry_run:
-        out_path = Path(tempfile.gettempdir()) / "sailline_enc" / f"{region.name}_hazards.geojson"
+        out_path = (
+            Path(tempfile.gettempdir()) / "sailline_enc"
+            / f"{region.name}_hazards.geojson"
+        )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(blob)
         log.info("dry-run: wrote %s", out_path)
         return {
             "region": region.name,
+            "service": service,
             "feature_count": n,
             "size_bytes": len(blob),
             "local_path": str(out_path),
@@ -234,6 +274,7 @@ def ingest(region_name: str, dry_run: bool = False) -> dict:
     uri = upload_to_gcs(blob, region.name)
     return {
         "region": region.name,
+        "service": service,
         "feature_count": n,
         "size_bytes": len(blob),
         "uri": uri,
@@ -242,8 +283,13 @@ def ingest(region_name: str, dry_run: bool = False) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest NOAA ENC hazard polygons to GCS")
-    parser.add_argument("--region", required=True, help=f"region from app.regions ({sorted(REGIONS)})")
+    parser = argparse.ArgumentParser(
+        description="Ingest NOAA ENC hazard polygons to GCS"
+    )
+    parser.add_argument(
+        "--region", required=True,
+        help=f"region from app.regions ({sorted(REGIONS)})",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

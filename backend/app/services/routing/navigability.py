@@ -10,6 +10,15 @@ Both layers are independent. Bathymetry is required (failing-open here
 silently routes through land); ENC is optional (depth alone catches the
 biggest hazard, which is shore).
 
+Hazards are loaded per-region. When a race is inside a known venue
+(chicago, sf_bay, ...), the predicate loads BOTH the base region's
+hazards (general-scale: open-water obstructions, military areas) AND
+the venue's hazards (harbour-scale: breakwalls, jetties, fishing
+facilities). A point is hazardous if it's inside any polygon from
+either index. The two scales complement each other — base catches
+things outside the venue bbox, venue catches things too small to
+appear at base scale.
+
 The "no data is hazardous" rule for bathymetry is deliberate. NCEI grids
 have NaN cells at coverage edges (e.g. tile boundaries between CRM
 volumes). Treating NaN as land means the engine routes around data gaps
@@ -21,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 from app.services import bathymetry, charts
 
@@ -39,12 +48,22 @@ def make_navigable_predicate(
     region: str,
     draft_m: float,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
+    venue: Optional[str] = None,
 ) -> Callable[[float, float], bool]:
     """Build the ``is_navigable`` predicate for a race.
 
+    Args:
+        region: base region name (conus, hawaii). Drives bathymetry
+            lookup and the broad-scale hazard index.
+        draft_m: boat draft in meters.
+        safety_factor: multiplier on draft for the depth check.
+        venue: optional venue name (chicago, sf_bay, ...). When set, the
+            venue's harbour-scale hazard index is loaded in addition to
+            the base index. Both are checked for every point.
+
     Raises:
         bathymetry.BathymetryUnavailable: if no depth grid is ingested
-            for this region. Caller should surface a 503 — silently
+            for the base region. Caller should surface a 503 — silently
             routing without depth checks is unsafe.
     """
     min_depth_m = draft_m * safety_factor
@@ -52,18 +71,28 @@ def make_navigable_predicate(
     # Bathymetry is required. Will raise if not ingested for this region.
     depth_grid = bathymetry.for_region(region)
 
-    # Charts are optional. None means depth-only routing (still safe).
-    hazard_index = charts.for_region(region)
+    # Charts are optional. Build a list of zero-or-more loaded indices.
+    hazard_indices: list[charts.HazardIndex] = []
+    base_haz = charts.for_region(region)
+    if base_haz is not None:
+        hazard_indices.append(base_haz)
+    if venue is not None:
+        venue_haz = charts.for_region(venue)
+        if venue_haz is not None:
+            hazard_indices.append(venue_haz)
 
-    if hazard_index is None:
+    if not hazard_indices:
         log.info(
-            "navigability for region=%s: depth-only (charts not ingested)",
-            region,
+            "navigability for region=%s venue=%s: depth-only "
+            "(charts not ingested)",
+            region, venue,
         )
     else:
+        total = sum(idx.feature_count for idx in hazard_indices)
         log.info(
-            "navigability for region=%s: depth + %s hazard polygons",
-            region, hazard_index.feature_count,
+            "navigability for region=%s venue=%s: depth + %s hazard "
+            "polygons across %s indices",
+            region, venue, total, len(hazard_indices),
         )
 
     def is_navigable(lat: float, lon: float) -> bool:
@@ -79,9 +108,13 @@ def make_navigable_predicate(
         if math.isnan(depth) or depth < min_depth_m:
             return False
 
-        # Hazard check (only if charts are loaded)
-        if hazard_index is not None and hazard_index.intersects(lat, lon):
-            return False
+        # Hazard check — point is blocked if ANY loaded index covers it.
+        # Order doesn't matter (boolean OR), but venue tends to be
+        # smaller so STRtree narrows faster — listed in append order
+        # (base first) which is fine for typical race geometries.
+        for idx in hazard_indices:
+            if idx.intersects(lat, lon):
+                return False
 
         return True
 
