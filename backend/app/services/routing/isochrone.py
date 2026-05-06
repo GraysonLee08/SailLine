@@ -1,40 +1,51 @@
-"""Isochrone routing engine.
+"""Pure-numpy isochrone routing engine.
 
-Pure-numpy time-step fan. From each frontier point we sweep headings every
-``heading_step_deg``, look up boat speed against the polar at the local
-TWA/TWS, project forward ``dt_minutes`` minutes, and accumulate a new
-frontier. Dominated points are culled by binning on bearing-from-start and
-keeping the candidate closest to finish in each bin.
+Time-step fan algorithm:
 
-This is the simplest version of the algorithm that produces sailable
-results — no obstacles, no currents, no time-varying wind, single
-deterministic forecast. The Saturday May 9 delivery test treats whatever
-this produces as the baseline; richer features land in subsequent sprints.
+  1. Start with a single frontier point (the race start).
+  2. Each iteration of ``dt_minutes`` minutes:
+       - For each frontier point, sweep headings 0..360 in
+         ``heading_step_deg`` increments
+       - Look up the wind at that point, compute TWA, get boat speed
+         from the polar
+       - Project the boat forward ``speed × dt`` along the heading
+       - Reject candidates that fail the ``is_navigable`` predicate
+         (depth + ENC hazards)
+  3. Cull dominated candidates: bin by angular bearing from the start,
+     keep only the candidate furthest from start in each bin
+  4. Stop when any frontier point is within ``finish_radius_nm`` of the
+     finish, or ``max_iterations`` is reached
+  5. Trace back through parent pointers, build the path
 
-Wind sampling: ``WindField`` wraps the pre-clipped JSON the ingest worker
-writes to Redis (lats[], lons[], u[][], v[][] in m/s, meteorological
-convention where positive u is eastward and positive v is northward). It
-exposes ``sample(lat, lon)`` for bilinear u/v lookup.
+The angular-bin domination check is the standard isochrone trick — it
+keeps the frontier from exploding without sacrificing optimality at the
+chosen bin resolution. 72 bins (5°) at v1; tunable.
 
-Coordinate math: spherical earth at the local latitude. Good to better
-than 0.1% over a 50nm passage — well below the wind/polar uncertainty.
+The ``is_navigable`` callback is the single integration point with
+bathymetry + chart hazards. The engine has no opinion about *why* a
+point is unsafe — the predicate decides. Build it via
+``app.services.routing.make_navigable_predicate``.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 import numpy as np
-
-from app.services.polars import Polar
 
 
 # ─── Constants ──────────────────────────────────────────────────────────
 
+
+# Earth radius in meters (mean). Used for great-circle projection.
 EARTH_RADIUS_M = 6_371_000.0
-MS_PER_KT = 0.5144444
-M_PER_NM = 1852.0
+
+# Knots → m/s
+KT_TO_MS = 0.514_444
+
+# Meters → nautical miles
+M_TO_NM = 1.0 / 1852.0
 
 
 # ─── Wind field ─────────────────────────────────────────────────────────
@@ -42,32 +53,37 @@ M_PER_NM = 1852.0
 
 @dataclass
 class WindField:
-    """Bilinear-interpolated u/v wind on a regular lat/lon grid.
+    """U/V wind components on a regular lat/lon grid.
 
-    lats: 1D ascending (degrees)
-    lons: 1D ascending (degrees)
-    u, v: 2D shape (len(lats), len(lons)) in m/s
+    Matches the shape produced by ``backend/workers/weather_ingest.py``
+    after JSON serialization. ``u`` is eastward component (m/s),
+    ``v`` is northward component (m/s).
     """
-    lats: np.ndarray
-    lons: np.ndarray
-    u: np.ndarray
-    v: np.ndarray
+    lats: np.ndarray            # 1D ascending, degrees
+    lons: np.ndarray            # 1D ascending, degrees
+    u: np.ndarray               # 2D shape (len(lats), len(lons)), m/s
+    v: np.ndarray               # 2D, m/s
     reference_time: Optional[str] = None
     valid_time: Optional[str] = None
     source: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict) -> "WindField":
-        """Construct from the ingest worker's JSON payload shape.
+        """Build a WindField from the JSON payload the weather worker writes.
 
-        Tolerates lats either ascending or descending — flips internally so
-        bracket math always sees ascending arrays.
+        Tolerates a couple of key spellings (some downstream code uses
+        ``u10``/``v10`` per the GRIB convention; the worker writes the
+        shorter ``u``/``v``).
         """
+        u_key = "u" if "u" in payload else "u10"
+        v_key = "v" if "v" in payload else "v10"
+
         lats = np.asarray(payload["lats"], dtype=np.float64)
         lons = np.asarray(payload["lons"], dtype=np.float64)
-        u = np.asarray(payload["u"], dtype=np.float64)
-        v = np.asarray(payload["v"], dtype=np.float64)
+        u = np.asarray(payload[u_key], dtype=np.float32)
+        v = np.asarray(payload[v_key], dtype=np.float32)
 
+        # Ensure ascending order — sample() relies on it.
         if lats[0] > lats[-1]:
             lats = lats[::-1]
             u = u[::-1, :]
@@ -78,7 +94,10 @@ class WindField:
             v = v[:, ::-1]
 
         return cls(
-            lats=lats, lons=lons, u=u, v=v,
+            lats=lats,
+            lons=lons,
+            u=u,
+            v=v,
             reference_time=payload.get("reference_time"),
             valid_time=payload.get("valid_time"),
             source=payload.get("source"),
@@ -90,10 +109,15 @@ class WindField:
             and self.lons[0] <= lon <= self.lons[-1]
         )
 
-    def sample(self, lat: float, lon: float) -> Optional[tuple[float, float]]:
-        """Bilinear u/v at (lat, lon). None if outside the grid."""
+    def sample(self, lat: float, lon: float) -> tuple[float, float]:
+        """Bilinear u, v at (lat, lon). Returns (0, 0) if out of bounds.
+
+        Out-of-bounds returns calm rather than raising — the engine treats
+        zero wind as "boat doesn't move," which naturally bounds the
+        search to the wind grid extent.
+        """
         if not self.contains(lat, lon):
-            return None
+            return 0.0, 0.0
 
         i = int(np.searchsorted(self.lats, lat, side="right") - 1)
         j = int(np.searchsorted(self.lons, lon, side="right") - 1)
@@ -105,265 +129,318 @@ class WindField:
         fy = (lat - lat0) / (lat1 - lat0) if lat1 > lat0 else 0.0
         fx = (lon - lon0) / (lon1 - lon0) if lon1 > lon0 else 0.0
 
-        u = (
-            (1 - fx) * (1 - fy) * self.u[i, j]
-            + fx * (1 - fy) * self.u[i, j + 1]
-            + (1 - fx) * fy * self.u[i + 1, j]
-            + fx * fy * self.u[i + 1, j + 1]
-        )
-        v = (
-            (1 - fx) * (1 - fy) * self.v[i, j]
-            + fx * (1 - fy) * self.v[i, j + 1]
-            + (1 - fx) * fy * self.v[i + 1, j]
-            + fx * fy * self.v[i + 1, j + 1]
-        )
-        return float(u), float(v)
+        def _bilerp(arr: np.ndarray) -> float:
+            v00 = arr[i, j]
+            v01 = arr[i, j + 1]
+            v10 = arr[i + 1, j]
+            v11 = arr[i + 1, j + 1]
+            return float(
+                (1 - fx) * (1 - fy) * v00
+                + fx * (1 - fy) * v01
+                + (1 - fx) * fy * v10
+                + fx * fy * v11
+            )
+
+        return _bilerp(self.u), _bilerp(self.v)
 
 
-# ─── Geometry ───────────────────────────────────────────────────────────
+# ─── Geometry helpers ───────────────────────────────────────────────────
 
 
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in meters."""
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dp = math.radians(lat2 - lat1)
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
+def _project(lat: float, lon: float, heading_deg: float, distance_m: float) -> tuple[float, float]:
+    """Forward projection along a great circle. Returns (new_lat, new_lon).
+
+    Heading is degrees true; 0 = north, 90 = east.
+    """
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    h_r = math.radians(heading_deg)
+    d_r = distance_m / EARTH_RADIUS_M
+
+    new_lat_r = math.asin(
+        math.sin(lat_r) * math.cos(d_r) + math.cos(lat_r) * math.sin(d_r) * math.cos(h_r)
+    )
+    new_lon_r = lon_r + math.atan2(
+        math.sin(h_r) * math.sin(d_r) * math.cos(lat_r),
+        math.cos(d_r) - math.sin(lat_r) * math.sin(new_lat_r),
+    )
+    return math.degrees(new_lat_r), math.degrees(new_lon_r)
 
 
-def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Initial bearing in degrees (0=N, 90=E) from p1 to p2."""
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dl = math.radians(lon2 - lon1)
-    y = math.sin(dl) * math.cos(p2)
-    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial bearing from (lat1, lon1) to (lat2, lon2), degrees true."""
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    dlon_r = math.radians(lon2 - lon1)
+    y = math.sin(dlon_r) * math.cos(lat2_r)
+    x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon_r)
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
-def project(lat: float, lon: float, heading_deg_: float, distance_m: float) -> tuple[float, float]:
-    """Project (lat, lon) along a constant bearing for distance_m meters."""
-    p1 = math.radians(lat)
-    l1 = math.radians(lon)
-    h = math.radians(heading_deg_)
-    d = distance_m / EARTH_RADIUS_M
-
-    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(h))
-    l2 = l1 + math.atan2(
-        math.sin(h) * math.sin(d) * math.cos(p1),
-        math.cos(d) - math.sin(p1) * math.sin(p2),
-    )
-    return math.degrees(p2), ((math.degrees(l2) + 540.0) % 360.0) - 180.0
-
-
-def uv_to_tws_twd(u_ms: float, v_ms: float) -> tuple[float, float]:
-    """(u, v) in m/s → (TWS in kts, TWD in deg, wind FROM direction)."""
-    tws_ms = math.hypot(u_ms, v_ms)
-    twd = (math.degrees(math.atan2(-u_ms, -v_ms)) + 360.0) % 360.0
-    return tws_ms / MS_PER_KT, twd
-
-
-def angular_diff(a: float, b: float) -> float:
-    """Smallest angle between two bearings, 0..180."""
-    return abs(((a - b + 540.0) % 360.0) - 180.0)
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters."""
+    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 
 # ─── Engine ─────────────────────────────────────────────────────────────
 
 
 @dataclass
-class IsochroneResult:
-    """The raw output of the engine. Convert to GeoJSON via route_to_geojson()."""
-    coords: list[tuple[float, float]]   # [(lat, lon), ...] including start and finish
-    total_minutes: float
-    tack_count: int
-    iterations: int
-    reached: bool                        # True if we hit the finish radius
-    nodes_explored: int
+class _Node:
+    """One position on an isochrone frontier with backpointer to its parent."""
+    lat: float
+    lon: float
+    heading_deg: float       # heading taken to reach this node
+    parent_idx: Optional[int]  # index into the iteration's prior frontier
+    iteration: int
+
+
+@dataclass
+class RouteResult:
+    """Output of a successful (or not) isochrone search."""
+    path: list[tuple[float, float]] = field(default_factory=list)
+    headings: list[float] = field(default_factory=list)
+    total_minutes: float = 0.0
+    tack_count: int = 0
+    reached: bool = False
+    iterations: int = 0
+    nodes_explored: int = 0
+
+
+def _wind_speed_dir(u: float, v: float) -> tuple[float, float]:
+    """Convert (u east, v north) m/s to (speed kt, direction-from deg).
+
+    Direction is meteorological "wind from" — i.e. 0° = wind out of the
+    north. This is what TWA calculations expect.
+    """
+    speed_ms = math.hypot(u, v)
+    if speed_ms < 1e-6:
+        return 0.0, 0.0
+    # "From" direction: vector points where wind is going, so flip 180°
+    dir_to = (math.degrees(math.atan2(u, v)) + 360.0) % 360.0
+    dir_from = (dir_to + 180.0) % 360.0
+    return speed_ms / KT_TO_MS, dir_from
+
+
+def _twa(heading_deg: float, wind_dir_from_deg: float) -> float:
+    """True wind angle: 0..180. Symmetric (port/stbd folded)."""
+    diff = (heading_deg - wind_dir_from_deg + 360.0) % 360.0
+    if diff > 180.0:
+        diff = 360.0 - diff
+    return diff
 
 
 def compute_isochrone_route(
     start: tuple[float, float],
     finish: tuple[float, float],
-    polar: Polar,
+    polar,                                        # app.services.polars.Polar
     wind: WindField,
+    is_navigable: Optional[Callable[[float, float], bool]] = None,
     *,
     dt_minutes: float = 5.0,
     heading_step_deg: float = 5.0,
     max_iterations: int = 240,
     finish_radius_nm: float = 0.5,
-    angular_bins: int = 144,
-    tack_threshold_deg: float = 80.0,
-) -> IsochroneResult:
-    """Run isochrone routing from start to finish.
+    angular_bins: int = 72,
+) -> RouteResult:
+    """Find a near-optimal route from start to finish via isochrone fan.
 
     Args:
-        start, finish: (lat, lon) tuples in degrees.
-        polar: class polar (see app.services.polars).
-        wind: WindField wrapping a single-time-step wind grid.
-        dt_minutes: time step per fan iteration. 5 min is a good default
-            for inshore/coastal; 10 min for distance.
-        heading_step_deg: heading sweep granularity. 5° = 72 directions.
-        max_iterations: hard cap. 240 × 5 min = 20 hours.
-        finish_radius_nm: a node within this distance terminates the search.
-        angular_bins: resolution of the bearing-from-start culling. 144
-            bins = 2.5°/bin — plenty for v0.
-        tack_threshold_deg: heading change above this between consecutive
-            segments is counted as a tack/gybe.
+        start: (lat, lon) of the race start
+        finish: (lat, lon) of the finish mark
+        polar: Polar object with a ``boat_speed_kt(twa, tws_kt)`` method
+        wind: WindField with u/v components
+        is_navigable: optional (lat, lon) -> bool. False rejects the
+            candidate point. None means no land/depth checks (for tests
+            and the standalone CLI).
+        dt_minutes: time step. 5 min is a reasonable default for inshore
+            and short-distance races.
+        heading_step_deg: heading sweep granularity. 5° gives 72 candidates
+            per node per step.
+        max_iterations: hard ceiling. 240 × 5 min = 20 hours.
+        finish_radius_nm: how close is "reached." 0.5 nm catches typical
+            finish-line widths.
+        angular_bins: domination culling bin count. More bins = larger
+            frontier = slower but more accurate.
+
+    Returns:
+        RouteResult. ``reached=False`` if the search ran out of iterations
+        without getting within finish_radius_nm of the finish.
     """
+    if is_navigable is None:
+        def is_navigable(_lat: float, _lon: float) -> bool:  # type: ignore[misc]
+            return True
+
     finish_lat, finish_lon = finish
     start_lat, start_lon = start
-    finish_radius_m = finish_radius_nm * M_PER_NM
 
-    # Flat parallel arrays — faster than list-of-dicts and easier to
-    # vectorize later. parent[i] = -1 means root.
-    lats = [start_lat]
-    lons = [start_lon]
-    times = [0.0]
-    parents = [-1]
-    headings: list[Optional[float]] = [None]
-
-    frontier: list[int] = [0]
-
-    # Early-out: starting already inside the finish radius is degenerate
-    # but we should still produce a route (just start→finish).
-    if haversine_m(start_lat, start_lon, finish_lat, finish_lon) <= finish_radius_m:
-        return IsochroneResult(
-            coords=[(start_lat, start_lon), (finish_lat, finish_lon)],
+    # Early out: already inside the finish circle
+    if _haversine_m(start_lat, start_lon, finish_lat, finish_lon) * M_TO_NM < finish_radius_nm:
+        return RouteResult(
+            path=[start, finish],
+            headings=[0.0],
             total_minutes=0.0,
-            tack_count=0,
-            iterations=0,
             reached=True,
+            iterations=0,
             nodes_explored=1,
         )
 
-    bin_width = 360.0 / angular_bins
-    headings_sweep = np.arange(0.0, 360.0, heading_step_deg)
+    dt_seconds = dt_minutes * 60.0
+    finish_radius_m = finish_radius_nm / M_TO_NM
+    heading_count = int(round(360.0 / heading_step_deg))
 
-    iterations = 0
+    # All explored nodes flat list. parent_idx points into this list.
+    all_nodes: list[_Node] = [
+        _Node(lat=start_lat, lon=start_lon, heading_deg=0.0,
+              parent_idx=None, iteration=0)
+    ]
+    # Frontier: indices into all_nodes, the latest isochrone.
+    frontier: list[int] = [0]
+    nodes_explored = 1
     reached_idx: Optional[int] = None
 
-    for it in range(1, max_iterations + 1):
-        iterations = it
-        # bin_idx -> (best_node_idx, dist_to_finish_m)
-        buckets: dict[int, tuple[int, float]] = {}
-
+    for iteration in range(1, max_iterations + 1):
+        # Generate candidates from each frontier node.
+        candidates: list[_Node] = []
         for parent_idx in frontier:
-            plat = lats[parent_idx]
-            plon = lons[parent_idx]
-            uv = wind.sample(plat, plon)
-            if uv is None:
+            parent = all_nodes[parent_idx]
+            u, v = wind.sample(parent.lat, parent.lon)
+            tws_kt, wind_from_deg = _wind_speed_dir(u, v)
+            if tws_kt < 0.5:
+                # Drift; skip — engine isn't useful below ~1 kt anyway
                 continue
-            tws_kts, twd_deg = uv_to_tws_twd(uv[0], uv[1])
 
-            for hdg in headings_sweep:
-                twa = angular_diff(float(hdg), twd_deg)
-                speed_kts = polar.boat_speed(twa, tws_kts)
-                if speed_kts <= 0.0:
+            for k in range(heading_count):
+                heading = k * heading_step_deg
+                twa = _twa(heading, wind_from_deg)
+                speed_kt = polar.boat_speed_kt(twa, tws_kt)
+                if speed_kt <= 0:
                     continue
-                dist_m = speed_kts * MS_PER_KT * dt_minutes * 60.0
-                lat2, lon2 = project(plat, plon, float(hdg), dist_m)
-
-                if not wind.contains(lat2, lon2):
+                distance_m = speed_kt * KT_TO_MS * dt_seconds
+                new_lat, new_lon = _project(parent.lat, parent.lon, heading, distance_m)
+                if not is_navigable(new_lat, new_lon):
                     continue
+                candidates.append(_Node(
+                    lat=new_lat, lon=new_lon,
+                    heading_deg=heading,
+                    parent_idx=parent_idx,
+                    iteration=iteration,
+                ))
 
-                d_finish = haversine_m(lat2, lon2, finish_lat, finish_lon)
-                brg = bearing_deg(start_lat, start_lon, lat2, lon2)
-                bidx = int(brg / bin_width) % angular_bins
-
-                cur = buckets.get(bidx)
-                if cur is not None and d_finish >= cur[1]:
-                    continue
-
-                node_idx = len(lats)
-                lats.append(lat2)
-                lons.append(lon2)
-                times.append(times[parent_idx] + dt_minutes)
-                parents.append(parent_idx)
-                headings.append(float(hdg))
-                buckets[bidx] = (node_idx, d_finish)
-
-        if not buckets:
-            break  # nowhere to go — wind grid edge or polar refusing all headings
-
-        new_frontier = [v[0] for v in buckets.values()]
-
-        # Termination: any new node within the finish radius wins (fastest).
-        finishers = [
-            idx for idx in new_frontier
-            if haversine_m(lats[idx], lons[idx], finish_lat, finish_lon) <= finish_radius_m
-        ]
-        if finishers:
-            finishers.sort(key=lambda i: times[i])
-            reached_idx = finishers[0]
+        if not candidates:
+            # Wholly trapped — no frontier extensions survived. Done.
             break
 
-        frontier = new_frontier
+        # Domination culling: per angular bin from start, keep the
+        # candidate that's furthest from start. This is the standard
+        # isochrone outer-envelope trick.
+        bin_width = 360.0 / angular_bins
+        best_per_bin: dict[int, tuple[float, _Node]] = {}
+        for cand in candidates:
+            bearing = _bearing_deg(start_lat, start_lon, cand.lat, cand.lon)
+            bin_idx = int(bearing // bin_width) % angular_bins
+            dist = _haversine_m(start_lat, start_lon, cand.lat, cand.lon)
+            cur = best_per_bin.get(bin_idx)
+            if cur is None or dist > cur[0]:
+                best_per_bin[bin_idx] = (dist, cand)
 
-    # If we didn't reach the finish, take the best closest-approach node
-    # from any iteration (not just the last frontier — the last frontier
-    # may be empty if the search stalled at a wind-grid edge).
+        new_frontier_indices: list[int] = []
+        for _, cand in best_per_bin.values():
+            all_nodes.append(cand)
+            idx = len(all_nodes) - 1
+            new_frontier_indices.append(idx)
+            nodes_explored += 1
+
+            # Check finish reached
+            d_to_finish_m = _haversine_m(cand.lat, cand.lon, finish_lat, finish_lon)
+            if d_to_finish_m < finish_radius_m:
+                if reached_idx is None or all_nodes[reached_idx].iteration > iteration:
+                    reached_idx = idx
+
+        frontier = new_frontier_indices
+
+        if reached_idx is not None:
+            break
+
+    # If we reached, pick the best (earliest iteration, closest to finish).
     if reached_idx is None:
-        # Search all nodes for the one closest to finish
-        best_idx = 0
-        best_d = float("inf")
-        for i in range(1, len(lats)):
-            d = haversine_m(lats[i], lons[i], finish_lat, finish_lon)
-            if d < best_d:
-                best_d = d
-                best_idx = i
-        end_idx = best_idx
+        # Fall back: return the frontier point closest to the finish, so
+        # the user sees something rather than nothing.
+        best = min(
+            frontier,
+            key=lambda idx: _haversine_m(
+                all_nodes[idx].lat, all_nodes[idx].lon, finish_lat, finish_lon
+            ),
+            default=None,
+        )
+        if best is None:
+            return RouteResult(
+                path=[start],
+                headings=[0.0],
+                total_minutes=0.0,
+                reached=False,
+                iterations=iteration,
+                nodes_explored=nodes_explored,
+            )
+        reached_idx = best
         reached = False
     else:
-        end_idx = reached_idx
         reached = True
 
-    # Backtrack
-    path: list[int] = []
-    cur = end_idx
-    while cur >= 0:
-        path.append(cur)
-        cur = parents[cur]
-    path.reverse()
+    # Trace path back to start.
+    path_idxs: list[int] = []
+    cursor = reached_idx
+    while cursor is not None:
+        path_idxs.append(cursor)
+        cursor = all_nodes[cursor].parent_idx
+    path_idxs.reverse()
 
-    coords: list[tuple[float, float]] = [(lats[i], lons[i]) for i in path]
+    path = [(all_nodes[i].lat, all_nodes[i].lon) for i in path_idxs]
+    headings = [all_nodes[i].heading_deg for i in path_idxs[1:]]  # skip start (no incoming heading)
+
+    # Append the finish itself as the last point if we reached.
     if reached:
-        # Append the actual finish so the line terminates exactly on the mark
-        coords.append((finish_lat, finish_lon))
+        path.append(finish)
 
-    # Tack count: heading change between consecutive segments
+    # Tack count: how many times the heading crosses through the wind
+    # axis. Use sign change in TWA at each segment as a proxy for tack
+    # vs gybe. Coarse but useful diagnostic.
     tack_count = 0
-    for k in range(2, len(path)):
-        h1 = headings[path[k - 1]]
-        h2 = headings[path[k]]
-        if h1 is None or h2 is None:
-            continue
-        if angular_diff(h1, h2) >= tack_threshold_deg:
+    for a, b in zip(headings[:-1], headings[1:]):
+        # Roll diff into -180..180
+        diff = (b - a + 540.0) % 360.0 - 180.0
+        if abs(diff) > 60.0:
             tack_count += 1
 
-    return IsochroneResult(
-        coords=coords,
-        total_minutes=times[end_idx],
+    total_minutes = (len(path_idxs) - 1) * dt_minutes
+
+    return RouteResult(
+        path=path,
+        headings=headings,
+        total_minutes=total_minutes,
         tack_count=tack_count,
-        iterations=iterations,
         reached=reached,
-        nodes_explored=len(lats),
+        iterations=iteration,
+        nodes_explored=nodes_explored,
     )
 
 
 # ─── GeoJSON output ─────────────────────────────────────────────────────
 
 
-def route_to_geojson(result: IsochroneResult, *, properties: Optional[dict] = None) -> dict:
-    """Convert an IsochroneResult to a GeoJSON Feature (LineString).
+def route_to_geojson(result: RouteResult, properties: Optional[dict] = None) -> dict:
+    """Convert a RouteResult to a GeoJSON Feature (LineString).
 
-    The frontend loads this into a Mapbox geojson source. Properties carry
-    diagnostics so the UI can render a badge ("4h 12m · 2 tacks").
+    Empty paths produce a Feature with an empty coordinates list — caller
+    may want to check ``properties.reached`` before rendering.
     """
-    props = {
-        "total_minutes": round(result.total_minutes, 1),
+    coords = [[lon, lat] for lat, lon in result.path]  # GeoJSON is [lon, lat]
+    props: dict = {
+        "total_minutes": result.total_minutes,
         "tack_count": result.tack_count,
         "reached": result.reached,
         "iterations": result.iterations,
@@ -371,13 +448,19 @@ def route_to_geojson(result: IsochroneResult, *, properties: Optional[dict] = No
     }
     if properties:
         props.update(properties)
-
     return {
         "type": "Feature",
-        "properties": props,
         "geometry": {
             "type": "LineString",
-            # GeoJSON uses (lon, lat) order
-            "coordinates": [[lon, lat] for (lat, lon) in result.coords],
+            "coordinates": coords,
         },
+        "properties": props,
     }
+
+
+__all__ = [
+    "WindField",
+    "RouteResult",
+    "compute_isochrone_route",
+    "route_to_geojson",
+]
