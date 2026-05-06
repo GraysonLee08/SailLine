@@ -25,6 +25,11 @@ volumes). Treating NaN as land means the engine routes around data gaps
 rather than through them — the right safety default. If a user complains
 that the route avoids open water near a CRM tile boundary, the answer is
 to ingest the adjacent volume, not to fail-open on NaN.
+
+Log levels: the per-call status line is at WARNING so it surfaces in
+Cloud Run's default text-payload feed (INFO from app loggers is
+filtered). Drop back to INFO once we have proper structured logging
+configured.
 """
 from __future__ import annotations
 
@@ -82,14 +87,14 @@ def make_navigable_predicate(
             hazard_indices.append(venue_haz)
 
     if not hazard_indices:
-        log.info(
+        log.warning(
             "navigability for region=%s venue=%s: depth-only "
             "(charts not ingested)",
             region, venue,
         )
     else:
         total = sum(idx.feature_count for idx in hazard_indices)
-        log.info(
+        log.warning(
             "navigability for region=%s venue=%s: depth + %s hazard "
             "polygons across %s indices",
             region, venue, total, len(hazard_indices),
