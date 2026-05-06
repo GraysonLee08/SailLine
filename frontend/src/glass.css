@@ -1,0 +1,233 @@
+/* frontend/src/glass.css
+ *
+ * Glassmorphism layer - dark glass over light map. The light variants
+ * are kept around for completeness (HeroPanel and any future light-on-
+ * dark surfaces) but the active overlays in MapView use the dark ones,
+ * because dark frosted glass on a light map gives much higher contrast
+ * than the inverse.
+ *
+ * Modifier classes (.glass--dark, .glass-card--dark, .glass-button--dark)
+ * are STANDALONE - apply by themselves, not in combination with the
+ * base class. So `<div className="glass-card--dark">`, not
+ * `<div className="glass-card glass-card--dark">`.
+ */
+
+:root {
+  /* Light glass tokens - retained for completeness */
+  --glass-bg: rgba(255, 255, 255, 0.32);
+  --glass-bg-strong: rgba(255, 255, 255, 0.42);
+  --glass-border: 1px solid rgba(255, 255, 255, 0.55);
+  --glass-blur: blur(40px) saturate(180%);
+  --glass-blur-strong: blur(50px) saturate(200%);
+  --glass-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.85) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.18) inset,
+    0 16px 48px rgba(15, 23, 42, 0.20),
+    0 4px 12px rgba(15, 23, 42, 0.10);
+
+  /* Dark glass tokens - the primary aesthetic. Tuned for sitting on
+     mapbox/light-v11 (light beige/gray map). The slight blue tint
+     in --night-2 carries through, giving the surface a sophisticated
+     smoky-navy character rather than flat black.
+
+     Opacity choices:
+       --glass-bg-dark: 42% - thin overlays where you can see the
+         map content clearly through the dark tint
+       --glass-bg-dark-strong: 65% - cards with body text, opacity
+         high enough that white text holds AA contrast against any
+         underlying map content */
+  --glass-bg-dark: rgba(17, 23, 35, 0.42);
+  --glass-bg-dark-strong: rgba(17, 23, 35, 0.65);
+  --glass-border-dark: 1px solid rgba(255, 255, 255, 0.16);
+  --glass-shadow-dark:
+    0 1px 0 rgba(255, 255, 255, 0.12) inset,
+    0 0 0 1px rgba(255, 255, 255, 0.04) inset,
+    0 16px 48px rgba(0, 0, 0, 0.32),
+    0 4px 12px rgba(0, 0, 0, 0.18);
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* Light surfaces (retained, not used by MapView)                      */
+/* ────────────────────────────────────────────────────────────────── */
+
+.glass {
+  background: var(--glass-bg);
+  border: var(--glass-border);
+  border-radius: var(--r-lg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
+  position: relative;
+}
+
+.glass-card {
+  background: var(--glass-bg-strong);
+  border: var(--glass-border);
+  border-radius: var(--r-lg);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  box-shadow: var(--glass-shadow);
+  position: relative;
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* Dark surfaces - standalone (don't pair with .glass / .glass-card)   */
+/* ────────────────────────────────────────────────────────────────── */
+
+.glass--dark {
+  background: var(--glass-bg-dark);
+  border: var(--glass-border-dark);
+  border-radius: var(--r-lg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow-dark);
+  color: var(--paper-ink);
+  position: relative;
+}
+
+.glass-card--dark {
+  background: var(--glass-bg-dark-strong);
+  border: var(--glass-border-dark);
+  border-radius: var(--r-lg);
+  backdrop-filter: var(--glass-blur-strong);
+  -webkit-backdrop-filter: var(--glass-blur-strong);
+  box-shadow: var(--glass-shadow-dark);
+  color: var(--paper-ink);
+  position: relative;
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* Buttons                                                             */
+/* ────────────────────────────────────────────────────────────────── */
+
+/* Light-context glass button - retained for completeness */
+.glass-button {
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.70);
+  border-radius: var(--r-md);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  color: var(--ink);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.7) inset,
+    0 1px 3px rgba(15, 23, 42, 0.08);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.08s ease;
+}
+.glass-button:hover {
+  background: rgba(255, 255, 255, 0.78);
+  border-color: rgba(255, 255, 255, 0.85);
+}
+
+/* Dark-context glass button - white-tinted translucent on dark
+   surfaces. Background is the most opaque element so it reads as
+   interactive against the dark glass parent. */
+.glass-button--dark {
+  background: rgba(255, 255, 255, 0.10);
+  border: 1px solid rgba(255, 255, 255, 0.20);
+  border-radius: var(--r-md);
+  backdrop-filter: blur(16px) saturate(180%);
+  -webkit-backdrop-filter: blur(16px) saturate(180%);
+  color: var(--paper-ink);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.10) inset,
+    0 1px 3px rgba(0, 0, 0, 0.18);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.08s ease;
+}
+.glass-button--dark:hover {
+  background: rgba(255, 255, 255, 0.20);
+  border-color: rgba(255, 255, 255, 0.36);
+}
+
+/* Shared interaction states */
+.glass-button:active,
+.glass-button--dark:active,
+.glass-button--primary:active,
+.glass-button--primary-light:active {
+  transform: scale(0.98);
+}
+.glass-button:disabled,
+.glass-button--dark:disabled,
+.glass-button--primary:disabled,
+.glass-button--primary-light:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Primary - solid ink, used on light surfaces */
+.glass-button--primary {
+  background: var(--ink);
+  color: var(--paper);
+  border: 1px solid var(--ink);
+  border-radius: var(--r-md);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.22);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.08s ease;
+}
+.glass-button--primary:hover {
+  background: var(--ink-2);
+  border-color: var(--ink-2);
+}
+
+/* Primary-light - solid paper, used on DARK surfaces (inverted).
+   Reach for this when you have a primary action on a dark glass
+   card and need it to pop against the smoky background. */
+.glass-button--primary-light {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--paper);
+  border-radius: var(--r-md);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.08s ease;
+}
+.glass-button--primary-light:hover {
+  background: var(--paper-2);
+  border-color: var(--paper-2);
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* Animations                                                          */
+/* ────────────────────────────────────────────────────────────────── */
+
+@keyframes slideDownFade {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────── */
+/* Fallback for browsers without backdrop-filter                       */
+/* ────────────────────────────────────────────────────────────────── */
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass,
+  .glass-card {
+    background: rgba(255, 255, 255, 0.92);
+  }
+  .glass--dark,
+  .glass-card--dark {
+    background: rgba(17, 23, 35, 0.92);
+  }
+  .glass-button {
+    background: rgba(255, 255, 255, 0.90);
+  }
+  .glass-button--dark {
+    background: rgba(40, 50, 70, 0.85);
+  }
+}

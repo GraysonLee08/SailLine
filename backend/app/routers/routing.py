@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -165,6 +165,12 @@ async def compute_route(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             f"resolved region {region!r} not in registry",
         )
+
+    log.warning("ROUTING DEBUG region=%s has_gfs=%s race_start=%s now+18h=%s",
+            region,
+            "gfs" in REGIONS[region].sources,
+            race_start.isoformat(),
+            (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat())
 
     spec = spec_for_class(race["boat_class"])
     polar_path = f"app/services/polars/{spec.polar_csv}"

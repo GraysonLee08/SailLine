@@ -1,22 +1,29 @@
 # backend/app/services/weather/forecast_loader.py
 """Load a WindForecast for a race from cached HRRR + GFS cycles.
 
-Cycle selection rule (per product spec):
+Cycle selection rule:
 
-    HRRR_HORIZON_HOURS = 18
-    If race_start <= now + HRRR_HORIZON_HOURS:
-        - HRRR for [race_start, hrrr_cycle_ref + 18h]
-        - GFS for (hrrr_cycle_ref + 18h, race_end] if race extends beyond
-        - "Latest cycle period" - newest HRRR cycle, regardless of whether
-          its F00 falls before or after race_start. For a race in 90min,
-          the latest cycle's F02 lands roughly on the gun.
-    Else:
-        Raise ForecastNotAvailable. Frontend shows
-        'forecast available in N hours; route will populate then.'
+    Use the best available model(s) to cover [race_start, race_end]:
+      - HRRR (hourly, 0-18h horizon) is the primary source when the
+        race window falls within HRRR's reach. High res, short range.
+      - GFS  (every 3h, 0-120h horizon) covers anything beyond HRRR
+        and is the sole source for races that start past +18h.
+      - Both are used when a race straddles the HRRR/GFS boundary
+        (start in HRRR, end past it - common for distance races).
 
-Race duration defaults to 6h if the caller didn't supply one - long enough
-to be useful for the common inshore/distance case, short enough to avoid
-loading hundreds of GFS fhours for a buoy race.
+    Only when NEITHER model covers the race window do we raise
+    ForecastNotAvailable. Practically that means:
+      - Race starts past +120h (GFS limit), OR
+      - Region has only HRRR configured AND race starts past +18h, OR
+      - Region has only GFS configured AND race ends past +120h
+
+The "latest cycle period" rule still applies: we pull the newest
+ingested cycle for each source we use, regardless of whether its
+F00 falls before or after race_start.
+
+Race duration defaults to 6h if the caller didn't supply one - long
+enough for the common inshore/distance case, short enough to avoid
+loading 40+ GFS fhours for a buoy race.
 """
 from __future__ import annotations
 
@@ -35,8 +42,8 @@ from app.services.routing.wind_forecast import WindForecast, _parse_iso
 log = logging.getLogger(__name__)
 
 HRRR_HORIZON_HOURS = 18
-DEFAULT_RACE_DURATION_HOURS = 6.0
 GFS_HORIZON_HOURS = 120  # matches workers/weather_ingest.SOURCES["gfs"].fhour_max
+DEFAULT_RACE_DURATION_HOURS = 6.0
 
 
 class ForecastNotAvailable(Exception):
@@ -71,7 +78,6 @@ class _CycleInfo:
 async def _newest_cycle(source: str, region: str) -> Optional[_CycleInfo]:
     redis = redis_client.get_client()
     cycles_key = f"weather:{source}:{region}:cycles"
-    # ZRANGE with REV returns newest first.
     raw = await redis.zrevrange(cycles_key, 0, 0)
     if not raw:
         return None
@@ -111,8 +117,8 @@ async def load_forecast_for_race(
     Raises
     ------
     ForecastNotAvailable
-        Race starts outside the HRRR horizon - caller should surface
-        the wait-time to the user.
+        Race window is past every available model's horizon. Caller
+        should surface the wait-time to the user.
     RuntimeError
         Cycles index is empty (no ingest has run yet) or a referenced
         snapshot blob is missing. Operational bug, not user-facing.
@@ -129,34 +135,54 @@ async def load_forecast_for_race(
     has_hrrr = "hrrr" in region_obj.sources
     has_gfs = "gfs" in region_obj.sources
 
-    # Step 1 - HRRR window check. The user-facing rule is "race must start
-    # within the HRRR horizon, or we don't route yet."
-    if has_hrrr:
-        hrrr_window_end = now + timedelta(hours=HRRR_HORIZON_HOURS)
-        if race_start > hrrr_window_end:
-            # Notify mode: forecast becomes available when a future HRRR
-            # cycle's F18 reaches race_start. Each new cycle is 1h.
-            available_at = race_start - timedelta(hours=HRRR_HORIZON_HOURS)
-            raise ForecastNotAvailable(
-                available_at=available_at,
-                reason="race starts beyond HRRR forecast horizon",
-            )
+    # Step 1 - decide which sources can cover the race window.
+    # HRRR is useful only if part of [race_start, race_end] falls within
+    # the next 18h. If the race starts past +18h, HRRR has nothing for
+    # this race and we should skip it entirely (loading a stale F18 from
+    # the latest cycle would be misleading - that data is from before
+    # the race even starts).
+    hrrr_horizon_end = now + timedelta(hours=HRRR_HORIZON_HOURS)
+    use_hrrr = has_hrrr and race_start <= hrrr_horizon_end
 
-    # Step 2 - load the newest cycles available.
-    hrrr_cycle = await _newest_cycle("hrrr", region) if has_hrrr else None
+    # GFS covers anything from now out to +120h. We need its tail when
+    # the race extends past HRRR, OR when HRRR can't be used at all.
+    gfs_horizon_end = now + timedelta(hours=GFS_HORIZON_HOURS)
+    gfs_can_cover_race = has_gfs and race_end <= gfs_horizon_end
+
+    # Step 2 - if NEITHER model covers, raise ForecastNotAvailable
+    # with the soonest moment a future cycle will reach the race.
+    if not use_hrrr and not gfs_can_cover_race:
+        if has_gfs:
+            # GFS will catch up when its 120h horizon reaches race_end.
+            available_at = race_end - timedelta(hours=GFS_HORIZON_HOURS)
+            reason = "race extends beyond GFS forecast horizon"
+        elif has_hrrr:
+            # Region is HRRR-only and race is past +18h.
+            available_at = race_start - timedelta(hours=HRRR_HORIZON_HOURS)
+            reason = (
+                "race starts beyond HRRR forecast horizon "
+                "and no GFS configured for region"
+            )
+        else:
+            # Region has neither - shouldn't happen given REGIONS config.
+            available_at = race_start
+            reason = f"no forecast sources configured for region={region}"
+        raise ForecastNotAvailable(available_at=available_at, reason=reason)
+
+    # Step 3 - load the newest cycles for the sources we'll actually use.
+    hrrr_cycle = await _newest_cycle("hrrr", region) if use_hrrr else None
     gfs_cycle = await _newest_cycle("gfs", region) if has_gfs else None
 
     if hrrr_cycle is None and gfs_cycle is None:
         raise RuntimeError(f"no ingested cycles for region={region}")
 
-    # Step 3 - pick fhours that cover [race_start, race_end].
+    # Step 4 - pick fhours that cover [race_start, race_end] from each
+    # source. HRRR first (if usable), then GFS for the tail.
     snapshots: list[WindField] = []
     quality_parts: list[str] = []
 
     hrrr_max_valid: Optional[datetime] = None
     if hrrr_cycle is not None:
-        # Keep HRRR fhours whose valid_time intersects the race window,
-        # plus one fhour on each side so interpolation has bracketing.
         hrrr_picks = _pick_bracketing(
             hrrr_cycle.fhours, hrrr_cycle.valid_times, race_start, race_end,
         )
@@ -167,7 +193,6 @@ async def load_forecast_for_race(
             hrrr_max_valid = hrrr_cycle.valid_times[hrrr_cycle.fhours.index(hrrr_picks[-1])]
 
     if gfs_cycle is not None and (hrrr_max_valid is None or race_end > hrrr_max_valid):
-        # Cover the tail past HRRR with GFS.
         gfs_window_start = hrrr_max_valid or race_start
         gfs_picks = _pick_bracketing(
             gfs_cycle.fhours, gfs_cycle.valid_times, gfs_window_start, race_end,
@@ -178,8 +203,6 @@ async def load_forecast_for_race(
             quality_parts.append("gfs")
 
     if not snapshots:
-        # Cycles existed but no fhour covered the window - typically a
-        # cycle so old its valid_times are all in the past.
         latest_cycle_iso = (gfs_cycle or hrrr_cycle).cycle_iso  # type: ignore[union-attr]
         raise RuntimeError(
             f"no forecast snapshots intersect race window "
@@ -206,12 +229,10 @@ def _pick_bracketing(
     ]
     picks: set[int] = {fh for fh, _ in in_window}
 
-    # Add the latest fhour BEFORE t_start (so interpolation can sample at t_start).
     before = [(fh, vt) for fh, vt in zip(fhours, valid_times) if vt < t_start]
     if before:
         picks.add(max(before, key=lambda x: x[1])[0])
 
-    # Add the earliest fhour AFTER t_end (so interpolation can sample at t_end).
     after = [(fh, vt) for fh, vt in zip(fhours, valid_times) if vt > t_end]
     if after:
         picks.add(min(after, key=lambda x: x[1])[0])

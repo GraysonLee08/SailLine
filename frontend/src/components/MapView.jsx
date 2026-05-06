@@ -1,29 +1,31 @@
-// MapView — the always-mounted base layer of the app.
+// MapView - the always-mounted base layer of the app.
 //
 // Wind rendering is two-layered:
 //
-//   1. BASE layer: HRRR @ 0.10° over CONUS, or GFS @ 0.25° over Hawaii.
+//   1. BASE layer: HRRR @ 0.10 deg over CONUS, or GFS @ 0.25 deg over Hawaii.
 //      Always loaded. Covers everywhere a user might pan.
 //
-//   2. VENUE layer (overlay): HRRR at native ~0.027° (~3 km), one per
-//      popular sailing area. Loaded only when zoom ≥ 11 AND the viewport
+//   2. VENUE layer (overlay): HRRR at native ~0.027 deg (~3 km), one per
+//      popular sailing area. Loaded only when zoom >= 11 AND the viewport
 //      center is inside a venue's bbox. Drawn on top of base.
 //
 // Where the venue covers, the base layer's barbs are suppressed in that
 // bbox so we don't render two densities on top of each other. Outside the
 // venue (or below zoom 11), only the base layer renders.
 //
-// Region-base auto-detection is in `useRegion`. Venue selection is here
-// because it depends on viewport state (which only the map knows).
-//
 // On top of wind, when an active race is set, we render a dashed blue
 // course-line through the marks plus numbered read-only markers.
-// Drag/edit happens in RaceEditor.
 //
 // On top of *that*, when the user hits Record, we render a green
-// breadcrumb of GPS points captured by `useTrackRecorder`. The recorder
-// owns its own buffer + offline queue; this view just consumes its
-// `points` array and pushes them to a Mapbox GeoJSON source.
+// breadcrumb of GPS points captured by useTrackRecorder.
+//
+// The "better route available" banner is a separate top-of-viewport
+// surface fed by the SSE notifications stream.
+//
+// All overlays use dark frosted-glass surfaces (.glass--dark /
+// .glass-card--dark from glass.css). Dark glass on a light map gives
+// dramatically more contrast than light-on-light, with the smoky tint
+// evoking sunglasses placed on a chart.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
@@ -35,60 +37,30 @@ import { useCountdown } from "../hooks/useCountdown";
 import { useRegion } from "../hooks/useRegion";
 import { useTrackRecorder } from "../hooks/useTrackRecorder";
 import { useRouting } from "../hooks/useRouting";
+import { useRouteNotifications } from "../hooks/useRouteNotifications";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
+import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
 
-// TODO(v1.x): wind particle / flow visualization. Two paths investigated and
-// shelved for v1:
-//   1. Custom WebGL layer adapted from mapbox/webgl-wind. Geometry verified
-//      correct (constant-velocity test passed) but real wind data produced
-//      false vortices we never fully isolated. See git history for the
-//      windParticleLayer.js attempt.
-//   2. Mapbox's official raster-particle. Visually beautiful, fully
-//      maintained, but cost is prohibitive: ~$5-6k/month at hourly HRRR
-//      publish frequency for one region.
-// Barbs are accurate and good enough for v1.
-
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
-// Target on-screen spacing between barbs in CSS pixels. Drives both the
-// stride when zoomed out (decimates the native grid) and the synthetic
-// spacing when zoomed in (interpolates between native points).
 const TARGET_BARB_SPACING_PX = 70;
-
-// Initial map zoom — the map mounts at the resolved base region's center.
 const REGION_FLY_ZOOM = 7;
 const GPS_FLY_ZOOM = 13;
-
-// Padding for fitBounds when an active race is loaded. Generous (140px) so
-// there's room around the course and the top-center race overlay never
-// covers a mark. maxZoom: 12 keeps tight courses from zooming in absurdly
-// close so the user sees the whole route in context.
 const COURSE_FIT_PADDING = 140;
 const COURSE_FIT_MAX_ZOOM = 12;
 
-/**
- * Compute the wind barb features to render at the current map view.
- *
- * Adaptive density: aims for ~constant on-screen barb spacing
- * (TARGET_BARB_SPACING_PX) regardless of zoom level.
- *
- * @param {Map} map        Mapbox map instance
- * @param {object} weather Wind grid payload with lats/lons/u/v
- * @param {{minLat,maxLat,minLon,maxLon}|null} excludeBbox
- *   When set, points falling inside this bbox are skipped. Used by the
- *   base layer to avoid drawing barbs where the venue overlay covers.
- */
+const RACE_OVERLAY_TOP_DEFAULT = 12;
+const RACE_OVERLAY_TOP_WITH_BANNER = 76;
+
 function computeFeatures(map, weather, excludeBbox = null) {
   const { lats, lons, u, v } = weather;
   const zoom = map.getZoom();
   const bounds = map.getBounds();
   const centerLat = map.getCenter().lat;
 
-  // Web Mercator: 256 px per tile, 2^zoom tiles per world width, scaled
-  // by cos(lat) to convert longitude degrees to ground distance.
   const pxPerDeg =
     (256 * Math.pow(2, zoom) * Math.cos((centerLat * Math.PI) / 180)) / 360;
   const targetDeg = TARGET_BARB_SPACING_PX / pxPerDeg;
@@ -112,9 +84,6 @@ function computeFeatures(map, weather, excludeBbox = null) {
   const features = [];
 
   if (targetDeg >= nativeStep) {
-    // Zoomed out: native grid is denser than we want. Stride through it
-    // and clip to the visible viewport so we don't ship offscreen barbs
-    // to Mapbox.
     const stride = Math.max(1, Math.round(targetDeg / nativeStep));
     for (let i = 0; i < lats.length; i += stride) {
       const lat = lats[i];
@@ -127,10 +96,6 @@ function computeFeatures(map, weather, excludeBbox = null) {
       }
     }
   } else {
-    // Zoomed in: native grid is too sparse. Walk a synthetic grid at
-    // targetDeg spacing and bilerp u/v at each point. Snap the start
-    // lat/lon to a multiple of targetDeg so the grid doesn't shift while
-    // panning — keeps barb positions stable to the eye.
     const startLat = Math.ceil(south / targetDeg) * targetDeg;
     const startLon = Math.ceil(west / targetDeg) * targetDeg;
 
@@ -167,16 +132,11 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   const flownRegionRef = useRef(null);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
-  // Viewport state — used to decide whether to load a venue overlay.
-  // Updated on `moveend` (covers pan + zoom, fires once per gesture).
-  const [viewport, setViewport] = useState(null); // { zoom, lat, lon }
+  const [viewport, setViewport] = useState(null);
 
-  // Resolve base region from user identity / race override.
   const base = useRegion(activeRace);
   const baseSource = base.defaultSource;
 
-  // Resolve venue from current viewport — only when zoomed in past the
-  // threshold AND the viewport center sits inside a venue's bbox.
   const venue = useMemo(() => {
     if (!viewport) return null;
     if (viewport.zoom < VENUE_ZOOM_THRESHOLD) return null;
@@ -187,22 +147,14 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     base.name,
     baseSource,
   );
-  // Pass `null` when no venue → useWeather skips fetching.
   const { data: venueWeather } = useWeather(venue?.name ?? null, "hrrr");
 
   const { position } = useGeolocation();
 
-  // Track recorder. Disabled when there's no active race — start() will
-  // surface an error if the user somehow hits the button without one.
   const recorder = useTrackRecorder(activeRace?.id ?? null);
-
-  // Routing — POST /api/routing/compute against the current HRRR wind.
-  // Disabled when no active race; UI gates the button.
   const routing = useRouting(activeRace?.id ?? null);
+  const notif = useRouteNotifications(activeRace?.id ?? null);
 
-  // Initialize map once. Center on the resolved base so the first paint
-  // is already in the right place — useRegion returns synchronously from
-  // localStorage or DEFAULT_BASE_REGION.
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
 
@@ -215,7 +167,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     mapRef.current = map;
     flownRegionRef.current = base.name;
 
-    // Seed viewport state on load and update on moveend.
     const pushViewport = () => {
       const c = map.getCenter();
       setViewport({ zoom: map.getZoom(), lat: c.lat, lon: c.lng });
@@ -231,7 +182,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         img.src = dataUrl;
       });
 
-      // Base wind layer — drawn first.
       map.addSource("wind-base", { type: "geojson", data: EMPTY_FC });
       map.addLayer({
         id: "wind-barbs-base",
@@ -247,7 +197,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      // Venue overlay — drawn on top of base.
       map.addSource("wind-venue", { type: "geojson", data: EMPTY_FC });
       map.addLayer({
         id: "wind-barbs-venue",
@@ -263,9 +212,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      // Course-line on top of wind — visually consistent with RaceEditor
-      // (blue dashed). Last-added wins for layer order on a Mapbox style,
-      // so the course always draws over wind.
       map.addSource("course", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "course-line",
@@ -278,9 +224,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      // GPS breadcrumb on top of course. Solid green so it visually
-      // contrasts with the dashed-blue planned course — at a glance the
-      // user can see "this is what I planned vs this is what I sailed".
       map.addSource("track", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "track-line",
@@ -293,8 +236,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      // Computed isochrone route — magenta, thinner than the track line
-      // so the actual sailed track stays prominent during a race.
       map.addSource("route", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "route-line",
@@ -317,15 +258,9 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
       map.remove();
       mapRef.current = null;
     };
-    // Only ever run once per mount. `base` is captured for the initial
-    // center; subsequent base changes are handled by the flyTo effect.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Push base wind features whenever the base payload, the viewport, or
-  // the active venue changes. Excludes points that fall inside the active
-  // venue's bbox so we don't double-render where the high-res overlay
-  // takes over.
   useEffect(() => {
     if (!styleLoaded || !baseWeather) return;
     const map = mapRef.current;
@@ -336,9 +271,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     src.setData({ type: "FeatureCollection", features });
   }, [baseWeather, viewport, venue, styleLoaded]);
 
-  // Push venue wind features whenever the venue payload or viewport
-  // changes. When venue is null/data is null, push empty so any prior
-  // overlay clears immediately.
   useEffect(() => {
     if (!styleLoaded) return;
     const map = mapRef.current;
@@ -353,9 +285,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     src.setData({ type: "FeatureCollection", features });
   }, [venueWeather, viewport, styleLoaded]);
 
-  // Fly to the base region center when the base changes. Skipped if an
-  // active race is set (the race's fitBounds wins) or if GPS will handle
-  // precise centering. Only fires once per region transition.
   useEffect(() => {
     if (!mapRef.current) return;
     if (flownRegionRef.current === base.name) return;
@@ -371,8 +300,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     });
   }, [base, activeRace, position]);
 
-  // Recenter on browser GPS when it resolves — but only once, and only
-  // if there's no active race. An active race's fitBounds always wins.
   useEffect(() => {
     if (!mapRef.current || !position) return;
     if (gpsHandledRef.current) return;
@@ -385,7 +312,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     });
   }, [position, activeRace]);
 
-  // Render / clear the active race's course + markers.
   const syncKey = useMemo(() => {
     if (!activeRace) return "";
     return (
@@ -450,9 +376,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncKey, styleLoaded]);
 
-  // Push the recorder's breadcrumb to the `track` source whenever a new
-  // point lands. Empty array clears the line — handles the
-  // user-cleared-the-race case as well as the recorder-was-stopped case.
   useEffect(() => {
     if (!styleLoaded) return;
     const map = mapRef.current;
@@ -474,9 +397,6 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     });
   }, [recorder.points, styleLoaded]);
 
-  // Push the computed isochrone route to the magenta line source whenever
-  // the routing hook produces a new GeoJSON Feature. Empty-data path
-  // clears the line on logout / race-cleared / fresh-recompute-error.
   useEffect(() => {
     if (!styleLoaded) return;
     const map = mapRef.current;
@@ -491,9 +411,21 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     src.setData(routing.route);
   }, [routing.route, styleLoaded]);
 
+  const raceOverlayTop = notif.alternative
+    ? RACE_OVERLAY_TOP_WITH_BANNER
+    : RACE_OVERLAY_TOP_DEFAULT;
+
   return (
     <div style={styles.shell}>
       <div ref={containerRef} style={styles.map} />
+
+      <BetterRouteBanner
+        alternative={notif.alternative}
+        onAccept={() =>
+          notif.accept((feature) => routing.applyAlternative(feature))
+        }
+        onDismiss={notif.dismiss}
+      />
 
       {activeRace && (
         <RaceOverlay
@@ -507,14 +439,13 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           onEdit={onEditActive}
           onClear={onClearActive}
           routing={routing}
+          topOffset={raceOverlayTop}
         />
       )}
 
-      {/* Wind status — top left. Shows the active source label and
-          freshness. Region label is intentionally omitted — the map
-          itself is the indicator. */}
+      {/* Wind status (top-left) - dark frosted glass. */}
       {baseWeather && (
-        <div style={styles.windOverlay}>
+        <div className="glass--dark" style={styles.windOverlay}>
           <span style={styles.label}>{baseSource.toUpperCase()}</span>
           <span style={styles.value}>
             valid {validTime?.toISOString().slice(11, 16)}Z
@@ -535,21 +466,26 @@ function RaceOverlay({
   onEdit,
   onClear,
   routing,
+  topOffset,
 }) {
   const cd = useCountdown(race.start_at);
   return (
-    <div style={styles.raceOverlay}>
+    <div
+      className="glass-card--dark"
+      style={{ ...styles.raceOverlay, top: topOffset }}
+    >
       <div style={styles.raceMain}>
         <div style={styles.raceLabel}>Active race</div>
         <div style={styles.raceName}>{race.name}</div>
         <div
           style={{
             ...styles.raceCountdown,
+            // On dark glass: light gray for unset/past, brighter blue for live.
             color: cd.isUnset
-              ? "var(--ink-3)"
+              ? "var(--paper-ink-3)"
               : cd.isPast
-                ? "var(--ink-3)"
-                : "#1a73e8",
+                ? "var(--paper-ink-3)"
+                : "#7eb6ff",
           }}
         >
           {cd.isUnset
@@ -581,6 +517,7 @@ function RaceOverlay({
         )}
         <button
           onClick={onToggleRecord}
+          className={recording ? "" : "glass-button--dark"}
           style={recording ? styles.recordBtnOn : styles.recordBtn}
           aria-label={recording ? "Stop recording" : "Start recording"}
           aria-pressed={recording}
@@ -594,11 +531,16 @@ function RaceOverlay({
             {recording ? "Rec" : "Record"}
           </span>
         </button>
-        <button onClick={onEdit} style={styles.raceEditBtn}>
+        <button
+          onClick={onEdit}
+          className="glass-button--dark"
+          style={styles.raceEditBtn}
+        >
           Edit
         </button>
         <button
           onClick={onClear}
+          className="glass-button--dark"
           style={styles.raceClearBtn}
           aria-label="Clear active race"
           title="Clear active race"
@@ -610,7 +552,7 @@ function RaceOverlay({
   );
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// -- Helpers ---------------------------------------------------------
 
 function emptyLine() {
   return {
@@ -684,7 +626,9 @@ const styles = {
   shell: { position: "relative", width: "100%", height: "100vh" },
   map: { position: "absolute", inset: 0 },
 
-  // Wind status (top-left).
+  // Wind status (top-left). All text colors are inverse - light on
+  // the dark glass surface. The .glass--dark class supplies bg / blur
+  // / border / shadow / radius / base color.
   windOverlay: {
     position: "absolute",
     top: 12,
@@ -693,36 +637,31 @@ const styles = {
     alignItems: "center",
     gap: 10,
     padding: "8px 14px",
-    background: "rgba(255, 255, 255, 0.94)",
-    backdropFilter: "blur(8px)",
-    borderRadius: 8,
-    boxShadow: "0 1px 3px rgba(0, 0, 0, 0.08)",
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontFamily: "var(--mono)",
     fontSize: 12,
-    color: "#1f2937",
     zIndex: 5,
   },
-  label: { fontWeight: 600, letterSpacing: "0.05em" },
-  value: { color: "#475569" },
-  age: { color: "#94a3b8" },
+  label: {
+    fontWeight: 600,
+    letterSpacing: "0.05em",
+    color: "var(--paper-ink)",
+  },
+  value: { color: "var(--paper-ink-2)" },
+  age: { color: "var(--paper-ink-3)" },
 
-  // Race overlay (top-center).
+  // Race overlay (top-center). Dark glass card; all text inverse.
   raceOverlay: {
     position: "absolute",
-    top: 12,
     left: "50%",
     transform: "translateX(-50%)",
     display: "flex",
     alignItems: "center",
     gap: 12,
     padding: "10px 14px 10px 18px",
-    background: "rgba(255, 255, 255, 0.96)",
-    backdropFilter: "blur(8px)",
-    borderRadius: 10,
-    boxShadow: "0 2px 10px rgba(0, 0, 0, 0.08)",
     minWidth: 240,
     maxWidth: "calc(100vw - 140px)",
     zIndex: 5,
+    transition: "top 0.32s cubic-bezier(0.2, 0.9, 0.3, 1.15)",
   },
   raceMain: {
     display: "flex",
@@ -733,34 +672,35 @@ const styles = {
   },
   raceLabel: {
     fontSize: 10,
-    color: "var(--ink-3)",
+    color: "var(--paper-ink-3)",
     textTransform: "uppercase",
     letterSpacing: "0.08em",
     fontWeight: 500,
   },
   raceName: {
     fontSize: 15,
-    color: "var(--ink)",
+    color: "var(--paper-ink)",
     fontWeight: 500,
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
   },
   raceCountdown: {
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontFamily: "var(--mono)",
     fontSize: 13,
     fontVariantNumeric: "tabular-nums",
     fontWeight: 500,
   },
   queueHint: {
     fontSize: 11,
-    color: "var(--ink-3)",
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    color: "var(--paper-ink-3)",
+    fontFamily: "var(--mono)",
     marginTop: 2,
   },
   recordError: {
+    // Brighter red for legibility on dark.
     fontSize: 11,
-    color: "#b00020",
+    color: "#ff8a92",
     marginTop: 2,
     maxWidth: 220,
     overflow: "hidden",
@@ -773,8 +713,9 @@ const styles = {
     flexShrink: 0,
     alignItems: "center",
   },
-  // Big finger-sized record button. 44px tall meets Apple HIG tap target;
-  // padding generous so it doesn't feel cramped next to Edit/Clear.
+
+  // Buttons inherit visuals from the .glass-button--dark class. These
+  // inline styles only handle dimensions, padding, and typography.
   recordBtn: {
     display: "flex",
     alignItems: "center",
@@ -782,15 +723,13 @@ const styles = {
     height: 44,
     minWidth: 80,
     padding: "0 14px",
-    border: "1px solid var(--rule)",
-    background: "var(--paper)",
-    borderRadius: "var(--r-sm)",
     fontSize: 13,
-    color: "var(--ink)",
     cursor: "pointer",
     fontFamily: "inherit",
     fontWeight: 500,
   },
+  // Recording-active deliberately breaks the glass language. Soft red
+  // glow + brighter red border read as alarming against dark glass.
   recordBtnOn: {
     display: "flex",
     alignItems: "center",
@@ -798,23 +737,25 @@ const styles = {
     height: 44,
     minWidth: 80,
     padding: "0 14px",
-    border: "1px solid #b00020",
-    background: "#fff5f6",
-    borderRadius: "var(--r-sm)",
+    border: "1px solid rgba(255, 107, 122, 0.55)",
+    background: "rgba(176, 0, 32, 0.32)",
+    backdropFilter: "blur(16px) saturate(180%)",
+    WebkitBackdropFilter: "blur(16px) saturate(180%)",
+    borderRadius: "var(--r-md)",
     fontSize: 13,
-    color: "#b00020",
+    color: "#ffb3ba",
     cursor: "pointer",
     fontFamily: "inherit",
     fontWeight: 600,
+    boxShadow: "0 1px 0 rgba(255, 255, 255, 0.10) inset",
+    transition: "background 0.15s, border-color 0.15s, transform 0.08s",
   },
-  // Solid red circle while recording (will pulse via CSS animation later).
-  // Outline version when idle so the button reads as "ready to record".
   recordDot: {
     display: "inline-block",
     width: 10,
     height: 10,
     borderRadius: "50%",
-    border: "2px solid #b00020",
+    border: "2px solid #ff8a92",
     background: "transparent",
   },
   recordDotOn: {
@@ -822,28 +763,21 @@ const styles = {
     width: 10,
     height: 10,
     borderRadius: "50%",
-    background: "#b00020",
-    boxShadow: "0 0 0 2px rgba(176, 0, 32, 0.18)",
+    background: "#ff5b6e",
+    boxShadow: "0 0 0 2px rgba(255, 91, 110, 0.28)",
   },
   recordLabel: { fontVariantNumeric: "tabular-nums" },
   raceEditBtn: {
-    border: "1px solid var(--rule)",
-    background: "var(--paper)",
-    borderRadius: "var(--r-sm)",
-    padding: "6px 12px",
+    padding: "8px 14px",
     fontSize: 13,
-    color: "var(--ink)",
     cursor: "pointer",
     fontFamily: "inherit",
+    fontWeight: 500,
   },
   raceClearBtn: {
-    width: 30,
-    height: 30,
-    border: "1px solid var(--rule)",
-    background: "var(--paper)",
-    borderRadius: "var(--r-sm)",
+    width: 34,
+    height: 34,
     fontSize: 14,
-    color: "var(--ink-3)",
     cursor: "pointer",
     padding: 0,
     fontFamily: "inherit",
