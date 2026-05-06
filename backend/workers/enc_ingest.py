@@ -14,15 +14,20 @@ Two services are used, picked automatically based on ``region.kind``:
   * ``venue`` regions (chicago, sf_bay, ...) hit the **enc_harbour**
     service (scale 1:5k–1:50k). This is where breakwalls, jetties,
     piers, and small-craft facility boundaries actually exist as
-    polygons. The smaller venue bboxes also fit comfortably inside ENC
-    Direct's per-query feature cap.
+    polygons.
+
+Per-layer timeouts: harbour-scale LNDARE / SLCONS / OBSTRN over a full
+venue bbox can return thousands of polygons and ENC Direct sometimes
+exceeds even a generous 180s timeout. ``query_layer_geojson`` handles
+this by recursively quartering the bbox on timeout and deduping
+features by their ENC ``OBJECTID``. Layers that come back fast on the
+first try (CTNARE, MIPARE, RESARE) skip the chunking path entirely.
 
 Each ENC Direct layer has a numeric ID inside its parent service. IDs
 are stable per service — but they are NOT the same across services, so
-every layer table here is paired with the service it's valid for. If
-NOAA renumbers anything, the worker logs ``0 features — possible ID
-drift`` and the fix is a one-line table edit. To verify current IDs,
-hit ``{ENC_BASE}/{service}/MapServer?f=json`` in a browser.
+every layer table here is paired with the service it's valid for. To
+verify current IDs, hit ``{ENC_BASE}/{service}/MapServer?f=json`` in
+a browser.
 
 Usage (run from backend/):
 
@@ -36,9 +41,11 @@ import argparse
 import json
 import logging
 import os
+import socket
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -58,8 +65,8 @@ log = logging.getLogger("enc_ingest")
 # ─── Service config ──────────────────────────────────────────────────────
 
 
-# NOAA ENC Direct REST root. The trailing service name is filled in
-# per-region (general for base, harbour for venue).
+# NOAA ENC Direct REST root. Service name (general / harbour) is
+# appended per-region.
 ENC_BASE = "https://encdirect.noaa.gov/arcgis/rest/services/encdirect"
 
 
@@ -110,22 +117,24 @@ def _service_for(region: Region) -> tuple[str, list[tuple[int, str]]]:
 # ─── Knobs ───────────────────────────────────────────────────────────────
 
 
-REQUEST_TIMEOUT_S = 90      # ENC Direct can take 30–60s on big bboxes
-LAYER_SLEEP_S = 1.0         # Be nice to ENC Direct between layers
+REQUEST_TIMEOUT_S = 180     # generous — harbour-scale layers are slow
+LAYER_SLEEP_S = 1.0         # be nice to ENC Direct between layer calls
 PAGE_SIZE = 1000            # ENC Direct caps single-response features
+MIN_CHUNK_DEG = 0.15        # ~10 nm — don't subdivide finer than this
 
 
 # ─── REST client ─────────────────────────────────────────────────────────
 
 
-def query_layer_geojson(
+def _query_once(
     service: str,
     layer_id: int,
     bbox: tuple[float, float, float, float],
-) -> dict:
-    """Hit one ENC Direct layer's /query endpoint and return GeoJSON.
+) -> list[dict]:
+    """One bbox query (with internal pagination). Raises on timeout/error.
 
-    Pages through results if the layer has more features than PAGE_SIZE.
+    Pagination follows ``exceededTransferLimit``. Returns features list,
+    not a FeatureCollection.
     """
     min_lat, max_lat, min_lon, max_lon = bbox
     base_params = {
@@ -145,16 +154,31 @@ def query_layer_geojson(
     while True:
         params = dict(base_params)
         params["resultOffset"] = str(offset)
-        url = f"{ENC_BASE}/{service}/MapServer/{layer_id}/query?{urllib.parse.urlencode(params)}"
+        url = (
+            f"{ENC_BASE}/{service}/MapServer/{layer_id}/query?"
+            f"{urllib.parse.urlencode(params)}"
+        )
         req = urllib.request.Request(
             url, headers={"User-Agent": "sailline-enc-ingest/0.2"},
         )
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
-            page = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read()
+            content_type = resp.headers.get("Content-Type", "")
+
+        try:
+            page = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError as exc:
+            snippet = raw[:300].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"non-JSON response from {service} layer {layer_id} "
+                f"(content-type={content_type!r}): {exc}. "
+                f"First 300 chars: {snippet!r}"
+            ) from exc
 
         if "error" in page:
             raise RuntimeError(
-                f"ENC Direct error ({service} layer {layer_id}): {page['error']}"
+                f"ENC Direct error ({service} layer {layer_id}): "
+                f"{page['error']}"
             )
 
         features = page.get("features", [])
@@ -164,7 +188,91 @@ def query_layer_geojson(
             break
         offset += len(features)
 
-    return {"type": "FeatureCollection", "features": all_features}
+    return all_features
+
+
+def _bbox_size_deg(bbox: tuple[float, float, float, float]) -> float:
+    """Smaller of (lat span, lon span) — used to gate subdivision."""
+    min_lat, max_lat, min_lon, max_lon = bbox
+    return min(max_lat - min_lat, max_lon - min_lon)
+
+
+def _quarter(
+    bbox: tuple[float, float, float, float],
+) -> list[tuple[float, float, float, float]]:
+    """Split a bbox into four equal quadrants (SW, SE, NW, NE)."""
+    min_lat, max_lat, min_lon, max_lon = bbox
+    mid_lat = (min_lat + max_lat) / 2
+    mid_lon = (min_lon + max_lon) / 2
+    return [
+        (min_lat, mid_lat, min_lon, mid_lon),  # SW
+        (min_lat, mid_lat, mid_lon, max_lon),  # SE
+        (mid_lat, max_lat, min_lon, mid_lon),  # NW
+        (mid_lat, max_lat, mid_lon, max_lon),  # NE
+    ]
+
+
+def _feature_oid(feat: dict) -> object:
+    """Stable identity for dedup. Falls back to geometry hash if no OBJECTID."""
+    props = feat.get("properties") or {}
+    # ENC features expose OBJECTID in properties; ArcGIS may also use
+    # FID or fid depending on serializer. Try the common spellings.
+    for key in ("OBJECTID", "objectid", "FID", "fid"):
+        if key in props and props[key] is not None:
+            return (key, props[key])
+    # No stable ID — geometry-hash fallback so identical adjacent
+    # features at chunk boundaries still dedup.
+    geom = feat.get("geometry")
+    if geom:
+        try:
+            return ("geom", json.dumps(geom, sort_keys=True))
+        except (TypeError, ValueError):
+            pass
+    return ("obj", id(feat))
+
+
+def query_layer_geojson(
+    service: str,
+    layer_id: int,
+    bbox: tuple[float, float, float, float],
+) -> dict:
+    """Hit one ENC Direct layer's /query endpoint. Auto-chunks on timeout.
+
+    Strategy: try the full bbox first. If we hit a network/socket
+    timeout, recursively split the bbox into quadrants and retry. Stops
+    subdividing at MIN_CHUNK_DEG (~10 nm); raises if even the smallest
+    chunk times out (very likely a real server problem at that point).
+
+    Returns a FeatureCollection. Dedup runs whenever results are merged
+    from sub-chunks because boundary polygons are returned by both
+    neighbouring queries.
+    """
+    try:
+        features = _query_once(service, layer_id, bbox)
+        return {"type": "FeatureCollection", "features": features}
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        if _bbox_size_deg(bbox) < MIN_CHUNK_DEG:
+            raise RuntimeError(
+                f"timeout at minimum chunk size for {service} "
+                f"layer {layer_id}: {exc}"
+            ) from exc
+
+        log.info("  layer %s: timeout on bbox %s, chunking 2x2",
+                 layer_id, bbox)
+
+        merged: list[dict] = []
+        seen: set = set()
+        for sub in _quarter(bbox):
+            sub_fc = query_layer_geojson(service, layer_id, sub)
+            for feat in sub_fc.get("features", []):
+                oid = _feature_oid(feat)
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                merged.append(feat)
+            time.sleep(LAYER_SLEEP_S)
+
+        return {"type": "FeatureCollection", "features": merged}
 
 
 # ─── Pipeline ────────────────────────────────────────────────────────────
@@ -201,10 +309,6 @@ def merge_layers(
                 "layer %s (%s) returned 0 features — possible ID drift",
                 layer_id, layer_name,
             )
-        elif n >= PAGE_SIZE:
-            # Pagination should have caught this, but log when we hit
-            # the cap so unexplained low counts get surfaced.
-            log.info("  → %s features (pagination active)", n)
         else:
             log.info("  → %s features", n)
 
