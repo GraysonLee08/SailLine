@@ -99,7 +99,7 @@ class ForecastPendingOut(BaseModel):
 
 
 # Bump on any change to engine inputs/outputs (polar, mask, algorithm).
-ENGINE_VERSION = "v7-venue-hazards-debug1"
+ENGINE_VERSION = "v8-segment-sampling"
 
 ROUTE_CACHE_TTL_S = 3600
 
