@@ -13,7 +13,7 @@ numpy==2.1.2
 scipy==1.14.1
 
 # Bathymetry — NetCDF read + spatial polygon index for ENC hazards
-netCDF4==1.7.1
+# netCDF4==1.7.1
 shapely==2.0.6
 
 # Database (week 1 — Cloud SQL via Connector + asyncpg pool)

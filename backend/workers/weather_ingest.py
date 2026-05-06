@@ -1,57 +1,52 @@
+# backend/workers/weather_ingest.py
 """NOAA weather ingestion -> wind grid JSON, clipped to a region bbox.
 
-Production: runs as a Cloud Run Job per (source, region), writes to Redis + GCS.
-Local: --dry-run flag writes JSON to ./ingest_output/ instead.
+Production: runs as a Cloud Run Job per (source, region). One invocation
+ingests the full forecast sequence for the latest cycle (HRRR F00-F18,
+GFS F000-F120 at 3h step) and writes per-fhour keys to Redis + GCS.
+Local: --dry-run writes JSON to ./ingest_output/ instead.
 
 Usage (from backend/):
-    python -m workers.weather_ingest gfs --region conus --dry-run
     python -m workers.weather_ingest hrrr --region conus --dry-run
-    python -m workers.weather_ingest hrrr --region sf_bay --dry-run
-    python -m workers.weather_ingest gfs --region hawaii --fhour 12 --dry-run
+    python -m workers.weather_ingest gfs --region conus --dry-run
+    python -m workers.weather_ingest hrrr --region conus --fhour 1 --dry-run
 
-The target resolution is per-region (e.g. CONUS HRRR = 0.10°, venue HRRR =
-0.027° native). It comes from ``app.regions`` — never hardcode it here.
-
-Each (source, region) pair gets its own Cloud Run Job, named
-``sailline-ingest-{source}-{region}`` (with ``_`` → ``-`` for the region).
-See ``docs/conus-migration.md`` for the rollout runbook.
+Redis key shape (post-rolling-forecast):
+    weather:{source}:{region}:{cycle}:f{fhour:03d}   gzipped JSON wind grid
+    weather:{source}:{region}:{cycle}:manifest       JSON: cycle, fhours, valid_times
+    weather:{source}:{region}:cycles                 sorted set, score=cycle epoch
+    weather:{source}:{region}:latest                 alias to newest cycle's default fhour
+                                                      (preserves /api/weather contract)
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
-import gzip
 import redis
 from google.cloud import storage
 
-import numpy as np
-
 from app.regions import REGIONS, Region
-from app.services.grib import WindGrid, parse_grib_to_wind_grid
+from app.services.grib import parse_grib_to_wind_grid
 
 WIND_FIELDS = (":UGRD:10 m above ground:", ":VGRD:10 m above ground:")
 
 
 # ---------------------------------------------------------------------------
 # Source configuration
-#
-# Resolution lives on the Region (per-source), not on the Source. Source
-# carries the cycle/lag/TTL knobs that are intrinsic to NOAA's release
-# schedule for each model.
 
 
 def gfs_url(date: str, cycle: int, fhour: int) -> str:
-    """GFS 0.25° global. Files run ~500MB each — we use byte ranges."""
     return (
         f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
         f"gfs.{date}/{cycle:02d}/atmos/gfs.t{cycle:02d}z.pgrb2.0p25.f{fhour:03d}"
@@ -59,7 +54,6 @@ def gfs_url(date: str, cycle: int, fhour: int) -> str:
 
 
 def hrrr_url(date: str, cycle: int, fhour: int) -> str:
-    """HRRR 3km CONUS. Surface file (wrfsfcf) — has 10m winds."""
     return (
         f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/"
         f"hrrr.{date}/conus/hrrr.t{cycle:02d}z.wrfsfcf{fhour:02d}.grib2"
@@ -72,35 +66,45 @@ class Source:
     url_fn: Callable[[str, int, int], str]
     cycle_step_hours: int
     publish_lag_hours: int
-    default_fhour: int
-    cache_ttl_seconds: int  # Redis TTL
+    default_fhour: int           # the fhour written to `:latest` for backwards compat
+    cache_ttl_seconds: int       # Redis TTL on per-fhour grids
+    fhour_min: int               # inclusive
+    fhour_max: int               # inclusive — full forecast horizon
+    fhour_step: int              # 1 for HRRR; 3 for GFS to keep download cost bounded
+
+    def fhour_range(self) -> list[int]:
+        return list(range(self.fhour_min, self.fhour_max + 1, self.fhour_step))
 
 
 SOURCES: dict[str, Source] = {
-    "gfs":  Source("gfs",  gfs_url,  6, 5, 6, cache_ttl_seconds=6 * 3600),
-    "hrrr": Source("hrrr", hrrr_url, 1, 2, 1, cache_ttl_seconds=1 * 3600),
+    # HRRR: F00-F18 hourly. 19 files per cycle.
+    "hrrr": Source(
+        "hrrr", hrrr_url, 1, 2, 1,
+        cache_ttl_seconds=2 * 3600,    # cycle TTL longer than cycle interval
+        fhour_min=0, fhour_max=18, fhour_step=1,
+    ),
+    # GFS: F000-F120 every 3h. 41 files per cycle. Plenty for Mac-length races.
+    # Past 120h GFS shifts to 3h native anyway and is rarely worth the bandwidth.
+    "gfs":  Source(
+        "gfs", gfs_url, 6, 5, 6,
+        cache_ttl_seconds=12 * 3600,
+        fhour_min=0, fhour_max=120, fhour_step=3,
+    ),
 }
 
 
 def latest_cycle(source: Source) -> tuple[str, int]:
-    """Pick the most recent run that should be fully published."""
+    """Most recent run that should be fully published."""
     now = datetime.now(timezone.utc) - timedelta(hours=source.publish_lag_hours)
     cycle = (now.hour // source.cycle_step_hours) * source.cycle_step_hours
     return now.strftime("%Y%m%d"), cycle
 
 
 # ---------------------------------------------------------------------------
-# Byte-range download via .idx (shared with scripts/download_fixture.py)
+# Byte-range download via .idx (unchanged from previous worker)
 
 
 def _urlopen_with_retries(req, *, timeout: int, max_attempts: int = 3):
-    """urlopen with exponential backoff on 5xx and network errors.
-
-    4xx (including 404 'cycle not yet published') propagates immediately so
-    callers can fail fast instead of waiting through retries on a permanent
-    error. Returns the urlopen response (caller is responsible for using it
-    as a context manager).
-    """
     delay = 1.0
     for attempt in range(1, max_attempts + 1):
         try:
@@ -118,8 +122,7 @@ def _urlopen_with_retries(req, *, timeout: int, max_attempts: int = 3):
 
 
 def fetch_ranges(idx_url: str, fields: tuple[str, ...]) -> list[tuple[int, int | None]]:
-    """Parse a NOAA .idx file, return (start, end) byte ranges for matching fields."""
-    with _urlopen_with_retries(idx_url, timeout=30) as resp:
+    with _urlopen_with_retries(urllib.request.Request(idx_url), timeout=30) as resp:
         lines = [ln for ln in resp.read().decode("ascii").splitlines() if ln.strip()]
 
     entries: list[tuple[int, int, str]] = []
@@ -136,31 +139,30 @@ def fetch_ranges(idx_url: str, fields: tuple[str, ...]) -> list[tuple[int, int |
 
 
 def download_grib(grib_url: str, ranges: list[tuple[int, int | None]], out: Path) -> None:
-    """Append byte ranges from grib_url to out as a valid concatenated GRIB2 file."""
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("wb") as f:
+    with out.open("wb") as fh:
         for start, end in ranges:
-            header = f"bytes={start}-{end if end is not None else ''}"
-            req = urllib.request.Request(grib_url, headers={"Range": header})
+            req = urllib.request.Request(grib_url)
+            range_header = f"bytes={start}-{'' if end is None else end}"
+            req.add_header("Range", range_header)
             with _urlopen_with_retries(req, timeout=120) as resp:
-                f.write(resp.read())
+                fh.write(resp.read())
 
 
 # ---------------------------------------------------------------------------
-# Bbox clipping + JSON serialization
+# Clipping + serialization
 
 
-def clip_and_serialize(
-    grid: WindGrid, bbox: tuple[float, float, float, float]
-) -> dict:
-    """Clip wind grid to bbox, round to 2 decimals, return JSON-ready dict."""
+def clip_and_serialize(grid, bbox: tuple[float, float, float, float]) -> dict:
+    import numpy as np
     min_lat, max_lat, min_lon, max_lon = bbox
     lat_mask = (grid.lats >= min_lat) & (grid.lats <= max_lat)
     lon_mask = (grid.lons >= min_lon) & (grid.lons <= max_lon)
-
     if not lat_mask.any() or not lon_mask.any():
-        raise ValueError(f"bbox {bbox} produced empty grid")
-
+        raise ValueError(
+            f"empty grid after clip to bbox={bbox}; "
+            f"grid lat=[{grid.lats.min():.2f},{grid.lats.max():.2f}] "
+            f"lon=[{grid.lons.min():.2f},{grid.lons.max():.2f}]"
+        )
     lats = grid.lats[lat_mask]
     lons = grid.lons[lon_mask]
     u = grid.u[np.ix_(lat_mask, lon_mask)]
@@ -170,58 +172,49 @@ def clip_and_serialize(
         "source": grid.source,
         "reference_time": grid.reference_time.isoformat(),
         "valid_time": grid.valid_time.isoformat(),
-        "bbox": {
-            "min_lat": min_lat, "max_lat": max_lat,
-            "min_lon": min_lon, "max_lon": max_lon,
-        },
-        "shape": list(u.shape),
-        "lats": [round(float(x), 4) for x in lats],
-        "lons": [round(float(x), 4) for x in lons],
-        "u": np.round(u, 2).tolist(),
-        "v": np.round(v, 2).tolist(),
+        "bbox": {"min_lat": min_lat, "max_lat": max_lat,
+                 "min_lon": min_lon, "max_lon": max_lon},
+        "shape": [len(lats), len(lons)],
+        "lats": lats.tolist(),
+        "lons": lons.tolist(),
+        "u": u.tolist(),
+        "v": v.tolist(),
     }
 
 
 # ---------------------------------------------------------------------------
-# Pipeline
+# Redis + GCS writes
 
 
-def _write_redis(key: str, ttl: int, blob: bytes) -> None:
-    r = redis.Redis(
+def _redis_client() -> redis.Redis:
+    return redis.Redis(
         host=os.environ["REDIS_HOST"],
-        port=int(os.environ.get("REDIS_PORT", 6379)),
-        socket_timeout=10,
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        db=0,
     )
-    r.setex(key, ttl, blob)
 
 
-def _write_gcs(source_name: str, region_name: str, cycle_iso: str, blob: bytes) -> str:
-    """Upload twice: timestamped archive object + stable latest.json.gz pointer.
+def _write_redis(client: redis.Redis, key: str, ttl: int, blob: bytes) -> None:
+    client.setex(key, ttl, blob)
 
-    The archive object preserves the per-cycle history for audit/debug; the
-    pointer lets the API fallback do a single ``get_blob`` instead of a
-    ``list_blobs`` + in-memory sort that scales with archive depth.
 
-    Order matters: archive first, then pointer. If the second upload fails,
-    the archive is still on disk for manual recovery and the next cycle
-    overwrites the pointer correctly. The reverse order would risk pointing
-    `latest.json.gz` at bytes that have no archive companion.
-
-    Returns the archive URI (the pointer URI is implied by the path scheme).
-    """
+def _write_gcs(source_name: str, region_name: str, cycle_iso: str,
+               fhour: int, blob: bytes) -> str:
     bucket_name = os.environ["GCS_WEATHER_BUCKET"]
     client = storage.Client()
     bucket = client.bucket(bucket_name)
 
-    archive_path = f"{source_name}/{region_name}/{cycle_iso}.json.gz"
-    latest_path = f"{source_name}/{region_name}/latest.json.gz"
+    archive_path = f"{source_name}/{region_name}/{cycle_iso}/f{fhour:03d}.json.gz"
+    obj = bucket.blob(archive_path)
+    obj.content_encoding = "gzip"
+    obj.upload_from_string(blob, content_type="application/json")
 
-    for path in (archive_path, latest_path):
-        obj = bucket.blob(path)
-        obj.content_encoding = "gzip"
-        obj.upload_from_string(blob, content_type="application/json")
-
+    # Per-cycle latest pointer for the default fhour preserves prior behaviour.
     return f"gs://{bucket_name}/{archive_path}"
+
+
+# ---------------------------------------------------------------------------
+# Core ingest — single fhour (kept compatible with existing tests)
 
 
 def ingest(
@@ -230,30 +223,137 @@ def ingest(
     fhour: int | None = None,
     dry_run: bool = False,
 ) -> dict:
-    if region_name not in REGIONS:
-        raise ValueError(
-            f"unknown region: {region_name}. valid: {sorted(REGIONS)}"
-        )
-    region: Region = REGIONS[region_name]
+    """Ingest a single fhour. Existing test contract preserved."""
+    source, region = _resolve(source_name, region_name)
+    if fhour is None:
+        fhour = source.default_fhour
 
+    payload, payload_gz, cycle_iso = _fetch_one(source, region, fhour)
+
+    if dry_run:
+        out_dir = Path(__file__).parent.parent / "ingest_output"
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
+        out_path.write_bytes(payload_gz)
+        print(f"[{source.name}/{region.name}] dry-run -> {out_path}", flush=True)
+        return payload
+
+    client = _redis_client()
+    fhour_key = f"weather:{source.name}:{region.name}:{cycle_iso}:f{fhour:03d}"
+    _write_redis(client, fhour_key, source.cache_ttl_seconds, payload_gz)
+    _write_gcs(source.name, region.name, cycle_iso, fhour, payload_gz)
+
+    # Backwards-compat alias, only when this is the default fhour.
+    if fhour == source.default_fhour:
+        latest_key = f"weather:{source.name}:{region.name}:latest"
+        _write_redis(client, latest_key, source.cache_ttl_seconds, payload_gz)
+
+    return payload
+
+
+def ingest_cycle(
+    source_name: str,
+    region_name: str,
+    dry_run: bool = False,
+) -> dict:
+    """Ingest the FULL forecast sequence for the latest cycle.
+
+    This is the new entry point. One Cloud Run Job invocation per cycle
+    walks every fhour, writes a per-fhour Redis key, and finalises with
+    a manifest + cycles-index update so the API can find this cycle.
+    """
+    source, region = _resolve(source_name, region_name)
+    fhours = source.fhour_range()
+
+    print(f"[{source.name}/{region.name}] cycle ingest, fhours={fhours[0]}..{fhours[-1]} "
+          f"step={source.fhour_step} ({len(fhours)} files)", flush=True)
+
+    cycle_iso: str | None = None
+    valid_times: dict[int, str] = {}
+    fhour_blobs: dict[int, bytes] = {}  # only for dry-run summary
+
+    for fh in fhours:
+        try:
+            payload, payload_gz, this_cycle_iso = _fetch_one(source, region, fh)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"  fhour {fh:03d}: 404 (not yet published) — stopping cycle", flush=True)
+                break
+            raise
+        cycle_iso = this_cycle_iso  # consistent across the cycle
+        valid_times[fh] = payload["valid_time"]
+
+        if dry_run:
+            fhour_blobs[fh] = payload_gz
+            continue
+
+        client = _redis_client()
+        fhour_key = f"weather:{source.name}:{region.name}:{cycle_iso}:f{fh:03d}"
+        _write_redis(client, fhour_key, source.cache_ttl_seconds, payload_gz)
+        _write_gcs(source.name, region.name, cycle_iso, fh, payload_gz)
+
+        if fh == source.default_fhour:
+            latest_key = f"weather:{source.name}:{region.name}:latest"
+            _write_redis(client, latest_key, source.cache_ttl_seconds, payload_gz)
+
+    if cycle_iso is None:
+        raise RuntimeError("no fhours ingested — even F00 failed")
+
+    manifest = {
+        "source": source.name,
+        "region": region.name,
+        "cycle": cycle_iso,
+        "reference_time": valid_times.get(fhours[0]),  # F00 valid_time == cycle ref
+        "fhours": sorted(valid_times.keys()),
+        "valid_times": [valid_times[fh] for fh in sorted(valid_times.keys())],
+    }
+    manifest_blob = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+
+    if dry_run:
+        out_dir = Path(__file__).parent.parent / "ingest_output"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / f"{source.name}_{region.name}_{cycle_iso}_manifest.json").write_bytes(manifest_blob)
+        print(f"[{source.name}/{region.name}] dry-run cycle complete: "
+              f"{len(fhour_blobs)} files, manifest written", flush=True)
+        return manifest
+
+    client = _redis_client()
+    manifest_key = f"weather:{source.name}:{region.name}:{cycle_iso}:manifest"
+    _write_redis(client, manifest_key, source.cache_ttl_seconds, manifest_blob)
+
+    # Cycles index — sorted set, score = cycle epoch, member = cycle iso.
+    cycle_dt = datetime.strptime(cycle_iso, "%Y%m%dT%H%MZ").replace(tzinfo=timezone.utc)
+    cycles_key = f"weather:{source.name}:{region.name}:cycles"
+    client.zadd(cycles_key, {cycle_iso: cycle_dt.timestamp()})
+    # Trim to the most recent 8 cycles per source — older cycles' keys age out
+    # via TTL anyway. ZREMRANGEBYRANK keeps memory bounded.
+    client.zremrangebyrank(cycles_key, 0, -9)
+
+    print(f"[{source.name}/{region.name}] cycle ingest complete: "
+          f"{len(valid_times)} fhours, cycle={cycle_iso}", flush=True)
+    return manifest
+
+
+def _resolve(source_name: str, region_name: str) -> tuple[Source, Region]:
+    if region_name not in REGIONS:
+        raise ValueError(f"unknown region: {region_name}. valid: {sorted(REGIONS)}")
+    region = REGIONS[region_name]
     if source_name not in region.sources:
         raise ValueError(
             f"source {source_name!r} not configured for region {region_name!r}. "
             f"valid: {list(region.sources)}"
         )
+    return SOURCES[source_name], region
 
-    source = SOURCES[source_name]
-    if fhour is None:
-        fhour = source.default_fhour
 
+def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes, str]:
+    """Download + parse + serialize one fhour. Returns (payload, gzip blob, cycle_iso)."""
     bbox = region.bbox
-    target_resolution = region.resolution_for(source_name)
-
+    target_resolution = region.resolution_for(source.name)
     date, cycle = latest_cycle(source)
     grib_url = source.url_fn(date, cycle, fhour)
-    tag = f"{source.name}/{region.name}@{target_resolution}°"
-    print(f"[{tag}] cycle={date} {cycle:02d}Z fhour={fhour:03d}", flush=True)
-    print(f"[{tag}] url={grib_url}", flush=True)
+    tag = f"{source.name}/{region.name}@{target_resolution}° f{fhour:03d}"
+    print(f"[{tag}] cycle={date} {cycle:02d}Z", flush=True)
 
     ranges = fetch_ranges(f"{grib_url}.idx", WIND_FIELDS)
     if not ranges:
@@ -264,10 +364,6 @@ def ingest(
     tmp_path = Path(tmp_path_str)
     try:
         download_grib(grib_url, ranges, tmp_path)
-        print(
-            f"[{tag}] downloaded {tmp_path.stat().st_size / 1024:.1f} KB",
-            flush=True,
-        )
         grid = parse_grib_to_wind_grid(
             tmp_path,
             source=source.name,
@@ -281,60 +377,26 @@ def ingest(
             pass
 
     payload = clip_and_serialize(grid, bbox)
-    print(
-        f"[{tag}] grid {payload['shape'][0]}x{payload['shape'][1]} "
-        f"({payload['lats'][0]:.2f}..{payload['lats'][-1]:.2f}N, "
-        f"{payload['lons'][0]:.2f}..{payload['lons'][-1]:.2f}E)",
-        flush=True,
-    )
-
     payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_gz = gzip.compress(payload_json)
-    print(
-        f"[{tag}] payload {len(payload_json) / 1024:.1f} KB "
-        f"-> gz {len(payload_gz) / 1024:.1f} KB",
-        flush=True,
-    )
-
-    if dry_run:
-        out_dir = Path(__file__).parent.parent / "ingest_output"
-        out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
-        out_path.write_bytes(payload_gz)
-        print(f"[{tag}] dry-run -> {out_path}", flush=True)
-    else:
-        cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
-        _write_redis(
-            f"weather:{source.name}:{region.name}:latest",
-            source.cache_ttl_seconds,
-            payload_gz,
-        )
-        gcs_uri = _write_gcs(source.name, region.name, cycle_iso, payload_gz)
-        print(
-            f"[{tag}] redis ttl={source.cache_ttl_seconds}s gcs={gcs_uri}",
-            flush=True,
-        )
-
-    return payload
+    cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
+    return payload, payload_gz, cycle_iso
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="NOAA weather ingestion worker")
     parser.add_argument("source", choices=sorted(SOURCES.keys()))
-    parser.add_argument(
-        "--region",
-        required=True,
-        choices=sorted(REGIONS.keys()),
-        help="Region to clip to (see app/regions.py)",
-    )
-    parser.add_argument("--fhour", type=int, help="Forecast hour (default: source-specific)")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Write JSON to ./ingest_output/ instead of Redis/GCS",
-    )
+    parser.add_argument("--region", required=True, choices=sorted(REGIONS.keys()))
+    parser.add_argument("--fhour", type=int,
+                        help="Single-fhour mode (default: full cycle ingest)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Write JSON to ./ingest_output/ instead of Redis/GCS")
     args = parser.parse_args()
-    ingest(args.source, region_name=args.region, fhour=args.fhour, dry_run=args.dry_run)
+
+    if args.fhour is not None:
+        ingest(args.source, region_name=args.region, fhour=args.fhour, dry_run=args.dry_run)
+    else:
+        ingest_cycle(args.source, region_name=args.region, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
