@@ -5,15 +5,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import telemetry
-app.include_router(telemetry.router)
-
 from app import auth, db, redis_client
 from app.routers import (
     health,
     races,
     routing,
     routing_notifications,
+    telemetry,
     tracks,
     users,
     weather,
@@ -65,10 +63,11 @@ app.add_middleware(
 
 app.include_router(health.router)
 app.include_router(users.router, prefix="/api")
-app.include_router(weather.router)              # router carries its own /api/weather prefix
-app.include_router(races.router)                # router carries its own /api/races prefix
-app.include_router(tracks.router)               # router carries its own /api/races/{id}/track prefix
-app.include_router(routing.router)              # /api/routing - compute endpoint
+app.include_router(weather.router)                # router carries its own /api/weather prefix
+app.include_router(races.router)                  # router carries its own /api/races prefix
+app.include_router(tracks.router)                 # router carries its own /api/races/{id}/track prefix
+app.include_router(telemetry.router)              # router carries its own /api/races/{id}/telemetry prefix
+app.include_router(routing.router)                # /api/routing - compute endpoint
 app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
 
 
