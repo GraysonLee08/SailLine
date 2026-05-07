@@ -39,6 +39,14 @@ import {
   parseCoord,
 } from "./lib/latlon";
 import { useCountdown } from "./hooks/useCountdown";
+import { safeAnimate, EASE_OUT_OVERSHOOT } from "./lib/motion";
+
+// crypto.randomUUID is the canonical browser UUID generator. Fallback
+// for older test environments (jsdom without crypto.randomUUID).
+const newAnimKey = () =>
+  typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `k-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
@@ -87,6 +95,12 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   const [loading, setLoading] = useState(!isNew);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+
+  // Tracks which mark _animKey just got added so the corresponding row
+  // can play its scale-bounce entrance once. The "__all__" sentinel
+  // means "every mark with an _animKey should animate" — used by the
+  // course-preset path which replaces the entire array at once.
+  const [justAddedMarkKey, setJustAddedMarkKey] = useState(null);
 
   const setMarksRef = useRef(setMarks);
   setMarksRef.current = setMarks;
@@ -160,10 +174,16 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 
     map.on("click", (e) => {
       const { lng, lat } = e.lngLat;
-      setMarksRef.current((prev) => [
-        ...prev,
-        { name: defaultMarkName(prev.length), lat, lon: lng },
-      ]);
+      setMarksRef.current((prev) => {
+        const m = {
+          name: defaultMarkName(prev.length),
+          lat,
+          lon: lng,
+          _animKey: newAnimKey(),
+        };
+        setJustAddedMarkKey(m._animKey);
+        return [...prev, m];
+      });
     });
 
     return () => {
@@ -288,10 +308,16 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   // New marks start unplaced — null lat/lon. The user fills in coords
   // via the inputs, or by dragging once a coord is entered.
   const addEmptyMark = () =>
-    setMarks((prev) => [
-      ...prev,
-      { name: defaultMarkName(prev.length), lat: null, lon: null },
-    ]);
+    setMarks((prev) => {
+      const m = {
+        name: defaultMarkName(prev.length),
+        lat: null,
+        lon: null,
+        _animKey: newAnimKey(),
+      };
+      setJustAddedMarkKey(m._animKey);
+      return [...prev, m];
+    });
 
   const applyCourseTemplate = (courseId) => {
     if (!courseId) return;
@@ -308,7 +334,10 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
     ) {
       return;
     }
-    setMarks(next);
+    // Tag every mark with a fresh _animKey and use the "__all__" sentinel
+    // so all rows scale-bounce in together when a preset is loaded.
+    setMarks(next.map((m) => ({ ...m, _animKey: newAnimKey() })));
+    setJustAddedMarkKey("__all__");
     fittedRef.current = false;
   };
 
@@ -341,6 +370,9 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         name: name.trim(),
         mode,
         boat_class: boatClass,
+        // Explicit field-by-field projection — the frontend-only
+        // `_animKey` (used to drive entrance animation) is naturally
+        // dropped here, so no extra strip is needed.
         marks: marks.map((m) => ({
           name: m.name,
           lat: m.lat,
@@ -495,12 +527,13 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
                 <ul style={styles.marksList}>
                   {marks.map((m, i) => (
                     <MarkRow
-                      key={i}
+                      key={m._animKey || i}
                       index={i}
                       mark={m}
                       format={coordFormat}
                       isFirst={i === 0}
                       isLast={i === marks.length - 1}
+                      justAddedMarkKey={justAddedMarkKey}
                       onRename={(v) => renameMark(i, v)}
                       onLat={(v) => updateCoord(i, "lat", v)}
                       onLon={(v) => updateCoord(i, "lon", v)}
@@ -538,7 +571,7 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 // input snaps back to the formatted current value.
 
 function MarkRow({
-  index, mark, format, isFirst, isLast,
+  index, mark, format, isFirst, isLast, justAddedMarkKey,
   onRename, onLat, onLon, onUp, onDown, onDelete,
 }) {
   // Pick formatters based on the active format. parseCoord handles both
@@ -559,6 +592,26 @@ function MarkRow({
 
   const [latStr, setLatStr] = useState(fmtLat(mark.lat));
   const [lonStr, setLonStr] = useState(fmtLon(mark.lon));
+
+  // Scale-bounce entrance: only fires on the row whose _animKey matches
+  // the freshly-added key (or on every keyed row when the "__all__"
+  // sentinel is set, which the preset-load path uses). safeAnimate is
+  // a no-op under prefers-reduced-motion / hidden tab — pure entrance
+  // pattern, so the unanimated state IS the final state.
+  const rowRef = useRef(null);
+  useEffect(() => {
+    const isJustAdded =
+      justAddedMarkKey === "__all__" ||
+      (mark._animKey && mark._animKey === justAddedMarkKey);
+    if (!isJustAdded) return;
+    if (!rowRef.current) return;
+    safeAnimate(rowRef.current, {
+      scale: [0.4, 1.0],
+      opacity: [0, 1],
+      duration: 250,
+      easing: EASE_OUT_OVERSHOOT,
+    });
+  }, [mark._animKey, justAddedMarkKey]);
 
   // Resync local strings whenever the underlying value or the active
   // format changes (e.g. drag, course load, format toggle).
@@ -598,7 +651,7 @@ function MarkRow({
   const unplaced = !Number.isFinite(mark.lat) || !Number.isFinite(mark.lon);
 
   return (
-    <li style={styles.markRow}>
+    <li ref={rowRef} style={styles.markRow}>
       <div style={styles.markRowTop}>
         <span
           style={{
