@@ -19,6 +19,12 @@
 //     effectively never appears more than once per session.
 
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import {
+  createTimeline,
+  EASE_OUT_SOFT,
+  prefersReducedMotion,
+  isHidden,
+} from "./lib/motion";
 import { signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiFetch } from "./api";
@@ -28,6 +34,7 @@ const RacesListView = lazy(() => import("./RacesListView.jsx"));
 const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
+const INTRO_PLAYED_KEY = "sailline.introPlayed";
 
 // A race is "ongoing" until 6 hours past its scheduled start. After that,
 // drop it from active state so the next time the app opens it doesn't
@@ -108,6 +115,32 @@ export default function AppView({ user }) {
     };
   }, []);
 
+  // ── Intro timeline (once per session) ────────────────────────────
+  // Fades the map subtree from 0 → 1 over 500ms when AppView first mounts.
+  // Gated by sessionStorage so reloads / view-switches don't replay.
+  // prefers-reduced-motion / hidden-tab → skip and snap to opacity 1.
+  const introContainerRef = useRef(null);
+  useEffect(() => {
+    if (sessionStorage.getItem(INTRO_PLAYED_KEY) === "1") return;
+
+    const root = introContainerRef.current;
+    const barbs = root?.querySelector("[data-intro='barbs']");
+
+    // Skip animation under reduced-motion / hidden-tab. Snap target to
+    // its final opacity so a subsequent intro never starts mid-frame.
+    if (prefersReducedMotion() || isHidden() || !barbs) {
+      if (barbs) barbs.style.opacity = "1";
+      sessionStorage.setItem(INTRO_PLAYED_KEY, "1");
+      return;
+    }
+
+    const tl = createTimeline({ defaults: { easing: EASE_OUT_SOFT } });
+    tl.add(barbs, { opacity: [0, 1], duration: 500 }, 0);
+
+    sessionStorage.setItem(INTRO_PLAYED_KEY, "1");
+    return () => tl.pause?.();
+  }, []);
+
   // ── Menu ESC ─────────────────────────────────────────────────────
   useEffect(() => {
     if (!menuOpen) return;
@@ -133,10 +166,10 @@ export default function AppView({ user }) {
   };
 
   return (
-    <div style={styles.shell}>
+    <div ref={introContainerRef} style={styles.shell}>
       {/* Map is always mounted so it doesn't reinitialize when switching
           back from another view. The other screens render on top of it. */}
-      <div style={{ ...styles.layer, zIndex: 0 }}>
+      <div data-intro="barbs" style={{ ...styles.layer, zIndex: 0 }}>
         <MapView
           activeRace={activeRace}
           onEditActive={() =>
