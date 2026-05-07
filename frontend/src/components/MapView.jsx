@@ -40,6 +40,7 @@ import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
+import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
@@ -492,7 +493,16 @@ function RaceOverlay({
             ? "No start time set"
             : cd.isPast
               ? cd.label
-              : `Starts in ${cd.label}`}
+              : (() => {
+                  const { prefix, seconds } = splitSecondsFromCountdown(cd.label);
+                  if (!prefix) return `Starts in ${cd.label}`;
+                  return (
+                    <>
+                      Starts in {prefix}
+                      <AnimatedDigit value={seconds} />
+                    </>
+                  );
+                })()}
         </div>
         {recording && queueLength > 0 && (
           <div style={styles.queueHint}>

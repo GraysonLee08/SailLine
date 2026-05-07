@@ -40,6 +40,7 @@ import {
 } from "./lib/latlon";
 import { useCountdown } from "./hooks/useCountdown";
 import { safeAnimate, EASE_OUT_OVERSHOOT } from "./lib/motion";
+import { AnimatedDigit, splitSecondsFromCountdown } from "./components/AnimatedDigit.jsx";
 
 // crypto.randomUUID is the canonical browser UUID generator. Fallback
 // for older test environments (jsdom without crypto.randomUUID).
@@ -421,7 +422,19 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
           <span style={styles.countdownLabel}>
             {countdown.isPast ? "STATUS" : "STARTS IN"}
           </span>
-          <span style={styles.countdownValue}>{countdown.label}</span>
+          <span style={styles.countdownValue}>
+            {(() => {
+              if (countdown.isPast || countdown.isUnset) return countdown.label;
+              const { prefix, seconds } = splitSecondsFromCountdown(countdown.label);
+              if (!prefix) return countdown.label;
+              return (
+                <>
+                  {prefix}
+                  <AnimatedDigit value={seconds} />
+                </>
+              );
+            })()}
+          </span>
         </div>
       )}
 
