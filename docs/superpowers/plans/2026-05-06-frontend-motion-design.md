@@ -118,17 +118,32 @@ git commit -m "feat(motion): add anime.js, motion tokens, pulseRing keyframe"
 // frontend/src/lib/motion.js
 //
 // Single import surface for anime.js v4. Centralizes shared durations
-// and easings so motion stays consistent across components. Wraps
-// anime.js's animate() with safety guards so individual components
-// don't have to remember to check prefers-reduced-motion or visibility.
+// and easings so motion stays consistent across components. Exposes
+// safeAnimate(): a thin wrapper around anime.js's animate() that bails
+// (returning null) under prefers-reduced-motion or when the tab is
+// hidden, so individual components don't have to remember the guards.
+//
+// IMPORTANT: safeAnimate does NOT snap the target to its end state on
+// bail. Callers are responsible for ensuring the desired final visual
+// state holds when safeAnimate returns null. Two common patterns:
+//   1. Pure entrance animations (scale/opacity from 0 → 1, etc.):
+//      the unanimated state IS the final state. A null return means
+//      the element just appears immediately. Nothing to do.
+//   2. Numeric tweens with onUpdate writing to React state: set state
+//      to the FINAL value BEFORE calling safeAnimate. If the animation
+//      runs, onUpdate will overwrite intermediate values; if it bails,
+//      the final value already holds.
 //
 // Lazy-loaded behind AppView's lazy() boundary in App.jsx — the auth
-// screen bundle never pulls anime.js. Verify with `npm run build` and
-// confirm the auth-screen chunk has no `animejs` references.
+// screen bundle never pulls anime.js.
 
 import { animate, createTimeline, stagger } from "animejs";
 
-export { animate, createTimeline, stagger };
+// createTimeline and stagger are exposed for callers that need them
+// (e.g., AppView's intro timeline). They are NOT guarded — callers
+// that import them must check prefersReducedMotion()/isHidden()
+// themselves before orchestrating.
+export { createTimeline, stagger };
 
 // Mirror of CSS tokens in src/index.css. Numeric (ms) for anime.js;
 // the CSS tokens are strings for transitions.
@@ -137,7 +152,7 @@ export const MOTION_MEDIUM = 320;
 export const MOTION_SLOW = 600;
 export const MOTION_HERO = 900;
 
-// anime.js v4 accepts standard CSS easing strings.
+// anime.js v4 accepts CSS-style easing strings.
 export const EASE_OUT_SOFT = "cubicBezier(0.2, 0.9, 0.3, 1.0)";
 export const EASE_OUT_OVERSHOOT = "cubicBezier(0.2, 0.9, 0.3, 1.15)";
 
@@ -154,68 +169,18 @@ export function isHidden() {
 }
 
 /**
- * Wrap anime.js's `animate()` with the standard guards. If reduced
- * motion is requested or the tab is hidden, snap to the end state
- * (by applying `to` values immediately when `to` is an object of
- * static values) and return null so callers can null-check before
- * calling .pause()/.cancel().
+ * Run anime.js animate() unless reduced motion is requested or the
+ * tab is hidden, in which case return null without animating.
  *
- * Use this instead of importing `animate` directly so the guards
- * can't be forgotten.
+ * The caller owns the final state — see file header for patterns.
  *
- * @param {Element|Element[]|string} target - DOM target(s) for anime
- * @param {object} opts - anime.js v4 options (duration, easing, properties)
+ * @param {Element|Element[]|string|object} target - anime.js target(s)
+ * @param {object} opts - anime.js v4 options
  * @returns {object|null} - the anime.js controller, or null if guarded
  */
 export function safeAnimate(target, opts) {
-  if (prefersReducedMotion() || isHidden()) {
-    // Snap to end state. anime.js v4 stores property targets directly
-    // on opts; for simple { property: value } pairs we can apply them
-    // synchronously as inline styles. For numeric tweens (where opts
-    // has an onUpdate that writes to React state) the caller is
-    // responsible for snapping — they'll typically set state to the
-    // target value when this function returns null.
-    snapToEnd(target, opts);
-    return null;
-  }
+  if (prefersReducedMotion() || isHidden()) return null;
   return animate(target, opts);
-}
-
-function snapToEnd(target, opts) {
-  if (!target || !opts) return;
-  const elements = resolveTargets(target);
-  for (const el of elements) {
-    for (const [key, value] of Object.entries(opts)) {
-      if (isAnimeOption(key)) continue;
-      const final = Array.isArray(value) ? value[value.length - 1] : value;
-      if (final == null || typeof final === "object") continue;
-      try {
-        el.style[key] = typeof final === "number" ? `${final}px` : String(final);
-      } catch {
-        // Some style keys (transform, opacity) are fine; ignore others.
-      }
-    }
-  }
-}
-
-function resolveTargets(target) {
-  if (typeof target === "string") {
-    return Array.from(document.querySelectorAll(target));
-  }
-  if (Array.isArray(target) || target instanceof NodeList) {
-    return Array.from(target);
-  }
-  return [target];
-}
-
-const ANIME_OPTION_KEYS = new Set([
-  "duration", "delay", "easing", "loop", "direction",
-  "autoplay", "begin", "update", "complete", "onUpdate",
-  "onComplete", "onBegin", "endDelay",
-]);
-
-function isAnimeOption(key) {
-  return ANIME_OPTION_KEYS.has(key);
 }
 ```
 
@@ -869,14 +834,10 @@ useEffect(() => {
   // Resolve children by data attribute so the timeline is robust to
   // markup tweaks (no brittle :nth-child selectors).
   const root = introContainerRef.current;
-  const sweep = root.querySelector("[data-intro='sweep']");
-  const trace = root.querySelector("[data-intro='trace']");
   const barbs = root.querySelector("[data-intro='barbs']");
 
   const tl = createTimeline({ defaults: { easing: EASE_OUT_SOFT } });
-  if (sweep) tl.add(sweep, { opacity: [1, 0], duration: 250 }, 0);
-  if (trace) tl.add(trace, { opacity: [0, 1], duration: 500 }, 200);
-  if (barbs) tl.add(barbs, { opacity: [0, 1], duration: 500 }, 400);
+  if (barbs) tl.add(barbs, { opacity: [0, 1], duration: 500 }, 0);
 
   sessionStorage.setItem(INTRO_PLAYED_KEY, "1");
   return () => tl.pause?.();
@@ -885,26 +846,19 @@ useEffect(() => {
 
 - [ ] **Step 2: Identify which JSX elements should carry the intro data attributes**
 
-`AppView.jsx` already renders the post-login shell. Decide which existing elements to tag:
-- `[data-intro="sweep"]` — A short-lived overlay. If no obvious target exists, add a single `<div>` overlay (`position: fixed`, full-viewport, `var(--paper)` background) inside `<div ref={introContainerRef}>` that's removed after fade-out via the timeline's `onComplete` (or simply left at opacity 0).
-- `[data-intro="trace"]` — A faint sample SVG path overlaid on the map. For ship-1, this can be a static SVG `<path>` with low opacity (`stroke-opacity: 0.25`), positioned absolutely inside the map container, that fades from 0 → 1.
-- `[data-intro="barbs"]` — The wind barb SVG layer container. If wind barbs render via Mapbox source data (not DOM SVG), then "fading them in" is harder; either skip this animation step, OR fade in the entire MapView wrapper from 0 → 1 instead. Default: tag the MapView outer wrapper as `[data-intro="barbs"]`.
+For ship-1, the intro is a single fade-up of the map subtree — no overlay sweep, no SVG trace. (Earlier drafts of this spec included a paper-color sweep overlay; it's been dropped because under reduced-motion the timeline guard returns early, leaving any opacity-1 sweep stuck on screen forever. Easier to start with a smaller intro than to build defensive logic around an overlay we may not even want.)
 
-Wrap the relevant subtree:
+Tag the MapView wrapper so the timeline target resolves:
+
 ```jsx
 <div ref={introContainerRef} style={{ position: "relative" }}>
-  <div data-intro="sweep" style={{
-    position: "fixed", inset: 0, background: "var(--paper)",
-    pointerEvents: "none", zIndex: 999,
-  }} />
-  <div data-intro="trace">{/* optional SVG trace, can be omitted for ship-1 */}</div>
   <div data-intro="barbs">
     {/* existing MapView and friends */}
   </div>
 </div>
 ```
 
-If any of the three targets is missing/awkward, omit it from the timeline; the `if (sweep)` guards handle absent elements gracefully.
+The `if (barbs)` guard in Step 1 handles absence gracefully if the markup ever shifts.
 
 - [ ] **Step 3: Manual verification**
 
