@@ -2,13 +2,56 @@
 //
 // "Better route available" banner. Slides down from the top of the
 // viewport when the SSE notifications stream surfaces an alternative.
-// Uses dark frosted glass to match the rest of the map overlays.
+// Numbers (minutes saved, % faster) tween from 0 to their final values
+// on entry so the user *sees* the savings register.
+
+import { useEffect, useState } from "react";
+import { safeAnimate, MOTION_SLOW, EASE_OUT_SOFT } from "../lib/motion";
 
 export function BetterRouteBanner({ alternative, onAccept, onDismiss }) {
+  const [animMins, setAnimMins] = useState(0);
+  const [animPct, setAnimPct] = useState(0);
+
+  // Tween 0 -> final values when an alternative payload arrives.
+  // We use anime.js's onUpdate to drive React state because the values
+  // are formatted for display (rounded mins, fixed-1 pct), not raw
+  // CSS properties.
+  useEffect(() => {
+    if (!alternative) {
+      setAnimMins(0);
+      setAnimPct(0);
+      return;
+    }
+    const targetMins = alternative.improvement_minutes;
+    const targetPct = alternative.improvement_pct;
+
+    // Snap immediately if reduced motion / hidden tab — safeAnimate
+    // returns null in those cases. We always want the final values
+    // visible regardless of animation.
+    setAnimMins(targetMins);
+    setAnimPct(targetPct);
+
+    const tween = { mins: 0, pct: 0 };
+    const ctrl = safeAnimate(tween, {
+      mins: targetMins,
+      pct: targetPct,
+      duration: MOTION_SLOW,
+      easing: EASE_OUT_SOFT,
+      onUpdate: () => {
+        setAnimMins(tween.mins);
+        setAnimPct(tween.pct);
+      },
+    });
+
+    return () => {
+      if (ctrl?.pause) ctrl.pause();
+    };
+  }, [alternative?.improvement_minutes, alternative?.improvement_pct]);
+
   if (!alternative) return null;
 
-  const minsSaved = Math.round(alternative.improvement_minutes);
-  const pctImproved = alternative.improvement_pct.toFixed(1);
+  const minsDisplay = Math.round(animMins);
+  const pctDisplay = animPct.toFixed(1);
 
   return (
     <div
@@ -28,9 +71,9 @@ export function BetterRouteBanner({ alternative, onAccept, onDismiss }) {
       <div style={styles.content}>
         <div style={styles.title}>Faster route available</div>
         <div className="t-mono" style={styles.detail}>
-          Save <strong style={styles.bold}>{minsSaved} min</strong>
+          Save <strong style={styles.bold}>{minsDisplay} min</strong>
           <span style={styles.dot}> · </span>
-          {pctImproved}% faster
+          {pctDisplay}% faster
         </div>
       </div>
 
@@ -70,12 +113,9 @@ const styles = {
     padding: "12px 14px 12px 16px",
     minWidth: 360,
     maxWidth: "calc(100% - 32px)",
-    animation: "slideDownFade 0.32s cubic-bezier(0.2, 0.9, 0.3, 1.15) both",
+    animation: "slideDownFade 0.32s var(--ease-out-overshoot) both",
     transform: "translateX(-50%)",
   },
-  // The accent-soft background is rgba orange at 12% - reads as a warm
-  // amber tint against dark glass, like a subtle traffic-direction
-  // indicator. Keep using --accent for the icon stroke.
   iconWrap: {
     display: "flex",
     alignItems: "center",
@@ -87,10 +127,7 @@ const styles = {
     color: "#ff8a5b",
     flexShrink: 0,
   },
-  content: {
-    flex: 1,
-    minWidth: 0,
-  },
+  content: { flex: 1, minWidth: 0 },
   title: {
     fontSize: 14,
     fontWeight: 600,
@@ -107,9 +144,7 @@ const styles = {
     color: "var(--paper-ink)",
     fontWeight: 600,
   },
-  dot: {
-    color: "var(--paper-ink-3)",
-  },
+  dot: { color: "var(--paper-ink-3)" },
   actions: {
     display: "flex",
     gap: 8,
