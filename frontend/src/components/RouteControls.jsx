@@ -11,24 +11,33 @@
 
 export function ComputeRouteButton({ loading, onClick, hasRoute }) {
   return (
-    <button
-      onClick={onClick}
-      disabled={loading}
-      style={{
-        ...styles.routeBtn,
-        ...(hasRoute ? styles.routeBtnHasRoute : null),
-        opacity: loading ? 0.6 : 1,
-      }}
-      aria-label={loading ? "Computing route" : "Compute optimal route"}
-      title="Compute optimal route based on current forecast"
-    >
-      <span style={styles.routeIcon} aria-hidden>
-        ◆
-      </span>
-      <span style={styles.routeLabel}>
-        {loading ? "Computing…" : hasRoute ? "Recompute" : "Compute Route"}
-      </span>
-    </button>
+    <div style={{ position: "relative", display: "inline-flex" }}>
+      {loading && (
+        <div
+          className="pulse-ring"
+          aria-hidden="true"
+          style={{ borderRadius: "var(--r-md)" }}
+        />
+      )}
+      <button
+        onClick={onClick}
+        disabled={loading}
+        style={{
+          ...styles.routeBtn,
+          ...(hasRoute ? styles.routeBtnHasRoute : null),
+          opacity: loading ? 0.6 : 1,
+        }}
+        aria-label={loading ? "Computing route" : "Compute optimal route"}
+        title="Compute optimal route based on current forecast"
+      >
+        <span style={styles.routeIcon} aria-hidden>
+          ◆
+        </span>
+        <span style={styles.routeLabel}>
+          {loading ? "Computing…" : hasRoute ? "Recompute" : "Compute Route"}
+        </span>
+      </button>
+    </div>
   );
 }
 
