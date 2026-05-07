@@ -5,6 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routers import telemetry
+app.include_router(telemetry.router)
+
 from app import auth, db, redis_client
 from app.routers import (
     health,
