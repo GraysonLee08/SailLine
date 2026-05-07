@@ -25,12 +25,6 @@ export function BetterRouteBanner({ alternative, onAccept, onDismiss }) {
     const targetMins = alternative.improvement_minutes;
     const targetPct = alternative.improvement_pct;
 
-    // Snap immediately if reduced motion / hidden tab — safeAnimate
-    // returns null in those cases. We always want the final values
-    // visible regardless of animation.
-    setAnimMins(targetMins);
-    setAnimPct(targetPct);
-
     const tween = { mins: 0, pct: 0 };
     const ctrl = safeAnimate(tween, {
       mins: targetMins,
@@ -42,6 +36,15 @@ export function BetterRouteBanner({ alternative, onAccept, onDismiss }) {
         setAnimPct(tween.pct);
       },
     });
+
+    // Reduced-motion / hidden-tab: safeAnimate returned null, so onUpdate
+    // will never fire. Snap to the final values explicitly. In the normal
+    // path, the tween progresses 0 → target naturally and the initial
+    // render's animMins=0 / animPct=0 is the correct starting frame.
+    if (!ctrl) {
+      setAnimMins(targetMins);
+      setAnimPct(targetPct);
+    }
 
     return () => {
       if (ctrl?.pause) ctrl.pause();
