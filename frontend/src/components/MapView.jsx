@@ -38,6 +38,7 @@ import { useRegion } from "../hooks/useRegion";
 import { useTrackRecorder } from "../hooks/useTrackRecorder";
 import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
+import { useFollowMode } from "../hooks/useFollowMode";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
@@ -132,6 +133,7 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   const fittedRaceIdRef = useRef(null);
   const gpsHandledRef = useRef(false);
   const flownRegionRef = useRef(null);
+  const lastEaseAtRef = useRef(0);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
   const [viewport, setViewport] = useState(null);
@@ -156,6 +158,10 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   const recorder = useTrackRecorder(activeRace?.id ?? null);
   const routing = useRouting(activeRace?.id ?? null);
   const notif = useRouteNotifications(activeRace?.id ?? null);
+  const followMode = useFollowMode(activeRace?.id ?? null);
+
+  const followModeRef = useRef(followMode);
+  followModeRef.current = followMode;
 
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
@@ -261,6 +267,18 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
 
       pushViewport();
       map.on("moveend", pushViewport);
+
+      // User-gesture detection: flip follow-mode off when the user manually
+      // pans/zooms/rotates. Programmatic camera moves (map.easeTo) don't
+      // have an `originalEvent`, so we filter to user-initiated only.
+      const userGestureHandler = (e) => {
+        if (e.originalEvent && followModeRef.current.following) {
+          followModeRef.current.setFollowing(false);
+        }
+      };
+      map.on("dragstart", userGestureHandler);
+      map.on("zoomstart", userGestureHandler);
+      map.on("rotatestart", userGestureHandler);
 
       setStyleLoaded(true);
     });
@@ -457,6 +475,45 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     };
   }, [routing.route, routing.meta?.cached, styleLoaded]);
 
+  // One easeTo per second max. Geolocation can fire at high rates and
+  // accuracy bounce would jitter the camera if every fix triggered a
+  // pan. The throttle is intentional — most sailing race speeds mean
+  // the user moves <100m/s, so 1Hz updates feel live without churn.
+  useEffect(() => {
+    if (!styleLoaded) return;
+    if (!followMode.following) return;
+    if (!position?.lat || !position?.lon) return;
+    const map = mapRef.current;
+    if (!map) return;
+
+    const now = Date.now();
+    if (now - lastEaseAtRef.current < 1000) return;
+    lastEaseAtRef.current = now;
+
+    map.easeTo({
+      center: [position.lon, position.lat],
+      duration: 600,
+      easing: (t) => 1 - Math.pow(1 - t, 3),  // ease-out cubic
+    });
+  }, [position, followMode.following, styleLoaded]);
+
+  // Recenter pill button bumps recenterTick. We want a stronger camera
+  // move than the steady-state follow (zoom in if currently far out).
+  useEffect(() => {
+    if (!styleLoaded) return;
+    if (followMode.recenterTick === 0) return;  // ignore initial value
+    if (!position?.lat || !position?.lon) return;
+    const map = mapRef.current;
+    if (!map) return;
+    map.easeTo({
+      center: [position.lon, position.lat],
+      zoom: Math.max(map.getZoom(), 14),
+      duration: 800,
+      easing: (t) => 1 - Math.pow(1 - t, 3),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followMode.recenterTick, styleLoaded]);
+
   const raceOverlayTop = notif.alternative
     ? RACE_OVERLAY_TOP_WITH_BANNER
     : RACE_OVERLAY_TOP_DEFAULT;
@@ -498,6 +555,25 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           </span>
           <span style={styles.age}>{ageMinutes}m old</span>
         </div>
+      )}
+
+      {!followMode.following && position?.lat && (
+        <button
+          type="button"
+          onClick={followMode.recenter}
+          className="glass-button--dark"
+          aria-label="Re-center on my position"
+          style={styles.recenterPill}
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none"
+               stroke="currentColor" strokeWidth="2.2"
+               strokeLinecap="round" strokeLinejoin="round"
+               style={{ verticalAlign: "-3px", marginRight: 6 }}>
+            <circle cx="12" cy="12" r="3" />
+            <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+          </svg>
+          Re-center
+        </button>
       )}
     </div>
   );
@@ -835,6 +911,17 @@ const styles = {
     fontSize: 14,
     cursor: "pointer",
     padding: 0,
+    fontFamily: "inherit",
+  },
+  recenterPill: {
+    position: "fixed",
+    bottom: 24,
+    right: 24,
+    zIndex: 1000,
+    padding: "10px 14px",
+    fontSize: 13,
+    fontWeight: 500,
+    cursor: "pointer",
     fontFamily: "inherit",
   },
 };
