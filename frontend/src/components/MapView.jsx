@@ -44,6 +44,7 @@ import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
+import { safeAnimate, EASE_OUT_SOFT } from "../lib/motion";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
@@ -237,15 +238,24 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
         },
       });
 
-      map.addSource("route", { type: "geojson", data: emptyLine() });
+      map.addSource("route", {
+        type: "geojson",
+        data: emptyLine(),
+        lineMetrics: true, // required for line-trim-offset
+      });
       map.addLayer({
         id: "route-line",
         type: "line",
         source: "route",
+        layout: {
+          "line-cap": "round",
+          "line-join": "round",
+        },
         paint: {
           "line-color": "#c026d3",
           "line-width": 3,
           "line-opacity": 0.85,
+          "line-trim-offset": [0, 1], // start fully trimmed (invisible)
         },
       });
 
@@ -407,10 +417,45 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
 
     if (!routing.route) {
       src.setData(emptyLine());
+      map.setPaintProperty("route-line", "line-trim-offset", [0, 1]);
       return;
     }
+
+    // Set the data first so the line geometry is in place.
     src.setData(routing.route);
-  }, [routing.route, styleLoaded]);
+
+    // Skip the draw-on for cache hits — server signals via meta.cached.
+    // The user already saw this route compute on a prior session; no need
+    // to replay the reveal.
+    if (routing.meta?.cached) {
+      map.setPaintProperty("route-line", "line-trim-offset", [0, 0]);
+      return;
+    }
+
+    // Animate line-trim-offset from [0, 1] (invisible) to [0, 0] (full).
+    // anime.js v4 tweens a plain object's property; setPaintProperty fires
+    // each frame to push the new trim end through to Mapbox.
+    const trim = { end: 1.0 };
+    map.setPaintProperty("route-line", "line-trim-offset", [0, 1]);
+
+    const ctrl = safeAnimate(trim, {
+      end: 0,
+      duration: 700,
+      easing: EASE_OUT_SOFT,
+      onUpdate: () => {
+        map.setPaintProperty("route-line", "line-trim-offset", [0, trim.end]);
+      },
+    });
+
+    // safeAnimate returns null under reduced-motion / hidden — snap.
+    if (!ctrl) {
+      map.setPaintProperty("route-line", "line-trim-offset", [0, 0]);
+    }
+
+    return () => {
+      if (ctrl?.pause) ctrl.pause();
+    };
+  }, [routing.route, routing.meta?.cached, styleLoaded]);
 
   const raceOverlayTop = notif.alternative
     ? RACE_OVERLAY_TOP_WITH_BANNER
