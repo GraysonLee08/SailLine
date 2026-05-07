@@ -42,6 +42,15 @@
   /* Type */
   --display: "Inter", system-ui, -apple-system, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Motion tokens. Mirrored as JS constants in src/lib/motion.js so
+     anime.js timelines stay in lockstep with CSS. */
+  --motion-fast: 150ms;
+  --motion-medium: 320ms;
+  --motion-slow: 600ms;
+  --motion-hero: 900ms;
+  --ease-out-soft: cubic-bezier(0.2, 0.9, 0.3, 1.0);
+  --ease-out-overshoot: cubic-bezier(0.2, 0.9, 0.3, 1.15);
 }
 
 * {

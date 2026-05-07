@@ -211,6 +211,29 @@
   }
 }
 
+/* Soft accent ring pulsing outward — used by the isochrone "thinking"
+   indicator while /api/routing/compute is in flight. CSS keyframe is
+   the right tool here (indefinite loop); anime.js would be overkill. */
+@keyframes pulseRing {
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.6);
+    opacity: 0;
+  }
+}
+
+.pulse-ring {
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  pointer-events: none;
+  animation: pulseRing 1.4s var(--ease-out-soft) infinite;
+}
+
 /* ────────────────────────────────────────────────────────────────── */
 /* Fallback for browsers without backdrop-filter                       */
 /* ────────────────────────────────────────────────────────────────── */
