@@ -27,6 +27,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from urllib.parse import quote_plus
+
 # Alembic Config object — gives access to alembic.ini values.
 config = context.config
 
@@ -59,7 +61,7 @@ def _build_url() -> str:
 
     host = os.environ.get("DB_HOST", "127.0.0.1")
     port = os.environ.get("DB_PORT", "5432")
-    return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{name}"
+    return f"postgresql+psycopg://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{name}"
 
 
 def run_migrations_offline() -> None:
