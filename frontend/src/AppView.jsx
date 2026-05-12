@@ -17,6 +17,9 @@
 //     "open the app, look at wind on the map" path doesn't pull editor
 //     code. Each chunk is cached after first use, so the fallback
 //     effectively never appears more than once per session.
+//   - SensorDebugView is a hidden diagnostic page reachable only via
+//     the URL parameter ?debug=sensors. Lazy-loaded so it doesn't
+//     bloat the main bundle for normal users.
 
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
@@ -32,6 +35,7 @@ import { MapView } from "./components/MapView.jsx";
 
 const RacesListView = lazy(() => import("./RacesListView.jsx"));
 const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
+const SensorDebugView = lazy(() => import("./SensorDebugView.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
 const INTRO_PLAYED_KEY = "sailline.introPlayed";
@@ -52,6 +56,27 @@ function isOngoing(race) {
 }
 
 export default function AppView({ user }) {
+  // Hidden diagnostic page — reachable only via ?debug=sensors. No UI
+  // entry point. Short-circuits before any hooks fire so it doesn't
+  // pull in profile fetching, active-race restoration, or the map.
+  // Safe re: hook-order rules because the URL doesn't change during a
+  // single mount, so the early return is either always-taken or never-
+  // taken for any given instance of this component.
+  if (
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("debug") === "sensors"
+  ) {
+    return (
+      <Suspense
+        fallback={
+          <div style={{ height: "100vh", background: "var(--paper)" }} />
+        }
+      >
+        <SensorDebugView />
+      </Suspense>
+    );
+  }
+
   const [profile, setProfile] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [activeRace, setActiveRace] = useState(null);
@@ -66,7 +91,7 @@ export default function AppView({ user }) {
     let cancelled = false;
     apiFetch("/api/users/me")
       .then((p) => !cancelled && setProfile(p))
-      .catch(() => {});
+      .catch(() => { });
     return () => {
       cancelled = true;
     };
