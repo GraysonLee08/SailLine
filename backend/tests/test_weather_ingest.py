@@ -10,10 +10,13 @@ Covers:
   - per-region resolution propagation to the parser
   - single-fhour ingest() — per-fhour key + alias on default_fhour only
   - ingest_cycle() — full sequence write, manifest, cycles sorted set, 404 stop
+  - ingest_cycle() — 500/503 propagates, F00-only-404 raises RuntimeError
+  - Optional live NOAA smoke test, gated by SAILLINE_NOAA_SMOKE=1
 """
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 from datetime import datetime, timezone
 from io import BytesIO
@@ -477,6 +480,87 @@ def test_ingest_cycle_stops_on_404_and_writes_partial_manifest(
     assert "weather:hrrr:conus:20260429T1200Z:manifest" in setex_keys
 
 
+# --- NEW: non-404 errors should propagate, not graceful-stop ---
+
+
+@patch("workers.weather_ingest.time.sleep")  # collapse retry backoff
+@patch("workers.weather_ingest.storage.Client")
+@patch("workers.weather_ingest.redis.Redis")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_cycle_propagates_non_404_http_errors(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+    mock_redis_cls, mock_storage_cls, _mock_sleep, monkeypatch,
+):
+    """500/503 mid-cycle should crash the job — Cloud Run will retry the run.
+
+    Only 404 ("not yet published") triggers the graceful-stop branch.
+    Other HTTP errors mean something's actually broken (NOAA partial outage,
+    our URL pattern wrong, network issue) and we want a loud failure rather
+    than a half-cycle manifest that downstream consumers will trust.
+
+    Companion to test_ingest_cycle_stops_on_404_and_writes_partial_manifest —
+    together they pin both branches of the except clause in ingest_cycle().
+    """
+    monkeypatch.setenv("REDIS_HOST", "fake-redis")
+    monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
+
+    mock_latest.return_value = ("20260429", 12)
+
+    # First 3 fhours succeed, fourth returns 500 (which fetch_ranges
+    # will retry 3x then re-raise per the retry contract).
+    def _fetch_side_effect(*args, **kwargs):
+        _fetch_side_effect.calls += 1
+        if _fetch_side_effect.calls > 3:
+            raise _http_error(500)
+        return [(0, 999)]
+    _fetch_side_effect.calls = 0
+    mock_fetch.side_effect = _fetch_side_effect
+
+    mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
+    mock_redis_cls.return_value = MagicMock()
+    mock_storage_cls.return_value.bucket.return_value = MagicMock()
+
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        ingest_cycle("hrrr", region_name="conus", dry_run=False)
+    assert exc.value.code == 500
+
+
+# --- NEW: F00 missing must raise, not silently publish an empty cycle ---
+
+
+@patch("workers.weather_ingest.time.sleep")
+@patch("workers.weather_ingest.storage.Client")
+@patch("workers.weather_ingest.redis.Redis")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_cycle_raises_when_f00_404s(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+    mock_redis_cls, mock_storage_cls, _mock_sleep, monkeypatch,
+):
+    """If even F00 returns 404, there's no cycle to publish — raise RuntimeError.
+
+    Pins the 'if cycle_iso is None: raise' branch. Without it, the worker
+    would otherwise hit the manifest-write code path with cycle_iso=None
+    and crash in a confusing way deep inside Redis serialisation.
+    """
+    monkeypatch.setenv("REDIS_HOST", "fake-redis")
+    monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
+
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.side_effect = _http_error(404)
+    mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
+    mock_redis_cls.return_value = MagicMock()
+    mock_storage_cls.return_value.bucket.return_value = MagicMock()
+
+    with pytest.raises(RuntimeError, match="no fhours ingested"):
+        ingest_cycle("hrrr", region_name="conus", dry_run=False)
+
+
 @patch("workers.weather_ingest.storage.Client")
 @patch("workers.weather_ingest.redis.Redis")
 @patch("workers.weather_ingest.parse_grib_to_wind_grid")
@@ -530,3 +614,37 @@ def test_sources_ttls_longer_than_cycle_intervals():
     assert hrrr.cache_ttl_seconds > hrrr.cycle_step_hours * 3600
     gfs = SOURCES["gfs"]
     assert gfs.cache_ttl_seconds > gfs.cycle_step_hours * 3600
+
+
+# ─── Live NOAA smoke test (gated) ───────────────────────────────────────
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    os.environ.get("SAILLINE_NOAA_SMOKE") != "1",
+    reason="Set SAILLINE_NOAA_SMOKE=1 to run live NOAA smoke test",
+)
+def test_real_noaa_hrrr_dry_run():
+    """Live HRRR F00 round-trip against NOAA NOMADS — full pipeline.
+
+    Validates that .idx parsing, byte-range download, and cfgrib parsing
+    all still work against the current NOAA format. Slow (~10–30s) and
+    depends on NOAA availability; gated by env var so it doesn't run by
+    default. Run locally before deploying GRIB-pipeline changes.
+
+    Writes the dry-run output to backend/ingest_output/ (worker default).
+    """
+    out = ingest("hrrr", region_name="conus", fhour=0, dry_run=True)
+
+    assert out["source"] == "hrrr"
+    # Shape consistency
+    assert out["shape"] == [len(out["lats"]), len(out["lons"])]
+    assert out["shape"][0] > 0 and out["shape"][1] > 0
+    # u/v are 2D lists matching shape
+    assert len(out["u"]) == out["shape"][0]
+    assert len(out["v"]) == out["shape"][0]
+    # CONUS bbox bounds
+    assert out["bbox"] == {
+        "min_lat": 24.0, "max_lat": 50.0,
+        "min_lon": -126.0, "max_lon": -66.0,
+    }
