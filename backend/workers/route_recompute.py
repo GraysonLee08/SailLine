@@ -11,10 +11,12 @@ tails the per-race Redis pub/sub channel and surfaces the popup.
 
 Region resolution mirrors the user-facing endpoint: the marks centroid
 picks both a base region (drives wind + bathymetry) and an optional
-venue (drives harbour-scale ENC hazard loading). Background recomputes
-must use the same hazard set as the synchronous endpoint or "better"
-routes could cut through breakwalls the user-facing route avoids — that
-would surface as alerts the user immediately distrusts.
+venue (drives harbour-scale ENC hazard loading). Currents resolution
+also mirrors the endpoint: OFS sources whose bbox overlaps the marks
+bbox contribute fields to a CurrentForecast. The background recompute
+must use the same forcing as the synchronous endpoint or 'better' routes
+could cut across model features the user-facing route correctly avoided
+— that would surface as alerts the user immediately distrusts.
 
 Trigger options (pick one when wiring infra):
     A. Cloud Scheduler job runs this 5 min after each ingest cycle.
@@ -39,9 +41,15 @@ from uuid import UUID
 import asyncpg
 
 from app import db, redis_client
+from app.currents_regions import sources_covering_marks
 from app.regions import base_region_for_point, venue_for_point
 from app.services.bathymetry import BathymetryUnavailable
 from app.services.boats import spec_for_class
+from app.services.currents import (
+    CurrentForecast,
+    CurrentsUnavailable,
+    load_currents_for_race,
+)
 from app.services.polars import load_polar
 from app.services.routing import (
     DEFAULT_SAFETY_FACTOR,
@@ -119,6 +127,37 @@ def _resolve_region(marks: list[dict]) -> tuple[str, Optional[str]]:
     )
 
 
+async def _load_currents_optional(
+    marks: list[dict],
+    race_start: datetime,
+    race_id: UUID,
+) -> Optional[CurrentForecast]:
+    """Mirror of the router's optional-currents loader.
+
+    Currents are non-fatal in the background recompute exactly as in the
+    synchronous endpoint: any failure (no source covers the bbox, no
+    ingested cycle, transient Redis blip) returns None and the route
+    still computes. Keeping the policy identical avoids spurious 'better
+    route' alerts driven by inconsistent currents handling.
+    """
+    sources = sources_covering_marks(marks)
+    if not sources:
+        return None
+    try:
+        return await load_currents_for_race(
+            sources=sources, race_start=race_start,
+        )
+    except CurrentsUnavailable as exc:
+        log.info("currents unavailable for race=%s: %s", race_id, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "currents load raised for race=%s (proceeding without): %s",
+            race_id, exc,
+        )
+        return None
+
+
 async def _read_last_total_minutes(race_id: UUID) -> Optional[float]:
     """Last total_minutes we notified about (or computed) for this race."""
     redis = redis_client.get_client()
@@ -179,6 +218,10 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
         log.warning("race=%s forecast load failed: %s", race.id, exc)
         return
 
+    currents = await _load_currents_optional(
+        marks=race.marks, race_start=race.start_at, race_id=race.id,
+    )
+
     try:
         is_navigable = make_navigable_predicate(
             region=region, draft_m=spec.draft_m,
@@ -192,22 +235,23 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
     polar = load_polar(f"app/services/polars/{spec.polar_csv}")
 
     log.info(
-        "recompute race=%s region=%s venue=%s polar=%s marks=%d",
+        "recompute race=%s region=%s venue=%s polar=%s marks=%d currents=%s",
         race.id, region, venue, polar.name, len(race.marks),
+        currents.quality if currents is not None else "off",
     )
 
     # Multi-leg with default derating. The synchronous endpoint accepts
     # caller-supplied max_tws_kt / hs_m / polar_margin / density_factor;
     # the background recompute uses safe defaults so its routes are
     # apples-to-apples with a freshly-computed user-facing route on a
-    # default request body. If we ever persist the user's last derating
-    # choices, surface them here.
+    # default request body. Currents are loaded with the same policy as
+    # the endpoint (None-on-failure) for the same reason.
     result = compute_isochrone_route_multileg(
         marks=race.marks,
         polar=polar, wind=forecast,
         is_navigable=is_navigable,
         race_start=race.start_at,
-        currents=None,
+        currents=currents,
         max_tws_kt=None,
         hs_m=0.0,
         density_factor=1.0,
@@ -235,6 +279,7 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
         "polar": polar.name,
         "region": region,
         "venue": venue,
+        "currents_quality": currents.quality if currents is not None else None,
     })
     await _publish_better_route(race, feature, last, result.total_minutes)
     await _store_last_total_minutes(race.id, result.total_minutes)

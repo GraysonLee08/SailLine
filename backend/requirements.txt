@@ -12,9 +12,15 @@ xarray==2024.9.0
 numpy==2.1.2
 scipy==1.14.1
 
-# Bathymetry — NetCDF read + spatial polygon index for ENC hazards
-# netCDF4==1.7.1
+# Bathymetry — spatial polygon index for ENC hazards
 shapely==2.0.6
+
+# NetCDF reader. Required by the currents ingest worker (NOAA OFS forecast
+# files are NetCDF4) and available to the bathymetry path as a fallback
+# alongside xarray's default engine. ~10 MB on disk, pulls libhdf5.
+# 1.7.2 ships prebuilt wheels for cp39 through cp313; 1.7.1 only goes
+# up to cp312 and would force a source build on Python 3.13.
+netCDF4==1.7.2
 
 # Database (week 1 — Cloud SQL via Connector + asyncpg pool)
 asyncpg==0.30.0
