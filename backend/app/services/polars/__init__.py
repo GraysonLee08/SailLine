@@ -13,14 +13,34 @@ Out-of-range handling: clamps to table bounds. A TWS of 25 kt asks for the
 forgiving — the isochrone engine sweeps headings against varying wind, so
 edge values matter less than not crashing on them.
 
+`boat_speed()` accepts three optional derating inputs:
+
+* ``hs_m`` — significant wave height (m). When > 0.5 m, applies an upwind
+  penalty (max 20% at hs=4.5 m) and small downwind surfing bonus. This is
+  the v1 wave model — replace with a per-class wave-derating table once
+  WaveWatch III / GLERL ingest is online and we've calibrated against
+  Beneteau 36.7 measured data.
+
+* ``density_factor`` — ρ/ρ_std where ρ_std = 1.225 kg/m³. Cold dense air
+  in Chicago in November has density_factor ≈ 1.07; hot humid Miami air
+  ≈ 0.95. Implemented as effective TWS scaling: effective_tws =
+  tws_kts × sqrt(density_factor). Standard density (1.0) ⇒ no change.
+
+* ``margin`` — global polar multiplier in [0, 1]. Default 1.0 = no margin.
+  Routers can pass 0.95–0.98 to bake in a conservative buffer for gust
+  variability and helmsman performance vs. polar idealization. Cheaper
+  than ingesting gust fields and re-running the engine per gust sample.
+
+All three default to no-op so legacy callers (tests, scripts) keep working.
+
 Beneteau First 36.7 is the only polar at v1. Future classes go in
 `BOAT_POLARS` with their own CSV file in this directory.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -35,6 +55,55 @@ BOAT_POLARS: dict[str, str] = {
 DEFAULT_POLAR = "Beneteau First 36.7"
 
 
+# ─── Wave derating model (v1) ────────────────────────────────────────────
+#
+# Simple piecewise-linear model good enough for v1. Real boat-class wave
+# response curves should replace this once we have per-class measured data.
+#
+# Calibration intuition for a 36-footer:
+#   hs ≤ 0.5 m   → no effect (small chop, well within boat's wavelength)
+#   hs = 1.5 m   → ~5% upwind loss (pounding starts)
+#   hs = 3.0 m   → ~12% upwind loss (slamming in chop)
+#   hs = 4.5 m   → ~20% upwind loss (significantly slowed)
+#   downwind     → small gain (surfing) at hs ≥ 1.0 m, capped at +5%
+#
+# Beam reaches sit in between — interpolated linearly across TWA in [60, 120].
+
+WAVE_PENALTY_THRESHOLD_M = 0.5    # below this, no effect
+WAVE_PENALTY_RATE = 0.05          # fraction lost per metre above threshold
+WAVE_PENALTY_MAX = 0.20           # cap upwind loss at 20%
+WAVE_SURF_BONUS_MAX = 0.05        # cap downwind gain at +5%
+
+
+def wave_derating(twa_deg: float, hs_m: float) -> float:
+    """Return a multiplier on polar boat speed for given wave height.
+
+    Returns 1.0 (no change) when ``hs_m`` is None or below the
+    threshold. Linearly interpolates penalty between upwind and downwind
+    sectors so beam reach (TWA ~90°) feels half the upwind hit.
+    """
+    if hs_m is None or hs_m <= WAVE_PENALTY_THRESHOLD_M:
+        return 1.0
+
+    # Magnitude of the effect, before sign.
+    raw = (hs_m - WAVE_PENALTY_THRESHOLD_M) * WAVE_PENALTY_RATE
+    upwind_loss = min(WAVE_PENALTY_MAX, raw)
+    downwind_gain = min(WAVE_SURF_BONUS_MAX, raw * 0.25)
+
+    # Fold to [0, 180] symmetric.
+    twa = abs(((twa_deg + 180.0) % 360.0) - 180.0)
+
+    # Blend upwind→downwind across [60°, 120°]. Outside this band, pure
+    # upwind penalty / downwind bonus.
+    if twa <= 60.0:
+        return 1.0 - upwind_loss
+    if twa >= 120.0:
+        return 1.0 + downwind_gain
+    # Linear blend across the beam-reach band.
+    t = (twa - 60.0) / 60.0
+    return (1.0 - upwind_loss) * (1.0 - t) + (1.0 + downwind_gain) * t
+
+
 @dataclass(frozen=True)
 class Polar:
     """A class polar — TWA rows × TWS cols of boat speed in knots."""
@@ -43,12 +112,28 @@ class Polar:
     speed: np.ndarray # 2D, shape (len(twa), len(tws)), knots
     name: str
 
-    def boat_speed(self, twa_deg: float, tws_kts: float) -> float:
-        """Bilinear interp boat speed at (TWA, TWS). Clamps to table bounds.
+    def boat_speed(
+        self,
+        twa_deg: float,
+        tws_kts: float,
+        *,
+        hs_m: float = 0.0,
+        density_factor: float = 1.0,
+        margin: float = 1.0,
+    ) -> float:
+        """Bilinear interp boat speed at (TWA, TWS), with optional derating.
 
         Returns 0.0 if TWA is below the table's smallest angle (i.e. above
         the close-hauled limit — boat can't sail there). All other
         out-of-range inputs clamp to the nearest table edge.
+
+        Optional derating:
+          hs_m: significant wave height in metres (default 0 = calm).
+          density_factor: ρ/ρ_std (default 1 = standard atmosphere).
+          margin: global multiplier in [0, 1] (default 1 = no margin).
+
+        With default arguments the behaviour exactly matches the v8
+        polar API so existing tests pass unchanged.
         """
         # Symmetry fold
         twa = abs(((twa_deg + 180) % 360) - 180)  # 0..180
@@ -57,8 +142,12 @@ class Polar:
         if twa < self.twa[0]:
             return 0.0
 
+        # Density correction: thicker air at the same wind speed produces
+        # more drive force. Scale effective TWS by sqrt(ρ/ρ_std).
+        effective_tws_kts = tws_kts * math.sqrt(max(0.0, density_factor))
+
         twa_c = float(np.clip(twa, self.twa[0], self.twa[-1]))
-        tws_c = float(np.clip(tws_kts, self.tws[0], self.tws[-1]))
+        tws_c = float(np.clip(effective_tws_kts, self.tws[0], self.tws[-1]))
 
         # Bracket indices
         i = int(np.searchsorted(self.twa, twa_c, side="right") - 1)
@@ -76,12 +165,14 @@ class Polar:
         v10 = self.speed[i + 1, j]
         v11 = self.speed[i + 1, j + 1]
 
-        return float(
+        raw = float(
             (1 - fa) * (1 - fs) * v00
             + (1 - fa) * fs * v01
             + fa * (1 - fs) * v10
             + fa * fs * v11
         )
+
+        return raw * wave_derating(twa, hs_m) * margin
 
 
 def load_polar(path: str | Path) -> Polar:
@@ -143,4 +234,11 @@ def load_polar_for_class(boat_class: str) -> Polar:
     return load_polar(Path(__file__).parent / filename)
 
 
-__all__ = ["Polar", "load_polar", "load_polar_for_class", "BOAT_POLARS", "DEFAULT_POLAR"]
+__all__ = [
+    "Polar",
+    "load_polar",
+    "load_polar_for_class",
+    "wave_derating",
+    "BOAT_POLARS",
+    "DEFAULT_POLAR",
+]

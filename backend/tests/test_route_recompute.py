@@ -113,7 +113,7 @@ async def test_first_time_seeing_race_establishes_silent_baseline(
                return_value=mock_redis), \
          patch("workers.route_recompute.load_forecast_for_race",
                new=AsyncMock(return_value=_fake_forecast())), \
-         patch("workers.route_recompute.compute_isochrone_route",
+         patch("workers.route_recompute.compute_isochrone_route_multileg",
                return_value=_result(420.0)), \
          patch("workers.route_recompute.make_navigable_predicate",
                return_value=lambda *a, **k: True):
@@ -141,7 +141,7 @@ async def test_improvement_above_threshold_publishes_notification(
                return_value=mock_redis), \
          patch("workers.route_recompute.load_forecast_for_race",
                new=AsyncMock(return_value=_fake_forecast())), \
-         patch("workers.route_recompute.compute_isochrone_route",
+         patch("workers.route_recompute.compute_isochrone_route_multileg",
                return_value=_result(380.0)), \
          patch("workers.route_recompute.make_navigable_predicate",
                return_value=lambda *a, **k: True):
@@ -172,7 +172,7 @@ async def test_improvement_below_threshold_updates_baseline_only(
                return_value=mock_redis), \
          patch("workers.route_recompute.load_forecast_for_race",
                new=AsyncMock(return_value=_fake_forecast())), \
-         patch("workers.route_recompute.compute_isochrone_route",
+         patch("workers.route_recompute.compute_isochrone_route_multileg",
                return_value=_result(415.0)), \
          patch("workers.route_recompute.make_navigable_predicate",
                return_value=lambda *a, **k: True):
@@ -222,7 +222,7 @@ async def test_engine_did_not_reach_finish_skips_notification(mock_pool, mock_re
                return_value=mock_redis), \
          patch("workers.route_recompute.load_forecast_for_race",
                new=AsyncMock(return_value=_fake_forecast())), \
-         patch("workers.route_recompute.compute_isochrone_route",
+         patch("workers.route_recompute.compute_isochrone_route_multileg",
                return_value=not_reached), \
          patch("workers.route_recompute.make_navigable_predicate",
                return_value=lambda *a, **k: True):

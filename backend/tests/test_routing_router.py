@@ -125,7 +125,8 @@ def test_compute_route_happy_path(
         routing_module, "load_forecast_for_race",
         new=AsyncMock(return_value=fake_forecast),
     ), patch.object(
-        routing_module, "compute_isochrone_route", return_value=fake_engine_result,
+        routing_module, "compute_isochrone_route_multileg",
+        return_value=fake_engine_result,
     ), patch.object(
         routing_module, "make_navigable_predicate", return_value=lambda *a, **k: True,
     ):
@@ -138,6 +139,8 @@ def test_compute_route_happy_path(
     assert body["meta"]["forecast_quality"] == "hrrr"
     assert body["meta"]["cached"] is False
     assert body["meta"]["region"] == "conus"
+    assert body["meta"]["legs"] == 1
+    assert body["meta"]["polar_margin"] == pytest.approx(0.97)
     mock_redis.setex.assert_awaited_once()
 
 
@@ -175,10 +178,13 @@ def test_compute_route_cache_hit(
         "meta": {
             "total_minutes": 410.0, "tack_count": 1, "reached": True,
             "iterations": 80, "nodes_explored": 2000,
+            "legs": 1,
             "region": "conus", "forecast_quality": "hrrr",
             "race_start": race_row["start_at"].isoformat(),
             "polar": "beneteau_36_7", "boat_class": "Beneteau First 36.7",
             "draft_m": 2.05, "min_depth_m": 3.075, "cached": False,
+            "max_tws_kt": None, "polar_margin": 0.97,
+            "hs_m": 0.0, "density_factor": 1.0,
         },
     }
     mock_redis.get.return_value = json.dumps(cached_response).encode()
@@ -186,7 +192,7 @@ def test_compute_route_cache_hit(
     with patch.object(
         routing_module, "load_forecast_for_race",
         new=AsyncMock(return_value=fake_forecast),
-    ), patch.object(routing_module, "compute_isochrone_route") as mock_engine:
+    ), patch.object(routing_module, "compute_isochrone_route_multileg") as mock_engine:
         r = client.post("/api/routing/compute",
                         json={"race_id": str(race_row["id"])})
 
@@ -229,7 +235,8 @@ def test_compute_route_falls_back_to_now_when_start_at_null(
         routing_module, "load_forecast_for_race",
         new=AsyncMock(return_value=fake_forecast),
     ) as mock_loader, patch.object(
-        routing_module, "compute_isochrone_route", return_value=fake_engine_result,
+        routing_module, "compute_isochrone_route_multileg",
+        return_value=fake_engine_result,
     ), patch.object(
         routing_module, "make_navigable_predicate", return_value=lambda *a, **k: True,
     ):

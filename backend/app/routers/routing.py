@@ -2,13 +2,20 @@
 """Route compute endpoint.
 
 POST /api/routing/compute
-    Body: { "race_id": "<uuid>", "safety_factor": 1.5,
-            "duration_hours": 6.0 }   # optional; defaults via forecast_loader
+    Body: {
+      "race_id": "<uuid>",
+      "safety_factor": 1.5,
+      "duration_hours": 6.0,            # optional
+      "max_tws_kt": null,               # optional heavy-weather cutoff
+      "polar_margin": 0.97,             # optional gust/perf de-rating
+      "hs_m": 0.0,                      # optional wave height (until ingest)
+      "density_factor": 1.0,            # optional air density factor
+    }
 
 Resolves the race, picks the wind region from marks centroid, builds a
-time-aware WindForecast spanning the race window, runs the isochrone
-engine threading simulated time, and returns a GeoJSON Feature plus
-diagnostic metadata.
+time-aware WindForecast spanning the race window, runs the multi-leg
+isochrone engine threading simulated time across every leg, and returns
+a GeoJSON Feature plus diagnostic metadata.
 
 Region resolution returns a (base_region, venue) pair. base_region drives
 wind + bathymetry lookup (always set; defaults to 'conus'). venue is set
@@ -20,7 +27,9 @@ Forecast not yet available: returns HTTP 425 (Too Early) with
 refetch at that timestamp.
 
 Cache key: (engine_version, race_id, safety_factor, hrrr_cycle, gfs_cycle,
-race_start_iso). race_start changes ⇒ cache miss; new cycle ⇒ cache miss.
+race_start_iso, snapshot_sources, venue, derating tuple). race_start
+changes ⇒ cache miss; new cycle ⇒ cache miss; any derating param
+change ⇒ cache miss.
 """
 from __future__ import annotations
 
@@ -42,7 +51,7 @@ from app.services.boats import spec_for_class
 from app.services.polars import load_polar
 from app.services.routing import (
     DEFAULT_SAFETY_FACTOR,
-    compute_isochrone_route,
+    compute_isochrone_route_multileg,
     make_navigable_predicate,
     route_to_geojson,
 )
@@ -65,6 +74,30 @@ class ComputeRouteIn(BaseModel):
                     "Defaults to 6h (covers most inshore/distance races); "
                     "set to ~50 for a Mac.",
     )
+    max_tws_kt: Optional[float] = Field(
+        default=None, ge=5.0, le=80.0,
+        description="Heavy-weather cutoff in knots. Candidates from frontier "
+                    "points where forecast TWS exceeds this are not expanded. "
+                    "Null = no cutoff.",
+    )
+    polar_margin: float = Field(
+        default=0.97, ge=0.5, le=1.0,
+        description="Global multiplier on polar boat speeds. 1.0 = no margin; "
+                    "0.97 (default) bakes in a conservative buffer for gust "
+                    "variability and helm-skill vs. polar idealization.",
+    )
+    hs_m: float = Field(
+        default=0.0, ge=0.0, le=10.0,
+        description="Significant wave height in metres. Until the wave ingest "
+                    "worker is online this is caller-supplied; the engine "
+                    "applies an upwind penalty / downwind bonus accordingly.",
+    )
+    density_factor: float = Field(
+        default=1.0, ge=0.8, le=1.2,
+        description="Air density relative to standard (1.225 kg/m³). Cold "
+                    "dense air → >1; hot humid air → <1. Scales effective "
+                    "TWS by sqrt(density_factor).",
+    )
 
 
 class RouteMeta(BaseModel):
@@ -73,6 +106,7 @@ class RouteMeta(BaseModel):
     reached: bool
     iterations: int
     nodes_explored: int
+    legs: int
     region: str
     venue: Optional[str] = None
     forecast_quality: str            # "hrrr", "gfs", "hrrr+gfs"
@@ -82,6 +116,12 @@ class RouteMeta(BaseModel):
     draft_m: float
     min_depth_m: float
     cached: bool
+    # New derating diagnostics — useful for client to render "conservative"
+    # vs "aggressive" labels and for support to debug bad routes.
+    max_tws_kt: Optional[float] = None
+    polar_margin: float = 1.0
+    hs_m: float = 0.0
+    density_factor: float = 1.0
 
 
 class ComputeRouteOut(BaseModel):
@@ -99,7 +139,8 @@ class ForecastPendingOut(BaseModel):
 
 
 # Bump on any change to engine inputs/outputs (polar, mask, algorithm).
-ENGINE_VERSION = "v8-segment-sampling"
+# v9: multi-leg routing, rounding sides, currents/cutoff/wave/density/margin.
+ENGINE_VERSION = "v9-multileg-derating"
 
 ROUTE_CACHE_TTL_S = 3600
 
@@ -217,20 +258,25 @@ async def compute_route(
 
     # Cache key. Cycle iso is stable for a given cycle; race_start changes
     # per scheduled gun time. Forecast quality string captures whether
-    # this is HRRR-only, GFS-only, or hybrid — not strictly needed for
-    # correctness but it disambiguates routes computed against different
-    # forecast horizons even within the same cycle. Venue is part of the
-    # key so a venue-hazard ingest invalidates cached routes for that
-    # venue without touching base-region routes.
+    # this is HRRR-only, GFS-only, or hybrid. Venue is part of the key
+    # so a venue-hazard ingest invalidates cached routes for that venue
+    # without touching base-region routes. Derating tuple is included so
+    # changing any user-visible polar/cutoff knob is a cache miss.
     redis = redis_client.get_client()
     snapshot_sources = "+".join(
         sorted({s.source or "?" for s in forecast.snapshots})
+    )
+    derating_tag = (
+        f"hs={payload.hs_m:.2f}:dens={payload.density_factor:.3f}:"
+        f"margin={payload.polar_margin:.3f}:"
+        f"cutoff={payload.max_tws_kt if payload.max_tws_kt is not None else '-'}"
     )
     cache_key = (
         f"route:{ENGINE_VERSION}:{payload.race_id}:"
         f"{race_start.isoformat()}:"
         f"{forecast.snapshots[0].reference_time}:{forecast.snapshots[-1].valid_time}:"
-        f"{snapshot_sources}:{payload.safety_factor:.2f}:venue={venue or '-'}"
+        f"{snapshot_sources}:{payload.safety_factor:.2f}:venue={venue or '-'}:"
+        f"{derating_tag}"
     )
     cached_blob = await redis.get(cache_key)
     if cached_blob is not None:
@@ -252,30 +298,35 @@ async def compute_route(
             f"{exc}. Run bathymetry_ingest for this region before computing routes.",
         )
 
-    start = (marks[0]["lat"], marks[0]["lon"])
-    finish = (marks[-1]["lat"], marks[-1]["lon"])
-
     log.info(
         "compute route race_id=%s region=%s venue=%s polar=%s race_start=%s "
-        "forecast_quality=%s start=%s finish=%s",
+        "forecast_quality=%s marks=%d max_tws=%s margin=%.3f hs=%.2f dens=%.3f",
         payload.race_id, region, venue, polar.name, race_start.isoformat(),
-        forecast.quality, start, finish,
+        forecast.quality, len(marks), payload.max_tws_kt,
+        payload.polar_margin, payload.hs_m, payload.density_factor,
     )
 
-    result = compute_isochrone_route(
-        start=start,
-        finish=finish,
+    # NOTE: ``currents`` is not yet plumbed — left as None until the
+    # GLERL GLCFS ingest worker lands in Stream 2. The engine accepts
+    # None as a no-op so the route is unaffected today.
+    result = compute_isochrone_route_multileg(
+        marks=marks,
         polar=polar,
         wind=forecast,
         is_navigable=is_navigable,
         race_start=race_start,
+        currents=None,
+        max_tws_kt=payload.max_tws_kt,
+        hs_m=payload.hs_m,
+        density_factor=payload.density_factor,
+        polar_margin=payload.polar_margin,
     )
 
     feature = route_to_geojson(
         result,
         properties={
-            "start": list(start),
-            "finish": list(finish),
+            "start": [marks[0]["lat"], marks[0]["lon"]],
+            "finish": [marks[-1]["lat"], marks[-1]["lon"]],
             "polar": polar.name,
             "boat_class": spec.name,
             "draft_m": spec.draft_m,
@@ -284,6 +335,10 @@ async def compute_route(
             "venue": venue,
             "race_start": race_start.isoformat(),
             "forecast_quality": forecast.quality,
+            "max_tws_kt": payload.max_tws_kt,
+            "polar_margin": payload.polar_margin,
+            "hs_m": payload.hs_m,
+            "density_factor": payload.density_factor,
         },
     )
 
@@ -295,6 +350,7 @@ async def compute_route(
             "reached": result.reached,
             "iterations": result.iterations,
             "nodes_explored": result.nodes_explored,
+            "legs": result.legs,
             "region": region,
             "venue": venue,
             "forecast_quality": forecast.quality,
@@ -304,6 +360,10 @@ async def compute_route(
             "draft_m": spec.draft_m,
             "min_depth_m": min_depth_m,
             "cached": False,
+            "max_tws_kt": payload.max_tws_kt,
+            "polar_margin": payload.polar_margin,
+            "hs_m": payload.hs_m,
+            "density_factor": payload.density_factor,
         },
     }
 

@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import auth, db, redis_client
 from app.routers import (
+    ais,
     health,
     races,
     routing,
@@ -71,6 +72,7 @@ app.include_router(telemetry.router)              # router carries its own /api/
 app.include_router(telemetry_stream.router)       # WS /api/races/{id}/telemetry/stream
 app.include_router(routing.router)                # /api/routing - compute endpoint
 app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
+app.include_router(ais.router)                    # /api/ais - vessel positions (cache-only read)
 
 
 @app.get("/")

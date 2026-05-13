@@ -45,7 +45,7 @@ from app.services.boats import spec_for_class
 from app.services.polars import load_polar
 from app.services.routing import (
     DEFAULT_SAFETY_FACTOR,
-    compute_isochrone_route,
+    compute_isochrone_route_multileg,
     make_navigable_predicate,
     route_to_geojson,
 )
@@ -190,19 +190,28 @@ async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
         return
 
     polar = load_polar(f"app/services/polars/{spec.polar_csv}")
-    start = (race.marks[0]["lat"], race.marks[0]["lon"])
-    finish = (race.marks[-1]["lat"], race.marks[-1]["lon"])
 
     log.info(
-        "recompute race=%s region=%s venue=%s polar=%s",
-        race.id, region, venue, polar.name,
+        "recompute race=%s region=%s venue=%s polar=%s marks=%d",
+        race.id, region, venue, polar.name, len(race.marks),
     )
 
-    result = compute_isochrone_route(
-        start=start, finish=finish,
+    # Multi-leg with default derating. The synchronous endpoint accepts
+    # caller-supplied max_tws_kt / hs_m / polar_margin / density_factor;
+    # the background recompute uses safe defaults so its routes are
+    # apples-to-apples with a freshly-computed user-facing route on a
+    # default request body. If we ever persist the user's last derating
+    # choices, surface them here.
+    result = compute_isochrone_route_multileg(
+        marks=race.marks,
         polar=polar, wind=forecast,
         is_navigable=is_navigable,
         race_start=race.start_at,
+        currents=None,
+        max_tws_kt=None,
+        hs_m=0.0,
+        density_factor=1.0,
+        polar_margin=0.97,
     )
     if not result.reached:
         log.info("race=%s recompute did not reach finish — not notifying", race.id)

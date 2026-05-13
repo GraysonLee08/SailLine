@@ -1,16 +1,20 @@
 # backend/app/services/routing/isochrone.py
-"""Pure-numpy isochrone routing engine — time-aware variant.
+"""Pure-numpy isochrone routing engine — time-aware, multi-leg.
 
 Each iteration of dt_minutes:
   - For each frontier point, sweep headings 0..360 by heading_step_deg
   - Sample wind at (lat, lon, valid_time = race_start + iter*dt)
-  - Compute TWA, get boat speed from polar, project forward
+  - Compute TWA, get boat speed from polar (with optional wave / density
+    / margin derating), project forward
+  - Vector-add surface current (if a currents sampler was supplied)
   - Reject candidates whose segment from parent fails the navigability
     check. The engine prefers an exact ``is_navigable.segment(lat1,
     lon1, lat2, lon2)`` line check when available (catches thin
     obstacles regardless of width) and falls back to per-point
     sampling along the segment when the predicate has no such
     attribute (legacy callers, simple test fixtures).
+  - Reject candidates whose TWS exceeds ``max_tws_kt`` (heavy-weather
+    cutoff)
   - Cull by bearing-from-finish bins (Hagiwara variant)
   - Stop when within finish_radius_nm AND the final approach segment
     is itself navigable
@@ -19,13 +23,20 @@ Time threading: when race_start is provided, the wind argument can be a
 WindForecast (multiple snapshots). The engine just calls
 wind.sample(lat, lon, valid_time). WindField also accepts the kwarg and
 ignores it, so legacy callers and existing tests work unchanged.
+
+Multi-leg: ``compute_isochrone_route_multileg`` accepts a list of marks
+and threads elapsed wall-clock across legs so each leg samples the
+correct forecast frame. Intermediate marks may carry a ``rounding``
+hint ("port" or "starboard"); the engine seeds the next leg's start
+position offset to the correct side of the mark by ~200 m. Final mark
+is the finish; first mark is the start. No rounding for first/last.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import numpy as np
 
@@ -40,6 +51,13 @@ M_PER_NM = 1852.0
 # a `.segment` attribute). The production predicate uses exact line-
 # vs-polygon intersection, where this constant doesn't apply.
 SEGMENT_FALLBACK_STEP_M = 100.0
+
+# Offset distance applied when seeding the next leg's frontier after a
+# rounded mark. 200 m is large enough to comfortably separate the seed
+# from the mark (so the next leg's heading sweep doesn't immediately
+# trip the rounding-side check) but small enough that the visual bend
+# at the mark looks correct on the chart.
+ROUNDING_OFFSET_M = 200.0
 
 
 # ─── Geometry primitives (public — tests + scripts import these) ────────
@@ -219,6 +237,36 @@ class RouteResult:
     reached: bool = False
     iterations: int = 0
     nodes_explored: int = 0
+    legs: int = 1   # number of legs joined into this path (multi-leg)
+
+
+def _apply_currents(
+    parent_lat: float, parent_lon: float,
+    heading: float, distance_m: float,
+    currents,
+    valid_time: Optional[datetime],
+    dt_seconds: float,
+) -> tuple[float, float]:
+    """Project forward under wind, then offset by current drift over dt.
+
+    ``currents`` is duck-typed: anything with ``.sample(lat, lon, valid_time)``
+    returning ``(uc_ms, vc_ms)`` or ``None``. When None or out-of-grid,
+    no current is applied — equivalent to the legacy single-vehicle path.
+    """
+    sailed_lat, sailed_lon = project(parent_lat, parent_lon, heading, distance_m)
+    if currents is None:
+        return sailed_lat, sailed_lon
+    cuv = currents.sample(parent_lat, parent_lon, valid_time)
+    if cuv is None:
+        return sailed_lat, sailed_lon
+    uc, vc = cuv
+    drift_m = math.hypot(uc, vc) * dt_seconds
+    if drift_m < 1e-3:
+        return sailed_lat, sailed_lon
+    # u is east, v is north — convert to compass heading where the
+    # current is flowing TOWARD.
+    drift_heading = (math.degrees(math.atan2(uc, vc)) + 360.0) % 360.0
+    return project(sailed_lat, sailed_lon, drift_heading, drift_m)
 
 
 def compute_isochrone_route(
@@ -234,13 +282,37 @@ def compute_isochrone_route(
     max_iterations: int = 240,
     finish_radius_nm: float = 0.5,
     angular_bins: int = 72,
+    # ── New in v9 ──────────────────────────────────────────────────────
+    currents=None,                                     # duck-typed sampler
+    max_tws_kt: Optional[float] = None,                # heavy-weather cutoff
+    hs_m: float = 0.0,                                 # significant wave height
+    density_factor: float = 1.0,                       # ρ/ρ_std
+    polar_margin: float = 1.0,                         # gust/perf de-rating
+    rounding_filter: Optional[Callable[[float, float], bool]] = None,
+    # ──────────────────────────────────────────────────────────────────
 ) -> RouteResult:
-    """Find a near-optimal route from start to finish via isochrone fan.
+    """Find a near-optimal single-leg route from start to finish.
 
-    When `race_start` is provided and `wind` is a WindForecast, each
+    When ``race_start`` is provided and ``wind`` is a WindForecast, each
     iteration samples wind at race_start + iteration*dt. When
-    `race_start` is None, behaviour matches the legacy single-snapshot
+    ``race_start`` is None, behaviour matches the legacy single-snapshot
     engine — useful for tests and the standalone CLI.
+
+    New in v9:
+      currents:        optional sampler returning (uc_ms, vc_ms) at
+                       (lat, lon, valid_time). Vector-added to projected
+                       boat position each iteration.
+      max_tws_kt:      heavy-weather cutoff. Candidates from frontier
+                       points where TWS exceeds this are not expanded.
+      hs_m:            significant wave height for polar derating.
+      density_factor:  air density relative to standard (1.225 kg/m³).
+      polar_margin:    multiplier in [0, 1] for global polar derating —
+                       cheap way to bake in gust/helm-skill margin.
+      rounding_filter: optional callable taking (lat, lon) and returning
+                       True if a candidate position is on the allowed
+                       side of a mark constraint. Used by the multi-leg
+                       driver to enforce port/starboard rounding without
+                       changing the inner loop.
     """
     if is_navigable is None:
         def is_navigable(_lat: float, _lon: float) -> bool:  # type: ignore[misc]
@@ -266,6 +338,7 @@ def compute_isochrone_route(
     frontier: list[int] = [0]
     nodes_explored = 1
     reached_idx: Optional[int] = None
+    iteration = 0
 
     for iteration in range(1, max_iterations + 1):
         # Simulated time at the START of this iteration's expansion. Each
@@ -285,15 +358,34 @@ def compute_isochrone_route(
             tws_kt, wind_from_deg = uv_to_tws_twd(*uv)
             if tws_kt < 0.5:
                 continue
+            if max_tws_kt is not None and tws_kt > max_tws_kt:
+                # Heavy-weather cutoff: simulate the boat being unable to
+                # safely race in this part of the field. The engine
+                # naturally routes around the high-wind area as long as
+                # alternative paths exist outside the cutoff zone.
+                continue
 
             for k in range(heading_count):
                 heading = k * heading_step_deg
                 twa = _twa(heading, wind_from_deg)
-                speed_kt = polar.boat_speed(twa, tws_kt)
+                speed_kt = polar.boat_speed(
+                    twa, tws_kt,
+                    hs_m=hs_m,
+                    density_factor=density_factor,
+                    margin=polar_margin,
+                )
                 if speed_kt <= 0:
                     continue
                 distance_m = speed_kt * KT_TO_MS * dt_seconds
-                new_lat, new_lon = project(parent.lat, parent.lon, heading, distance_m)
+                new_lat, new_lon = _apply_currents(
+                    parent.lat, parent.lon, heading, distance_m,
+                    currents, valid_time, dt_seconds,
+                )
+                # Rounding-side filter (multi-leg). Candidates on the
+                # wrong side of an enforced rounding constraint are
+                # silently rejected.
+                if rounding_filter is not None and not rounding_filter(new_lat, new_lon):
+                    continue
                 # Whole-segment check — exact line-vs-polygon when the
                 # predicate exposes .segment, per-point fallback otherwise.
                 if not _segment_check(
@@ -382,6 +474,241 @@ def compute_isochrone_route(
         path=path, headings=headings,
         total_minutes=total_minutes, tack_count=tack_count,
         reached=reached, iterations=iteration, nodes_explored=nodes_explored,
+        legs=1,
+    )
+
+
+# ─── Multi-leg driver ───────────────────────────────────────────────────
+
+
+def _rounding_offset_seed(
+    mark_lat: float, mark_lon: float,
+    next_mark_lat: float, next_mark_lon: float,
+    rounding: str,
+) -> tuple[float, float]:
+    """Offset the next leg's start position to the correct side of the mark.
+
+    "port" rounding = boat keeps mark on its port (left) side. After
+    passing the mark heading toward the next mark, the boat is therefore
+    to the right of the mark relative to the next-leg bearing. We seed
+    the next leg from that offset point.
+
+    "starboard" rounding mirrors this — seed to the left of the next-leg
+    bearing.
+
+    The offset is small (200 m) so the geometric "bend" at the mark
+    looks correct on the chart. Larger offsets would distort the route;
+    smaller offsets risk the next-leg heading sweep tripping the rounding
+    side immediately.
+    """
+    bearing_to_next = bearing_deg(mark_lat, mark_lon, next_mark_lat, next_mark_lon)
+    if rounding == "port":
+        # Offset to the right of the next-leg bearing.
+        offset_heading = (bearing_to_next + 90.0) % 360.0
+    elif rounding == "starboard":
+        # Offset to the left of the next-leg bearing.
+        offset_heading = (bearing_to_next - 90.0 + 360.0) % 360.0
+    else:
+        return mark_lat, mark_lon
+    return project(mark_lat, mark_lon, offset_heading, ROUNDING_OFFSET_M)
+
+
+def _signed_side(
+    point_lat: float, point_lon: float,
+    line_lat: float, line_lon: float,
+    bearing_to_next_deg: float,
+) -> float:
+    """Cross-product sign for "is point left or right of a directed line."
+
+    Positive return: point is to the LEFT of the directed line.
+    Negative: to the RIGHT.
+
+    Treats the local tangent plane around (line_lat, line_lon) as flat;
+    fine for the <50 nm leg scales sailboats care about.
+    """
+    # Convert bearing to a unit vector in local east-north space.
+    h = math.radians(bearing_to_next_deg)
+    bx = math.sin(h)   # east component
+    by = math.cos(h)   # north component
+    # Vector from line point to test point in local east-north metres.
+    # Use simple equirectangular approximation; sufficient for <50nm.
+    mean_lat = math.radians((point_lat + line_lat) / 2.0)
+    dx = math.radians(point_lon - line_lon) * math.cos(mean_lat) * EARTH_RADIUS_M
+    dy = math.radians(point_lat - line_lat) * EARTH_RADIUS_M
+    # 2D cross product: bx*dy - by*dx > 0 means point is to LEFT of bearing.
+    return bx * dy - by * dx
+
+
+def _make_rounding_filter(
+    mark_lat: float, mark_lon: float,
+    next_mark_lat: float, next_mark_lon: float,
+    rounding: str,
+) -> Callable[[float, float], bool]:
+    """Build a (lat, lon) -> bool filter that enforces rounding side.
+
+    Filter returns False for candidate positions that lie on the wrong
+    side of the line from the mark toward the next mark. Used as the
+    next leg's ``rounding_filter`` argument so the boat departs the
+    mark on the correct side.
+    """
+    bearing_to_next = bearing_deg(mark_lat, mark_lon, next_mark_lat, next_mark_lon)
+
+    def _filter(lat: float, lon: float) -> bool:
+        # Only enforce within a few miles of the mark — far away, the
+        # boat can swing back across the line without breaking the rule.
+        if haversine_m(mark_lat, mark_lon, lat, lon) > 3.0 * M_PER_NM:
+            return True
+        side = _signed_side(lat, lon, mark_lat, mark_lon, bearing_to_next)
+        if rounding == "port":
+            # Boat keeps mark on its port (left) side. So the boat must
+            # be to the RIGHT of the line from mark toward next mark.
+            return side < 1.0  # allow tiny tolerance ~exactly on line
+        if rounding == "starboard":
+            return side > -1.0
+        return True
+
+    return _filter
+
+
+def compute_isochrone_route_multileg(
+    marks: Sequence[dict],
+    polar,
+    wind,
+    is_navigable: Optional[Callable[[float, float], bool]] = None,
+    *,
+    race_start: Optional[datetime] = None,
+    dt_minutes: float = 5.0,
+    heading_step_deg: float = 5.0,
+    max_iterations: int = 240,
+    finish_radius_nm: float = 0.5,
+    angular_bins: int = 72,
+    currents=None,
+    max_tws_kt: Optional[float] = None,
+    hs_m: float = 0.0,
+    density_factor: float = 1.0,
+    polar_margin: float = 1.0,
+) -> RouteResult:
+    """Route through a multi-mark course, threading wall-clock across legs.
+
+    ``marks`` is a sequence of dicts with at minimum ``lat`` and ``lon``.
+    Intermediate marks (not the first, not the last) may carry a
+    ``rounding`` key with value "port" or "starboard"; any other value
+    or absence means no rounding constraint. The first mark is the start
+    (no rounding); the last is the finish (no rounding — you cross it,
+    you don't round it).
+
+    Returns a single RouteResult whose ``path`` is the concatenation of
+    all legs and whose ``total_minutes`` is the sum. ``legs`` reports the
+    number of legs joined. If any leg fails to reach, the result's
+    ``reached`` is False and trailing legs are skipped — the partial
+    route is still returned for inspection.
+    """
+    if len(marks) < 2:
+        raise ValueError("multi-leg routing needs >= 2 marks")
+
+    legs_completed: list[RouteResult] = []
+    elapsed_minutes = 0.0
+    current_pos = (float(marks[0]["lat"]), float(marks[0]["lon"]))
+
+    for i in range(len(marks) - 1):
+        leg_finish = (float(marks[i + 1]["lat"]), float(marks[i + 1]["lon"]))
+        leg_start_dt = (
+            race_start + timedelta(minutes=elapsed_minutes)
+            if race_start is not None else None
+        )
+
+        # Rounding filter for THIS leg: only applies if the leg STARTS
+        # from an intermediate mark (i > 0). The filter enforces that
+        # candidates near the just-rounded mark stay on the correct side.
+        rf: Optional[Callable[[float, float], bool]] = None
+        if i > 0:
+            prev_mark = marks[i]
+            prev_rounding = prev_mark.get("rounding")
+            if prev_rounding in ("port", "starboard"):
+                rf = _make_rounding_filter(
+                    mark_lat=float(prev_mark["lat"]),
+                    mark_lon=float(prev_mark["lon"]),
+                    next_mark_lat=leg_finish[0],
+                    next_mark_lon=leg_finish[1],
+                    rounding=prev_rounding,
+                )
+
+        leg_result = compute_isochrone_route(
+            start=current_pos,
+            finish=leg_finish,
+            polar=polar,
+            wind=wind,
+            is_navigable=is_navigable,
+            race_start=leg_start_dt,
+            dt_minutes=dt_minutes,
+            heading_step_deg=heading_step_deg,
+            max_iterations=max_iterations,
+            finish_radius_nm=finish_radius_nm,
+            angular_bins=angular_bins,
+            currents=currents,
+            max_tws_kt=max_tws_kt,
+            hs_m=hs_m,
+            density_factor=density_factor,
+            polar_margin=polar_margin,
+            rounding_filter=rf,
+        )
+        legs_completed.append(leg_result)
+        elapsed_minutes += leg_result.total_minutes
+
+        if not leg_result.reached:
+            # No point routing onward — return the partial.
+            break
+
+        # Seed the next leg. Apply rounding offset if this mark
+        # (intermediate, not the finish) has a rounding rule.
+        is_intermediate = (i + 1) < (len(marks) - 1)
+        if is_intermediate:
+            this_mark = marks[i + 1]
+            rounding = this_mark.get("rounding")
+            if rounding in ("port", "starboard"):
+                next_mark = marks[i + 2]
+                current_pos = _rounding_offset_seed(
+                    mark_lat=leg_finish[0],
+                    mark_lon=leg_finish[1],
+                    next_mark_lat=float(next_mark["lat"]),
+                    next_mark_lon=float(next_mark["lon"]),
+                    rounding=rounding,
+                )
+            else:
+                current_pos = leg_finish
+        else:
+            current_pos = leg_finish
+
+    # Aggregate. Drop duplicate join points between adjacent legs.
+    combined_path: list[tuple[float, float]] = []
+    combined_headings: list[float] = []
+    for i, lr in enumerate(legs_completed):
+        if i == 0:
+            combined_path.extend(lr.path)
+        else:
+            # First point of this leg may duplicate the last point of
+            # the previous leg (mark coordinate) — skip it.
+            combined_path.extend(lr.path[1:] if lr.path else [])
+        combined_headings.extend(lr.headings)
+
+    total_minutes = sum(lr.total_minutes for lr in legs_completed)
+    tack_count = sum(lr.tack_count for lr in legs_completed)
+    iterations = sum(lr.iterations for lr in legs_completed)
+    nodes_explored = sum(lr.nodes_explored for lr in legs_completed)
+    reached = (
+        len(legs_completed) == len(marks) - 1
+        and all(lr.reached for lr in legs_completed)
+    )
+
+    return RouteResult(
+        path=combined_path,
+        headings=combined_headings,
+        total_minutes=total_minutes,
+        tack_count=tack_count,
+        reached=reached,
+        iterations=iterations,
+        nodes_explored=nodes_explored,
+        legs=len(legs_completed),
     )
 
 
@@ -396,6 +723,7 @@ def route_to_geojson(result: RouteResult, properties: Optional[dict] = None) -> 
         "reached": result.reached,
         "iterations": result.iterations,
         "nodes_explored": result.nodes_explored,
+        "legs": result.legs,
     }
     if properties:
         props.update(properties)
@@ -408,7 +736,9 @@ def route_to_geojson(result: RouteResult, properties: Optional[dict] = None) -> 
 
 __all__ = [
     "WindField", "RouteResult",
-    "compute_isochrone_route", "route_to_geojson",
+    "compute_isochrone_route",
+    "compute_isochrone_route_multileg",
+    "route_to_geojson",
     "haversine_m", "bearing_deg", "project", "uv_to_tws_twd",
     "M_PER_NM", "KT_TO_MS", "EARTH_RADIUS_M",
 ]

@@ -3,6 +3,7 @@
 from app.services.routing.isochrone import (
     WindField,
     compute_isochrone_route,
+    compute_isochrone_route_multileg,
     route_to_geojson,
 )
 from app.services.routing.navigability import (
@@ -15,6 +16,7 @@ __all__ = [
     "WindField",
     "WindForecast",
     "compute_isochrone_route",
+    "compute_isochrone_route_multileg",
     "route_to_geojson",
     "make_navigable_predicate",
     "DEFAULT_SAFETY_FACTOR",

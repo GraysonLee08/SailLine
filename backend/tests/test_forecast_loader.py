@@ -148,15 +148,22 @@ async def test_long_race_uses_hrrr_plus_gfs_hybrid(freeze_now):
 
 
 @pytest.mark.asyncio
-async def test_race_past_hrrr_horizon_raises_forecast_not_available(freeze_now):
+async def test_race_past_all_horizons_raises_forecast_not_available(freeze_now):
+    """Race window beyond every model's horizon should surface as 425.
+
+    conus carries both HRRR (18h) and GFS (120h). For ForecastNotAvailable
+    to fire on conus we need a race past *both* — past HRRR alone is no
+    longer sufficient now that conus is multi-source (it was, when this
+    test was first written and conus was HRRR-only). 130h is past GFS.
+    """
     fake = _FakeRedis(store={})  # store irrelevant — should fail before lookup
     with patch("app.services.weather.forecast_loader.redis_client.get_client",
                return_value=fake):
-        race_start = freeze_now + timedelta(hours=24)  # 24 > 18h horizon
+        race_start = freeze_now + timedelta(hours=130)  # > GFS horizon (120h)
         with pytest.raises(ForecastNotAvailable) as exc:
             await load_forecast_for_race("conus", race_start, duration_hours=4)
 
-    # available_at should be race_start - 18h; hours_until_available > 0
+    # available_at should be race_end - 120h (when GFS catches up).
     assert exc.value.hours_until_available > 0
     assert exc.value.available_at < race_start
 
