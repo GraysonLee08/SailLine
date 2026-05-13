@@ -9,7 +9,14 @@ steps:
     entrypoint: npm
     args: ['ci']
 
-  # 2. Materialize .env.production from Secret Manager.
+  # 2. Run frontend tests (vitest). Gates deploy — a failing test fails the build.
+  - name: 'node:20'
+    id: 'test'
+    dir: 'frontend'
+    entrypoint: npm
+    args: ['test']
+
+  # 3. Materialize .env.production from Secret Manager.
   #    Secret `sailline-frontend-env` holds the full file contents
   #    (VITE_FIREBASE_*, VITE_MAPBOX_TOKEN). VITE_API_URL is intentionally
   #    omitted — production uses relative paths via Firebase Hosting rewrites.
@@ -23,14 +30,14 @@ steps:
         gcloud secrets versions access latest \
           --secret=sailline-frontend-env > .env.production
 
-  # 3. Build the React app — Vite bakes VITE_* env vars into the bundle here.
+  # 4. Build the React app — Vite bakes VITE_* env vars into the bundle here.
   - name: 'node:20'
     id: 'build'
     dir: 'frontend'
     entrypoint: npm
     args: ['run', 'build']
 
-  # 4. Deploy to Firebase Hosting using ADC (no CI token to rotate).
+  # 5. Deploy to Firebase Hosting using ADC (no CI token to rotate).
   #    The build SA needs roles/firebasehosting.admin (granted one-time).
   - name: 'node:20'
     id: 'deploy'

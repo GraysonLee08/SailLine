@@ -47,7 +47,7 @@ npm run build        # → dist/
 npm run deploy       # build + firebase deploy --only hosting
 ```
 
-No `lint` or `test` scripts are configured on the frontend — don't try `npm test`/`npm run lint`.
+`npm test` runs vitest (one-shot) and is gated in CI via `infra/cloudbuild.frontend.yaml` — a failing test blocks deploy. No `lint` script is configured.
 
 ### Deploy
 
