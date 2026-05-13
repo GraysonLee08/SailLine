@@ -1,6 +1,19 @@
 # infra/cloudbuild.yaml
 steps:
-  # 1. Build the container image
+  # 1. Run backend tests (pytest). Gates deploy — a failing test fails the build.
+  #    Skips the `slow` marker (live NOAA hits) for CI speed.
+  #    Uses python:3.12-slim to match the Dockerfile base image.
+  - name: 'python:3.12-slim'
+    id: 'test'
+    dir: 'backend'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        pytest -m "not slow"
+
+  # 2. Build the container image
   - name: 'gcr.io/cloud-builders/docker'
     id: 'build'
     args:
@@ -11,7 +24,7 @@ steps:
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:latest'
       - './backend'
 
-  # 2. Push both tags to Artifact Registry
+  # 3. Push both tags to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     id: 'push-sha'
     args:
@@ -24,7 +37,7 @@ steps:
       - 'push'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:latest'
 
-  # 3. Deploy to Cloud Run
+  # 4. Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     id: 'deploy'
     entrypoint: gcloud

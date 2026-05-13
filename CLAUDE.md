@@ -51,7 +51,7 @@ npm run deploy       # build + firebase deploy --only hosting
 
 ### Deploy
 
-Cloud Build auto-deploys on push to `main` — `infra/cloudbuild.yaml` (backend → Cloud Run) and `infra/cloudbuild.frontend.yaml` (frontend → Firebase Hosting). **Migrations are intentionally manual**; see `docs/migrations.md` for the runbook (short version: apply additive migrations *before* pushing; split destructive ones across two commits).
+Cloud Build auto-deploys on push to `main` — `infra/cloudbuild.yaml` (backend → Cloud Run) and `infra/cloudbuild.frontend.yaml` (frontend → Firebase Hosting). Both pipelines run tests before deploy (`pytest -m "not slow"` for backend, `npm test` for frontend) — a failing test blocks deploy. **Migrations are intentionally manual**; see `docs/migrations.md` for the runbook (short version: apply additive migrations *before* pushing; split destructive ones across two commits).
 
 ## Architecture
 
