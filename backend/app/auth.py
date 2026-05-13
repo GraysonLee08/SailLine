@@ -6,6 +6,19 @@ ID token. The frontend includes that token on every API call as
 using the Firebase Admin SDK, then look up (or lazily create) the user's row
 in `user_profiles` to get their subscription tier.
 
+Two entry points share the same underlying verification:
+  - `get_current_user`  HTTP route dependency. HTTPBearer reads the token
+                        from the Authorization header; failures raise 401.
+  - `verify_ws_token`   WebSocket-friendly. Accepts a raw token string
+                        (browsers can't set Authorization on WS connections,
+                        so the token rides on the URL query). Failures raise
+                        InvalidTokenError; the WS handler is expected to
+                        catch it and close with code 1008.
+
+Both paths funnel through `_verify_token_string`, so any change to the
+verification logic (revocation checks, custom-claims handling) applies to
+HTTP and WS uniformly.
+
 Firebase Admin auto-discovers credentials on Cloud Run via the runtime
 service account (`sailline-api`), which has the `firebaseauth.admin` role.
 No JSON key file or env var is required in production.
@@ -27,6 +40,17 @@ from app.db import get_pool
 log = logging.getLogger(__name__)
 
 _security = HTTPBearer(auto_error=True, description="Firebase ID token")
+
+
+class InvalidTokenError(Exception):
+    """Raised when a Firebase ID token fails verification.
+
+    Carries a short reason string suitable for logging or surfacing in a
+    WebSocket close frame. Each transport translates this to its own
+    error shape:
+      - HTTP: 401 with WWW-Authenticate header
+      - WS:   close code 1008 (policy violation)
+    """
 
 
 def initialize() -> None:
@@ -58,43 +82,68 @@ async def _ensure_profile(pool: asyncpg.Pool, uid: str) -> str:
         )
 
 
-async def get_current_user(
-    creds: HTTPAuthorizationCredentials = Depends(_security),
-    pool: asyncpg.Pool = Depends(get_pool),
-) -> dict:
-    """Verify the bearer token and return the authenticated user.
+async def _verify_token_string(token: str, pool: asyncpg.Pool) -> dict:
+    """Core verification — token string in, user dict out.
 
-    Steps:
-    1. Verify the Firebase ID token (signature, expiry, issuer, audience).
-    2. UPSERT the user's profile row in Postgres, fetching their tier.
-    3. Return a dict with the uid, optional email, tier, and full claims.
+    Called by both HTTP and WebSocket auth paths. Raises InvalidTokenError
+    on any verification failure; the caller translates that to a
+    transport-appropriate error response.
 
     `verify_id_token` is sync (it does an HTTP fetch + JWT verify), so we
     push it to a thread to avoid blocking the event loop.
     """
     try:
-        decoded = await asyncio.to_thread(fb_auth.verify_id_token, creds.credentials)
+        decoded = await asyncio.to_thread(fb_auth.verify_id_token, token)
     except (
         fb_auth.InvalidIdTokenError,
         fb_auth.ExpiredIdTokenError,
         fb_auth.RevokedIdTokenError,
         ValueError,
     ) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"invalid token: {type(exc).__name__}",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+        raise InvalidTokenError(type(exc).__name__) from exc
 
     uid = decoded["uid"]
     tier = await _ensure_profile(pool, uid)
-
     return {
         "uid": uid,
         "email": decoded.get("email"),
         "tier": tier,
         "claims": decoded,
     }
+
+
+async def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(_security),
+    pool: asyncpg.Pool = Depends(get_pool),
+) -> dict:
+    """Verify the bearer token and return the authenticated user.
+
+    HTTP route dependency. Returns the same user dict shape as the WS
+    path — `{uid, email, tier, claims}` — so downstream code is
+    transport-agnostic.
+    """
+    try:
+        return await _verify_token_string(creds.credentials, pool)
+    except InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"invalid token: {exc}",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+
+async def verify_ws_token(token: str, pool: asyncpg.Pool) -> dict:
+    """Verify a Firebase ID token passed as a WebSocket query parameter.
+
+    The browser WebSocket API can't set Authorization headers, so tokens
+    ride on the URL: `wss://.../path?token=<id_token>`. The short-lived
+    (~1h) nature of Firebase ID tokens bounds the blast radius of
+    incidental query-string exposure in server logs.
+
+    Raises InvalidTokenError on any verification failure. The WS handler
+    is expected to catch this and close the connection with code 1008.
+    """
+    return await _verify_token_string(token, pool)
 
 
 def require_pro(user: dict = Depends(get_current_user)) -> dict:

@@ -12,6 +12,7 @@ from app.routers import (
     routing,
     routing_notifications,
     telemetry,
+    telemetry_stream,
     tracks,
     users,
     weather,
@@ -67,6 +68,7 @@ app.include_router(weather.router)                # router carries its own /api/
 app.include_router(races.router)                  # router carries its own /api/races prefix
 app.include_router(tracks.router)                 # router carries its own /api/races/{id}/track prefix
 app.include_router(telemetry.router)              # router carries its own /api/races/{id}/telemetry prefix
+app.include_router(telemetry_stream.router)       # WS /api/races/{id}/telemetry/stream
 app.include_router(routing.router)                # /api/routing - compute endpoint
 app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
 
