@@ -39,6 +39,8 @@ import { useTrackRecorder } from "../hooks/useTrackRecorder";
 import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
 import { useFollowMode } from "../hooks/useFollowMode";
+import { useAutoStartRecorder } from "../hooks/useAutoStartRecorder";
+import { useRouteFreshnessCheck } from "../hooks/useRouteFreshnessCheck";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
@@ -159,6 +161,32 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
   const routing = useRouting(activeRace?.id ?? null);
   const notif = useRouteNotifications(activeRace?.id ?? null);
   const followMode = useFollowMode(activeRace?.id ?? null);
+
+  // Auto-arm the recorder for T-5. `auto_start_enabled` defaults to true
+  // for races created before 0007 too — the migration sets the column
+  // default and the API serialises true on read.
+  const autoStart = useAutoStartRecorder({
+    raceId: activeRace?.id ?? null,
+    startAtIso: activeRace?.start_at ?? null,
+    enabled: activeRace?.auto_start_enabled !== false,
+    recording: recorder.recording,
+    start: recorder.start,
+  });
+
+  // T-5 wind-drift check against the computed route's start-mark wind.
+  // Active any time a route exists — but the banner is only shown inside
+  // the pre-start window (see RaceOverlay below) so it doesn't haunt the
+  // user post-gun.
+  const startMark = useMemo(() => {
+    const m = activeRace?.marks?.[0];
+    if (!m || !Number.isFinite(m.lat) || !Number.isFinite(m.lon)) return null;
+    return { lat: m.lat, lon: m.lon };
+  }, [activeRace]);
+  const freshness = useRouteFreshnessCheck({
+    routeMeta: routing.meta,
+    baseWeather,
+    startMark,
+  });
 
   const followModeRef = useRef(followMode);
   followModeRef.current = followMode;
@@ -543,6 +571,9 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           onClear={onClearActive}
           routing={routing}
           topOffset={raceOverlayTop}
+          autoStart={autoStart}
+          freshness={freshness}
+          onRecompute={routing.compute}
         />
       )}
 
@@ -589,8 +620,23 @@ function RaceOverlay({
   onClear,
   routing,
   topOffset,
+  autoStart,
+  freshness,
+  onRecompute,
 }) {
   const cd = useCountdown(race.start_at);
+
+  // Show the "armed" hint and the freshness banner only inside the
+  // pre-start window. After the gun, the banner becomes noise: the user
+  // has already crossed and either accepted the route or didn't. The
+  // phone-placement tip is shown alongside the armed badge so the user
+  // sees the reminder right before recording kicks in.
+  const inPreStartWindow =
+    !cd.isUnset && !cd.isPast && (cd.msUntil ?? 0) <= 5 * 60 * 1000;
+  const showArmed = autoStart?.armed && !recording && inPreStartWindow;
+  const showFreshness =
+    freshness?.ready && freshness.stale && !cd.isPast && !cd.isUnset;
+
   return (
     <div
       className="glass-card--dark"
@@ -625,6 +671,29 @@ function RaceOverlay({
                   );
                 })()}
         </div>
+        {showArmed && (
+          <div style={styles.armedHint}>
+            ● Auto-recording armed · mount your phone in a fixed location
+          </div>
+        )}
+        {showFreshness && (
+          <div style={styles.freshnessBanner}>
+            <div style={styles.freshnessText}>
+              Wind shifted since route was computed
+              {" · "}
+              Δ{Math.round(freshness.deltaDirDeg)}°,{" "}
+              {freshness.deltaSpeedKt.toFixed(1)} kt
+            </div>
+            <button
+              onClick={onRecompute}
+              disabled={routing?.loading}
+              style={styles.freshnessBtn}
+              aria-label="Recompute route with current wind"
+            >
+              {routing?.loading ? "Recomputing…" : "Recompute"}
+            </button>
+          </div>
+        )}
         {recording && queueLength > 0 && (
           <div style={styles.queueHint}>
             {queueLength} pt{queueLength === 1 ? "" : "s"} pending
@@ -827,6 +896,47 @@ const styles = {
     color: "var(--paper-ink-3)",
     fontFamily: "var(--mono)",
     marginTop: 2,
+  },
+  // Subtle blue-tinted line. Appears inside the T-5 window once the
+  // auto-start timer is scheduled; goes away the moment the recorder
+  // actually flips to recording.
+  armedHint: {
+    fontSize: 11,
+    color: "#7eb6ff",
+    marginTop: 4,
+    letterSpacing: "0.01em",
+  },
+  // Amber-ish callout above the route status — distinct from
+  // recorderError red so it doesn't read as a fault.
+  freshnessBanner: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 6,
+    padding: "6px 10px",
+    border: "1px solid rgba(255, 196, 102, 0.55)",
+    background: "rgba(255, 196, 102, 0.15)",
+    borderRadius: "var(--r-sm)",
+    maxWidth: 320,
+  },
+  freshnessText: {
+    flex: 1,
+    fontSize: 11,
+    color: "#ffd089",
+    lineHeight: 1.3,
+    fontVariantNumeric: "tabular-nums",
+  },
+  freshnessBtn: {
+    flexShrink: 0,
+    padding: "4px 10px",
+    border: "1px solid rgba(255, 196, 102, 0.6)",
+    background: "rgba(255, 196, 102, 0.18)",
+    borderRadius: "var(--r-sm)",
+    color: "#ffd089",
+    fontSize: 11,
+    fontWeight: 500,
+    cursor: "pointer",
+    fontFamily: "inherit",
   },
   recordError: {
     // Brighter red for legibility on dark.

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -141,6 +142,14 @@ class RouteMeta(BaseModel):
     # currents were folded into the route; the engine ran with
     # ``currents=None``.
     currents_quality: Optional[str] = None
+    # New in v10.1 — wind sampled at marks[0] at race_start_at using the
+    # same forecast that fed the engine. Lets the frontend's pre-start
+    # freshness check (T-5 banner) compute a wind delta against the
+    # current forecast without re-running compute. None when the sample
+    # falls outside the forecast horizon (rare; would only happen for
+    # races scheduled past the loaded duration_hours window).
+    start_wind_dir_deg: Optional[float] = None
+    start_wind_speed_kt: Optional[float] = None
 
 
 class ComputeRouteOut(BaseModel):
@@ -219,6 +228,33 @@ async def _load_currents_optional(
             race_id, exc,
         )
         return None
+
+
+def _sample_start_wind(
+    forecast,
+    start_lat: float,
+    start_lon: float,
+    race_start: datetime,
+) -> tuple[Optional[float], Optional[float]]:
+    """Sample wind at the start mark at race_start time.
+
+    Returns ``(dir_deg, speed_kt)`` or ``(None, None)`` when the sample
+    falls outside the forecast's spatial or temporal coverage. Used by
+    the frontend's T-5 freshness check to detect material forecast
+    drift since the route was computed.
+
+    Direction follows the meteorological "wind from" convention to match
+    the rest of the app (``uvToSpeedDir`` in ``windBarb.js`` does the
+    same: ``atan2(-u, -v)``).
+    """
+    uv = forecast.sample(start_lat, start_lon, race_start)
+    if uv is None:
+        return None, None
+    u, v = uv
+    speed_ms = math.hypot(u, v)
+    speed_kt = speed_ms * 1.94384
+    dir_deg = (math.degrees(math.atan2(-u, -v)) + 360.0) % 360.0
+    return dir_deg, speed_kt
 
 
 def _currents_cache_tag(currents: Optional[CurrentForecast]) -> str:
@@ -379,6 +415,18 @@ async def compute_route(
         )
 
     currents_quality = currents.quality if currents is not None else None
+
+    # Sample the wind the route is "anchored to" at the start mark / gun
+    # time. Stamped onto the response meta so the T-5 freshness check
+    # can compute a delta against the current forecast without re-doing
+    # the route compute.
+    start_wind_dir_deg, start_wind_speed_kt = _sample_start_wind(
+        forecast=forecast,
+        start_lat=marks[0]["lat"],
+        start_lon=marks[0]["lon"],
+        race_start=race_start,
+    )
+
     log.info(
         "compute route race_id=%s region=%s venue=%s polar=%s race_start=%s "
         "forecast_quality=%s marks=%d max_tws=%s margin=%.3f hs=%.2f dens=%.3f "
@@ -420,6 +468,8 @@ async def compute_route(
             "hs_m": payload.hs_m,
             "density_factor": payload.density_factor,
             "currents_quality": currents_quality,
+            "start_wind_dir_deg": start_wind_dir_deg,
+            "start_wind_speed_kt": start_wind_speed_kt,
         },
     )
 
@@ -446,6 +496,8 @@ async def compute_route(
             "hs_m": payload.hs_m,
             "density_factor": payload.density_factor,
             "currents_quality": currents_quality,
+            "start_wind_dir_deg": start_wind_dir_deg,
+            "start_wind_speed_kt": start_wind_speed_kt,
         },
     }
 

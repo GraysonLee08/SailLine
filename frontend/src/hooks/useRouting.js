@@ -5,9 +5,9 @@
 //
 // Invoked from the active-race overlay's "Compute Route" button. On
 // success the hook holds the GeoJSON Feature plus diagnostic metadata
-// (total time, tack count, region, forecast quality). MapView reads
-// `route` and pushes it to a Mapbox geojson source so the magenta line
-// renders.
+// (total time, tack count, region, forecast quality, and — added in
+// v10.1 — the wind at the start mark at gun time that the route was
+// computed against, which feeds the T-5 freshness check).
 //
 // applyAlternative(feature) lets the SSE notifications path swap in a
 // better route without going through compute() again — the recompute
@@ -74,6 +74,11 @@ export function useRouting(raceId) {
       region: props.region ?? "",
       forecast_quality: props.forecast_quality ?? "",
       polar: props.polar ?? "",
+      // start_wind_* may be absent on alternatives published by older
+      // worker builds — guard with null defaults so the freshness hook
+      // simply no-ops in that case rather than crashing on undefined.
+      start_wind_dir_deg: props.start_wind_dir_deg ?? null,
+      start_wind_speed_kt: props.start_wind_speed_kt ?? null,
       cached: false,
     });
     setError(null);

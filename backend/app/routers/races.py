@@ -12,6 +12,10 @@ named marks (e.g. "205° - 1.3 miles from Four Mile Crib") in hover popups.
 `start_at` is the gun time for the race, stored as TIMESTAMPTZ. Nullable —
 the frontend treats null as "no start time set" rather than an error,
 which lets users save a course before scheduling is finalized.
+
+`auto_start_enabled` (added in 0007) controls whether the frontend
+recorder auto-starts at `start_at - 5min`. Defaults to TRUE on the
+column; PATCH respects it like any other field.
 """
 from __future__ import annotations
 
@@ -48,6 +52,10 @@ class RaceCreate(BaseModel):
     boat_class: str = Field(min_length=1, max_length=80)
     marks: list[Mark] = Field(default_factory=list)
     start_at: Optional[datetime] = None
+    # Default mirrors the column default so a POST that omits the field
+    # still ends up with auto_start_enabled=True. Sending False explicitly
+    # at create time is supported (rare — users typically opt out later).
+    auto_start_enabled: bool = True
 
 
 class RaceUpdate(BaseModel):
@@ -60,6 +68,7 @@ class RaceUpdate(BaseModel):
     boat_class: Optional[str] = Field(default=None, min_length=1, max_length=80)
     marks: Optional[list[Mark]] = None
     start_at: Optional[datetime] = None
+    auto_start_enabled: Optional[bool] = None
 
 
 class RaceOut(BaseModel):
@@ -71,6 +80,7 @@ class RaceOut(BaseModel):
     start_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    auto_start_enabled: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -79,7 +89,7 @@ class RaceOut(BaseModel):
 
 _SELECT_COLS = """
     id, name, mode, boat_class, marks, start_at, started_at, ended_at,
-    created_at, updated_at
+    auto_start_enabled, created_at, updated_at
 """
 
 
@@ -102,6 +112,7 @@ def _row_to_race(row: asyncpg.Record) -> dict:
         "start_at": row["start_at"],
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
+        "auto_start_enabled": row["auto_start_enabled"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -145,8 +156,11 @@ async def create_race(
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
-            INSERT INTO race_sessions (user_id, name, mode, boat_class, marks, start_at)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            INSERT INTO race_sessions (
+                user_id, name, mode, boat_class, marks, start_at,
+                auto_start_enabled
+            )
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
             RETURNING {_SELECT_COLS}
             """,
             user["uid"],
@@ -155,6 +169,7 @@ async def create_race(
             payload.boat_class,
             _marks_json(payload.marks),
             payload.start_at,
+            payload.auto_start_enabled,
         )
     return _row_to_race(row)
 

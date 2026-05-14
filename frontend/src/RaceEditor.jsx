@@ -68,6 +68,9 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   const [mode, setMode] = useState("inshore");
   const [boatClass, setBoatClass] = useState(BOAT_CLASSES[0]);
   const [marks, setMarks] = useState([]);
+  // Default ON to match the column default on race_sessions. Toggled
+  // in the editor sidebar; honoured by useAutoStartRecorder in MapView.
+  const [autoStartEnabled, setAutoStartEnabled] = useState(true);
 
   // Start time, split into local date + local time strings for the two
   // <input> elements. Combined to ISO UTC only on save (and only when
@@ -117,6 +120,9 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         setMode(race.mode);
         setBoatClass(race.boat_class);
         setMarks(race.marks || []);
+        // Races created before 0007 serialise as true (column default).
+        // Be defensive against an undefined response field anyway.
+        setAutoStartEnabled(race.auto_start_enabled !== false);
         const parts = isoToLocalParts(race.start_at);
         setStartDate(parts.date);
         setStartTime(parts.time);
@@ -381,6 +387,7 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
           ...(m.description ? { description: m.description } : {}),
         })),
         start_at: startAtIso, // null when either half is unset
+        auto_start_enabled: autoStartEnabled,
       };
       const saved = isNew
         ? await apiFetch("/api/races", { method: "POST", body: payload })
@@ -503,6 +510,17 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
                   aria-label="Class start time"
                 />
               </div>
+              <label style={styles.autoStartRow}>
+                <input
+                  type="checkbox"
+                  checked={autoStartEnabled}
+                  onChange={(e) => setAutoStartEnabled(e.target.checked)}
+                  style={styles.autoStartCheckbox}
+                />
+                <span style={styles.autoStartLabel}>
+                  Auto-start recording 5 min before gun
+                </span>
+              </label>
             </Section>
 
             <Section label="MORF course preset">
@@ -910,6 +928,9 @@ const styles = {
   input: { width: "100%", height: 40, padding: "0 12px", border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 14, color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
   startRow: { display: "flex", gap: 8 },
   startInput: { flex: 1, minWidth: 0, height: 40, padding: "0 10px", border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 14, color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
+  autoStartRow: { display: "flex", alignItems: "center", gap: 8, marginTop: 10, cursor: "pointer", userSelect: "none" },
+  autoStartCheckbox: { width: 16, height: 16, cursor: "pointer", accentColor: "#1a73e8" },
+  autoStartLabel: { fontSize: 13, color: "var(--ink-2, var(--ink))", lineHeight: 1.4 },
   clearBtn: { border: "none", background: "transparent", padding: 0, fontSize: 11, color: "var(--ink-3)", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.04em", fontFamily: "inherit", textDecoration: "underline", textDecorationColor: "var(--rule)", textUnderlineOffset: "2px" },
   radioGroup: { display: "flex", gap: 8 },
   radio: { flex: 1, height: 40, border: "1.5px solid var(--rule)", borderRadius: "var(--r-sm)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, cursor: "pointer", transition: "background 0.1s, border-color 0.1s, color 0.1s" },
