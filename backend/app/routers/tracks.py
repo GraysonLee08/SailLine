@@ -1,27 +1,39 @@
-"""Track recording endpoints — GPS breadcrumb capture during a race.
+"""Track recording endpoints - GPS breadcrumb capture during a race.
 
-`POST /api/races/{race_id}/track`  bulk-inserts a batch of points (the
+POST /api/races/{race_id}/track  bulk-inserts a batch of points (the
 client buffers ~30s or ~100 points and flushes; failed flushes go back
-on a localStorage queue and retry on reconnect).
+on a localStorage queue and retry on reconnect). The same call also
+runs the mark-rounding detector incrementally - any new roundings
+produced by this batch are persisted to race_sessions.mark_passes
+and returned in the response body so the frontend's auto-stop hook
+gets immediate feedback without polling.
 
-`GET  /api/races/{race_id}/track`  returns the full recorded track in
-chronological order — used by the post-race playback view.
+GET  /api/races/{race_id}/track  returns the full recorded track in
+chronological order - used by the post-race playback view.
 
 Both endpoints require Firebase auth and are scoped to the calling user
-via the parent race_session's `user_id` — we never read or write a
+via the parent race_session's user_id - we never read or write a
 race we don't own.
 
 Schema is in migration 0002 (track_points). Position is stored as
 GEOGRAPHY(POINT, 4326). On insert we build the geography from lat/lon
-with `ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography`; on read we
+with ST_SetSRID(ST_MakePoint(lon, lat), 4326)::geography; on read we
 project back to a geometry and pull X/Y as lon/lat.
 
-Bulk insert uses `unnest` on parallel arrays in a single statement —
-faster than `executemany` for the 30s/100-point batch sizes the
+Bulk insert uses unnest on parallel arrays in a single statement -
+faster than executemany for the 30s/100-point batch sizes the
 recorder produces, and keeps the round trip count at 1 per flush.
+
+Mark-rounding state lives in race_sessions.mark_passes (JSONB,
+migration 0008). Each batch reads the prior list + the boat's marks,
+constructs a MarkRoundingDetector resumed at the next-unrounded
+index, feeds the new batch through it, and rewrites the column with
+old + new passes. See app/services/mark_rounding.py for the
+algorithm and the resume semantics.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -33,6 +45,11 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
+from app.services.mark_rounding import (
+    Mark as DetectorMark,
+    MarkRoundingDetector,
+    Point as DetectorPoint,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,13 +62,13 @@ router = APIRouter(prefix="/api/races", tags=["tracks"])
 MAX_BATCH = 500
 
 
-# ─── Models ──────────────────────────────────────────────────────────────
+# --- Models ------------------------------------------------------------
 
 
 class TrackPointIn(BaseModel):
     """One GPS sample from the recorder.
 
-    `speed_kts` and `heading_deg` are optional — the browser geolocation
+    speed_kts and heading_deg are optional - the browser geolocation
     API populates them on most devices but not all (e.g. desktop Safari
     with a fixed IP returns no speed/heading). Server stores nulls; the
     playback view tolerates them.
@@ -75,32 +92,103 @@ class TrackPointOut(BaseModel):
     heading_deg: Optional[float] = None
 
 
+class MarkPassOut(BaseModel):
+    """Authoritative server-recorded rounding event.
+
+    Same shape as the JSONB stored in race_sessions.mark_passes.
+    Returned in the POST response so the frontend can update its
+    auto-stop state without a follow-up GET.
+    """
+    mark_index: int
+    ts: datetime
+    lat: float
+    lon: float
+
+
 class TrackBatchAccepted(BaseModel):
     inserted: int
+    mark_passes: list[MarkPassOut] = Field(default_factory=list)
+    new_mark_passes: list[MarkPassOut] = Field(default_factory=list)
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────
+# --- Helpers -----------------------------------------------------------
 
 
-async def _assert_race_owned(
+async def _load_race_for_ingest(
     conn: asyncpg.Connection, race_id: UUID, uid: str
-) -> None:
-    """404 if the race doesn't exist OR isn't owned by this user.
+) -> dict:
+    """Fetch the bits of the race row needed to run mark rounding.
 
-    Same "don't leak existence" pattern as the races router — a 404 means
-    "you can't have this", regardless of whether it's missing or just
-    someone else's. Cheap one-row SELECT; fine to call on every flush.
+    404 if the race doesn't exist OR isn't owned by this user.
     """
     row = await conn.fetchrow(
-        "SELECT 1 FROM race_sessions WHERE id = $1 AND user_id = $2",
+        """
+        SELECT marks, mark_passes
+        FROM race_sessions
+        WHERE id = $1 AND user_id = $2
+        """,
         race_id,
         uid,
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+    marks_raw = row["marks"]
+    if isinstance(marks_raw, (bytes, str)):
+        marks = json.loads(marks_raw) if marks_raw else []
+    else:
+        marks = marks_raw or []
+    passes_raw = row["mark_passes"]
+    if isinstance(passes_raw, (bytes, str)):
+        passes = json.loads(passes_raw) if passes_raw else []
+    else:
+        passes = passes_raw or []
+    return {"marks": marks, "mark_passes": passes}
 
 
-# ─── Endpoints ───────────────────────────────────────────────────────────
+def _detect_new_passes(
+    marks: list[dict],
+    existing_passes: list[dict],
+    new_points: list[TrackPointIn],
+) -> list[dict]:
+    """Run the detector resumed at the right index over only the new
+    batch. Returns just the NEW passes (not appended to existing).
+
+    Marks without lat/lon are skipped silently - defensive against
+    pre-Alembic rows that may have an odd shape.
+    """
+    detector_marks: list[DetectorMark] = []
+    for m in marks:
+        try:
+            detector_marks.append(
+                DetectorMark(lat=float(m["lat"]), lon=float(m["lon"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            return []
+    if not detector_marks:
+        return []
+
+    next_idx = len(existing_passes)
+    if next_idx >= len(detector_marks):
+        return []
+
+    det = MarkRoundingDetector(detector_marks, next_mark_index=next_idx)
+    points_iter = (
+        DetectorPoint(lat=p.lat, lon=p.lon, ts=p.recorded_at)
+        for p in new_points
+    )
+    new = det.feed_batch(points_iter)
+    return [
+        {
+            "mark_index": p.mark_index,
+            "ts": p.ts.isoformat(),
+            "lat": p.lat,
+            "lon": p.lon,
+        }
+        for p in new
+    ]
+
+
+# --- Endpoints ---------------------------------------------------------
 
 
 @router.post(
@@ -114,15 +202,7 @@ async def append_track(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
-    """Bulk-insert a batch of GPS points for a race.
-
-    Idempotency: not enforced server-side. The recorder's localStorage
-    queue is the durability layer — if a flush partially succeeds, the
-    client may resend points and we'll get duplicates. That's acceptable
-    for v1 (post-race analysis is robust to a few duplicate samples;
-    cleanup is cheap with `SELECT DISTINCT ON (recorded_at)` if needed).
-    Adding a unique constraint later is a one-line migration.
-    """
+    """Bulk-insert a batch of GPS points for a race."""
     n = len(payload.points)
     recorded_ats: list[datetime] = []
     lats: list[float] = []
@@ -137,7 +217,8 @@ async def append_track(
         headings.append(p.heading_deg)
 
     async with pool.acquire() as conn:
-        await _assert_race_owned(conn, race_id, user["uid"])
+        race = await _load_race_for_ingest(conn, race_id, user["uid"])
+
         await conn.execute(
             """
             INSERT INTO track_points
@@ -164,7 +245,29 @@ async def append_track(
             headings,
         )
 
-    return TrackBatchAccepted(inserted=n)
+        new_passes = _detect_new_passes(
+            race["marks"], race["mark_passes"], payload.points
+        )
+
+        all_passes = list(race["mark_passes"]) + new_passes
+        if new_passes:
+            await conn.execute(
+                """
+                UPDATE race_sessions
+                SET mark_passes = $1::jsonb,
+                    updated_at = NOW()
+                WHERE id = $2 AND user_id = $3
+                """,
+                json.dumps(all_passes),
+                race_id,
+                user["uid"],
+            )
+
+    return TrackBatchAccepted(
+        inserted=n,
+        mark_passes=[MarkPassOut(**p) for p in all_passes],
+        new_mark_passes=[MarkPassOut(**p) for p in new_passes],
+    )
 
 
 @router.get("/{race_id}/track", response_model=list[TrackPointOut])
@@ -173,16 +276,15 @@ async def get_track(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
-    """Return every recorded point for the race in chronological order.
-
-    No pagination yet. A 6-hour passage at 1Hz is ~21,600 points; gzipped
-    JSON of `{recorded_at, lat, lon, speed_kts, heading_deg}` per row is
-    well under a few MB and the playback view loads it all upfront. If
-    we start ingesting telemetry at 5–10Hz that math changes; revisit
-    with cursor pagination then.
-    """
+    """Return every recorded point for the race in chronological order."""
     async with pool.acquire() as conn:
-        await _assert_race_owned(conn, race_id, user["uid"])
+        owned = await conn.fetchrow(
+            "SELECT 1 FROM race_sessions WHERE id = $1 AND user_id = $2",
+            race_id,
+            user["uid"],
+        )
+        if owned is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
         rows = await conn.fetch(
             """
             SELECT

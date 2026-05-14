@@ -1,16 +1,15 @@
 """Tests for app/routers/tracks.py.
 
-Mocks the asyncpg pool by overriding the FastAPI `db.get_pool` dependency
-and stubbing `get_current_user`. No real database is touched.
+Mocks the asyncpg pool by overriding the FastAPI db.get_pool dependency
+and stubbing get_current_user. No real database is touched.
 
-The ownership check (`_assert_race_owned`) issues a fetchrow before
-every insert/select; tests configure its return value via the shared
-mock_conn.fetchrow. Bulk insert is verified by inspecting the SQL the
-router executes and the parallel-array arguments — we don't try to
-actually run unnest in a fake.
+POST tests exercise the mark-rounding side effect added in 0008: the
+row read returns marks + existing passes, the router invokes the
+detector against the new batch, and persists any new passes via UPDATE.
 """
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
@@ -25,7 +24,7 @@ from app.auth import get_current_user
 from app.routers import tracks
 
 
-# ─── Fixtures ────────────────────────────────────────────────────────────
+# --- Fixtures ----------------------------------------------------------
 
 
 @pytest.fixture
@@ -64,12 +63,19 @@ def client(app):
     return TestClient(app)
 
 
-def _race_owned(uid: str = "test-uid"):
-    """Stand-in row for `SELECT 1 FROM race_sessions WHERE id=$1 AND user_id=$2`."""
+def _race_row(marks=None, mark_passes=None):
+    if marks is None:
+        marks = [{"name": "M", "lat": 42.30, "lon": -87.80}]
+    if mark_passes is None:
+        mark_passes = []
+    return {"marks": json.dumps(marks), "mark_passes": json.dumps(mark_passes)}
+
+
+def _owned():
     return {"?column?": 1}
 
 
-def _sample_points(n: int = 3, start: datetime | None = None):
+def _sample_points(n=3, start=None):
     start = start or datetime(2026, 5, 9, 14, 0, tzinfo=timezone.utc)
     return [
         {
@@ -83,19 +89,23 @@ def _sample_points(n: int = 3, start: datetime | None = None):
     ]
 
 
-# ─── POST batch insert ───────────────────────────────────────────────────
+# --- POST batch insert -------------------------------------------------
 
 
 def test_post_batch_inserts(client, mock_conn):
-    mock_conn.fetchrow.return_value = _race_owned()
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
     race_id = uuid4()
     points = _sample_points(5)
 
     r = client.post(f"/api/races/{race_id}/track", json={"points": points})
 
     assert r.status_code == 201
-    assert r.json() == {"inserted": 5}
-    # ownership check + bulk insert = 2 round trips
+    body = r.json()
+    assert body["inserted"] == 5
+    assert body["new_mark_passes"] == []
+    assert body["mark_passes"] == []
     mock_conn.fetchrow.assert_awaited_once()
     mock_conn.execute.assert_awaited_once()
     args = mock_conn.execute.await_args.args
@@ -103,18 +113,16 @@ def test_post_batch_inserts(client, mock_conn):
     assert "INSERT INTO track_points" in sql
     assert "unnest" in sql.lower()
     assert "ST_SetSRID(ST_MakePoint" in sql
-    # parallel arrays match input length
     assert args[1] == race_id
     for arr in args[2:]:
         assert len(arr) == 5
-    # ownership check used the JWT uid, not anything from the body
     own_args = mock_conn.fetchrow.await_args.args
     assert own_args[1] == race_id
     assert own_args[2] == "test-uid"
 
 
 def test_post_404_when_race_not_owned(client, mock_conn):
-    mock_conn.fetchrow.return_value = None  # not yours, or doesn't exist
+    mock_conn.fetchrow.return_value = None
 
     r = client.post(
         f"/api/races/{uuid4()}/track",
@@ -127,7 +135,7 @@ def test_post_404_when_race_not_owned(client, mock_conn):
 
 def test_post_rejects_empty_batch(client, mock_conn):
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": []})
-    assert r.status_code == 422  # Pydantic min_length=1
+    assert r.status_code == 422
     mock_conn.fetchrow.assert_not_awaited()
 
 
@@ -139,40 +147,109 @@ def test_post_rejects_oversized_batch(client, mock_conn):
 
 
 def test_post_rejects_out_of_range_coords(client, mock_conn):
-    bad = [
-        {
-            "recorded_at": "2026-05-09T14:00:00Z",
-            "lat": 95.0,  # > 90
-            "lon": -87.8,
-        }
-    ]
+    bad = [{"recorded_at": "2026-05-09T14:00:00Z", "lat": 95.0, "lon": -87.8}]
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": bad})
     assert r.status_code == 422
 
 
 def test_post_accepts_missing_speed_and_heading(client, mock_conn):
-    """Desktop browsers sometimes don't populate speed/heading — server
-    should accept and store nulls."""
-    mock_conn.fetchrow.return_value = _race_owned()
-    points = [
-        {
-            "recorded_at": "2026-05-09T14:00:00Z",
-            "lat": 42.30,
-            "lon": -87.80,
-        }
-    ]
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+    points = [{"recorded_at": "2026-05-09T14:00:00Z", "lat": 42.30, "lon": -87.80}]
 
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
 
     assert r.status_code == 201
-    assert r.json() == {"inserted": 1}
+    assert r.json()["inserted"] == 1
     args = mock_conn.execute.await_args.args
     speeds, headings = args[5], args[6]
     assert speeds == [None]
     assert headings == [None]
 
 
-# ─── GET replay ──────────────────────────────────────────────────────────
+def test_post_emits_mark_pass_when_batch_rounds_a_mark(client, mock_conn):
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    mock_conn.fetchrow.return_value = _race_row(marks=[mark])
+
+    base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    points = [
+        {
+            "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
+            "lat": 42.30,
+            "lon": -87.80 - 0.0009 + i * 0.000225,
+            "speed_kts": 5.0,
+            "heading_deg": 90.0,
+        }
+        for i in range(9)
+    ]
+
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+
+    assert r.status_code == 201
+    body = r.json()
+    assert body["inserted"] == 9
+    assert len(body["new_mark_passes"]) == 1
+    assert body["new_mark_passes"][0]["mark_index"] == 0
+    assert body["mark_passes"] == body["new_mark_passes"]
+    assert mock_conn.execute.await_count == 2
+    update_call = mock_conn.execute.await_args_list[1].args
+    assert "UPDATE race_sessions" in update_call[0]
+    assert "mark_passes" in update_call[0]
+    persisted = json.loads(update_call[1])
+    assert len(persisted) == 1
+    assert persisted[0]["mark_index"] == 0
+
+
+def test_post_skips_update_when_no_new_passes(client, mock_conn):
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}],
+        mark_passes=[],
+    )
+    r = client.post(
+        f"/api/races/{uuid4()}/track", json={"points": _sample_points(3)}
+    )
+    assert r.status_code == 201
+    assert mock_conn.execute.await_count == 1
+
+
+def test_post_resumes_from_existing_passes(client, mock_conn):
+    marks = [
+        {"name": "A", "lat": 42.30, "lon": -87.80},
+        {"name": "B", "lat": 42.31, "lon": -87.80},
+    ]
+    existing = [
+        {
+            "mark_index": 0,
+            "ts": "2026-05-14T17:55:00+00:00",
+            "lat": 42.30,
+            "lon": -87.80,
+        }
+    ]
+    mock_conn.fetchrow.return_value = _race_row(marks=marks, mark_passes=existing)
+
+    base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    points = [
+        {
+            "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
+            "lat": 42.30,
+            "lon": -87.80 - 0.0009 + i * 0.000225,
+            "speed_kts": 5.0,
+            "heading_deg": 90.0,
+        }
+        for i in range(9)
+    ]
+
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+
+    assert r.status_code == 201
+    body = r.json()
+    assert body["new_mark_passes"] == []
+    assert len(body["mark_passes"]) == 1
+    assert body["mark_passes"][0]["mark_index"] == 0
+
+
+# --- GET replay --------------------------------------------------------
 
 
 def test_get_returns_chronological_track(client, mock_conn):
@@ -188,7 +265,7 @@ def test_get_returns_chronological_track(client, mock_conn):
         }
         for i in range(3)
     ]
-    mock_conn.fetchrow.return_value = _race_owned()
+    mock_conn.fetchrow.return_value = _owned()
     mock_conn.fetch.return_value = rows
 
     r = client.get(f"/api/races/{race_id}/track")
@@ -215,7 +292,7 @@ def test_get_404_when_race_not_owned(client, mock_conn):
 
 
 def test_get_returns_empty_list_for_unrecorded_race(client, mock_conn):
-    mock_conn.fetchrow.return_value = _race_owned()
+    mock_conn.fetchrow.return_value = _owned()
     mock_conn.fetch.return_value = []
 
     r = client.get(f"/api/races/{uuid4()}/track")

@@ -40,6 +40,7 @@ import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
 import { useFollowMode } from "../hooks/useFollowMode";
 import { useAutoStartRecorder } from "../hooks/useAutoStartRecorder";
+import { useAutoStopRecorder } from "../hooks/useAutoStopRecorder";
 import { useRouteFreshnessCheck } from "../hooks/useRouteFreshnessCheck";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
@@ -171,6 +172,20 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     enabled: activeRace?.auto_start_enabled !== false,
     recording: recorder.recording,
     start: recorder.start,
+  });
+
+  // Auto-stop once the boat finishes the course (last + second-to-last
+  // marks rounded, then 5min buffer). Re-uses the same `auto_start_enabled`
+  // flag for now — Session B's column gates the whole auto-record cycle;
+  // splitting it into a separate `auto_stop_enabled` is a future tweak if
+  // anyone wants to opt into one without the other.
+  const autoStop = useAutoStopRecorder({
+    raceId: activeRace?.id ?? null,
+    marks: activeRace?.marks ?? [],
+    points: recorder.points,
+    recording: recorder.recording,
+    enabled: activeRace?.auto_start_enabled !== false,
+    stop: recorder.stop,
   });
 
   // T-5 wind-drift check against the computed route's start-mark wind.
@@ -572,6 +587,7 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
           routing={routing}
           topOffset={raceOverlayTop}
           autoStart={autoStart}
+          autoStop={autoStop}
           freshness={freshness}
           onRecompute={routing.compute}
         />
@@ -621,6 +637,7 @@ function RaceOverlay({
   routing,
   topOffset,
   autoStart,
+  autoStop,
   freshness,
   onRecompute,
 }) {
@@ -694,6 +711,11 @@ function RaceOverlay({
             </button>
           </div>
         )}
+        {recording && autoStop?.armed && (
+          <div style={styles.armedHint}>
+            ● Course complete · auto-stop in {formatMmSs(autoStop.msUntilStop)}
+          </div>
+        )}
         {recording && queueLength > 0 && (
           <div style={styles.queueHint}>
             {queueLength} pt{queueLength === 1 ? "" : "s"} pending
@@ -753,6 +775,15 @@ function RaceOverlay({
 }
 
 // -- Helpers ---------------------------------------------------------
+
+/** "M:SS" countdown for the auto-stop badge. Null/<=0 → "0:00". */
+function formatMmSs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "0:00";
+  const total = Math.round(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
 
 function emptyLine() {
   return {
