@@ -1,10 +1,19 @@
 // useTrackRecorder — continuous GPS capture for an active race.
 //
 // Lifecycle: caller flips `recording` on by calling `start()`. The hook
-// then opens `navigator.geolocation.watchPosition`, accumulates points
-// in an in-memory buffer, and flushes to `POST /api/races/{id}/track`
-// every FLUSH_INTERVAL_MS or whenever the buffer reaches FLUSH_BATCH_SIZE,
-// whichever comes first.
+// asks the platform-adaptive geolocation adapter for a watcher
+// (`createWatcher` in lib/geolocation.js — web watchPosition in the
+// browser, Capacitor background-geolocation on Android), accumulates
+// normalised points in an in-memory buffer, and flushes to
+// `POST /api/races/{id}/track` every FLUSH_INTERVAL_MS or whenever the
+// buffer reaches FLUSH_BATCH_SIZE, whichever comes first.
+//
+// Background tracking: in the web/PWA build, the OS pauses
+// `watchPosition` when the tab is hidden or the screen locks — points
+// are lost during those windows. In the Android Capacitor build the
+// adapter switches to a foreground-service watcher that survives screen
+// lock. The hook itself is unaware of which path is active; all
+// platform branching lives in the adapter.
 //
 // Offline durability: every appended point is also persisted to a
 // per-race localStorage key. Points stay there until the server has
@@ -26,18 +35,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch } from "../api";
+import { createWatcher } from "../lib/geolocation";
 
 const FLUSH_INTERVAL_MS = 30_000;
 const FLUSH_BATCH_SIZE = 100;
-
-// Watch options. enableHighAccuracy=true asks the OS for GPS rather than
-// wifi/cell triangulation; on a phone in a cockpit this is what you
-// want. maximumAge=0 forces a fresh fix every time.
-const WATCH_OPTS = {
-  enableHighAccuracy: true,
-  timeout: 15_000,
-  maximumAge: 0,
-};
 
 const STORAGE_PREFIX = "sailline.trackQueue.";
 
@@ -85,8 +86,9 @@ export function useTrackRecorder(raceId) {
 
   // Refs hold the live values for callbacks that close over them. State
   // is just for re-render — refs are the source of truth.
-  const queueRef = useRef([]);     // unflushed points
-  const watchIdRef = useRef(null);
+  const queueRef = useRef([]);            // unflushed points
+  const watcherHandleRef = useRef(null);  // { stop } from the adapter, once resolved
+  const watcherPromiseRef = useRef(null); // Promise<handle> while setup is in flight
   const flushTimerRef = useRef(null);
   const flushingRef = useRef(false);
   const raceIdRef = useRef(raceId);
@@ -148,23 +150,11 @@ export function useTrackRecorder(raceId) {
     }
   }, []);
 
-  // ── Geolocation handler ───────────────────────────────────────────
+  // ── Position handler — receives an already-normalised point ───────
   const onPosition = useCallback(
-    (pos) => {
+    (point) => {
       const id = raceIdRef.current;
       if (!id) return;
-      const point = {
-        recorded_at: new Date(pos.timestamp).toISOString(),
-        lat: pos.coords.latitude,
-        lon: pos.coords.longitude,
-        // Browser API: speed in m/s, heading in degrees true (or null).
-        speed_kts: Number.isFinite(pos.coords.speed)
-          ? pos.coords.speed * 1.943844
-          : null,
-        heading_deg: Number.isFinite(pos.coords.heading)
-          ? pos.coords.heading
-          : null,
-      };
 
       queueRef.current.push(point);
       writeQueue(id, queueRef.current);
@@ -181,7 +171,7 @@ export function useTrackRecorder(raceId) {
   );
 
   const onPositionError = useCallback((err) => {
-    setError(err.message || `geolocation error ${err.code}`);
+    setError(err?.message || `geolocation error ${err?.code ?? ""}`);
   }, []);
 
   // ── Start / stop ──────────────────────────────────────────────────
@@ -190,27 +180,50 @@ export function useTrackRecorder(raceId) {
       setError("No active race — set one before recording.");
       return;
     }
-    if (!navigator.geolocation) {
-      setError("Geolocation is not supported on this device.");
-      return;
-    }
-    if (watchIdRef.current !== null) return;
+    // Idempotent — guard against double-start while a watcher is being
+    // set up or is already live.
+    if (watcherHandleRef.current || watcherPromiseRef.current) return;
 
     setError(null);
     setRecording(true);
 
-    watchIdRef.current = navigator.geolocation.watchPosition(
+    // Kick off the adapter. We store the promise so stop() can wait for
+    // setup to finish if the user races start→stop too quickly.
+    watcherPromiseRef.current = createWatcher({
       onPosition,
-      onPositionError,
-      WATCH_OPTS,
-    );
+      onError: onPositionError,
+    })
+      .then((handle) => {
+        watcherHandleRef.current = handle;
+        watcherPromiseRef.current = null;
+        return handle;
+      })
+      .catch((e) => {
+        onPositionError(e);
+        watcherPromiseRef.current = null;
+      });
+
     flushTimerRef.current = setInterval(flushNow, FLUSH_INTERVAL_MS);
   }, [onPosition, onPositionError, flushNow]);
 
   const stop = useCallback(async () => {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
+    // Wait for any in-flight watcher setup, then tear it down. This
+    // matters on the native path where addWatcher is async — calling
+    // stop() before it resolves would otherwise orphan the watcher.
+    if (watcherPromiseRef.current) {
+      try {
+        await watcherPromiseRef.current;
+      } catch {
+        /* setup already errored — onPositionError logged it */
+      }
+    }
+    if (watcherHandleRef.current) {
+      try {
+        await watcherHandleRef.current.stop();
+      } catch {
+        /* best effort */
+      }
+      watcherHandleRef.current = null;
     }
     if (flushTimerRef.current) {
       clearInterval(flushTimerRef.current);
@@ -243,12 +256,14 @@ export function useTrackRecorder(raceId) {
     };
   }, [recording, flushNow]);
 
-  // ── Cleanup on unmount / raceId change ────────────────────────────
+  // ── Cleanup on unmount ───────────────────────────────────────────
   useEffect(() => {
     return () => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
+      // Fire-and-forget; unmount can't await. The adapter's stop() is
+      // best-effort anyway.
+      if (watcherHandleRef.current) {
+        watcherHandleRef.current.stop().catch(() => {});
+        watcherHandleRef.current = null;
       }
       if (flushTimerRef.current) {
         clearInterval(flushTimerRef.current);

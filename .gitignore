@@ -43,3 +43,24 @@ backend/ingest_output/
 # === OS ===
 .DS_Store
 Thumbs.db
+
+# === Capacitor (Android native shell) ===
+# The android/ directory itself is intentionally committed (it is the
+# native project). Below are per-machine and build artefacts that must
+# not be checked in.
+frontend/android/.gradle/
+frontend/android/.idea/
+frontend/android/local.properties
+frontend/android/build/
+frontend/android/app/build/
+frontend/android/captures/
+frontend/android/app/release/
+# Release keystores must never be committed. Debug keystore is auto-
+# generated locally; ignore both to be safe.
+frontend/android/**/*.keystore
+frontend/android/**/*.jks
+# Capacitor sync artefacts copied from frontend/dist/ — regenerated on
+# every `npx cap sync`, no need to track.
+frontend/android/app/src/main/assets/public/
+frontend/android/app/src/main/assets/capacitor.config.json
+frontend/android/app/src/main/assets/capacitor.plugins.json
