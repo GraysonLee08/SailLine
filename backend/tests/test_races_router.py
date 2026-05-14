@@ -75,6 +75,7 @@ def _make_row(**overrides):
         "start_at": None,
         "started_at": None,
         "ended_at": None,
+        "auto_start_enabled": True,
         "created_at": now,
         "updated_at": now,
     }
