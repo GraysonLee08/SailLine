@@ -7,7 +7,9 @@
 
 import { useRaces } from "./hooks/useRaces";
 
-export default function RacesListView({ onBack, onOpen, onEdit, onCreate }) {
+export default function RacesListView({
+  onBack, onOpen, onEdit, onCreate, onViewStats,
+}) {
   const { races, error, remove } = useRaces();
 
   return (
@@ -48,6 +50,15 @@ export default function RacesListView({ onBack, onOpen, onEdit, onCreate }) {
                 race={r}
                 onOpen={() => onOpen(r)}
                 onEdit={() => onEdit(r.id)}
+                onViewStats={
+                  // Show the Stats button when the race has at least
+                  // one mark rounding recorded — i.e. it was raced.
+                  // Races that were planned but never tracked don't
+                  // get the entry (nothing to show).
+                  (r.mark_passes && r.mark_passes.length > 0) || r.stats_available
+                    ? () => onViewStats?.(r.id)
+                    : null
+                }
                 onDelete={async () => {
                   if (!confirm(`Delete "${r.name}"? This can't be undone.`)) return;
                   try {
@@ -65,7 +76,7 @@ export default function RacesListView({ onBack, onOpen, onEdit, onCreate }) {
   );
 }
 
-function RaceCard({ race, onOpen, onEdit, onDelete }) {
+function RaceCard({ race, onOpen, onEdit, onViewStats, onDelete }) {
   // Card body click = the primary action (load on map). Edit and Delete
   // are explicit buttons in the action cluster on the right. Keyboard
   // users get the same primary action via Enter on the focused row.
@@ -95,6 +106,9 @@ function RaceCard({ race, onOpen, onEdit, onDelete }) {
       </div>
       <div style={styles.cardActions}>
         <button onClick={onOpen} style={styles.openBtn}>Open on map</button>
+        {onViewStats ? (
+          <button onClick={onViewStats} style={styles.editBtn}>Stats</button>
+        ) : null}
         <button onClick={onEdit} style={styles.editBtn}>Edit</button>
         <button onClick={onDelete} style={styles.deleteBtn} aria-label="Delete race">
           Delete

@@ -56,5 +56,5 @@ websockets==13.1
 
 
 
-# anthropic                         # Claude API (week 8)
+anthropic==0.39.0                 # Post-race AI summary (Session D1)
 # stripe                            # Payments (week 7)

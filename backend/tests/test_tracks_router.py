@@ -249,6 +249,92 @@ def test_post_resumes_from_existing_passes(client, mock_conn):
     assert body["mark_passes"][0]["mark_index"] == 0
 
 
+# --- Postprocess trigger ----------------------------------------------
+
+
+def test_post_triggers_postprocess_when_final_mark_rounded(
+    client, mock_conn, monkeypatch
+):
+    """A batch that rounds the LAST mark should kick off the job."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    fake_trigger = _AsyncMock()
+    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+
+    # Single-mark course with no prior passes — this batch should
+    # round it and trip the final-mark gate.
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    mock_conn.fetchrow.return_value = _race_row(marks=[mark])
+
+    base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    points = [
+        {
+            "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
+            "lat": 42.30,
+            "lon": -87.80 - 0.0009 + i * 0.000225,
+            "speed_kts": 5.0,
+            "heading_deg": 90.0,
+        }
+        for i in range(9)
+    ]
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    assert fake_trigger.await_count == 1
+
+
+def test_post_does_not_trigger_when_intermediate_mark(
+    client, mock_conn, monkeypatch
+):
+    """A batch that rounds an EARLIER-but-not-final mark must not
+    fire the trigger — beer-can layouts where start ~= finish would
+    repeatedly trigger if we got this wrong."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    fake_trigger = _AsyncMock()
+    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+
+    # Two-mark course — boat rounds mark 0 in this batch, mark 1 is
+    # nowhere near, so passes after = 1 < 2 = total marks.
+    marks = [
+        {"name": "A", "lat": 42.30, "lon": -87.80},
+        {"name": "B", "lat": 42.40, "lon": -87.80},
+    ]
+    mock_conn.fetchrow.return_value = _race_row(marks=marks)
+
+    base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    points = [
+        {
+            "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
+            "lat": 42.30,
+            "lon": -87.80 - 0.0009 + i * 0.000225,
+            "speed_kts": 5.0,
+            "heading_deg": 90.0,
+        }
+        for i in range(9)
+    ]
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    fake_trigger.assert_not_awaited()
+
+
+def test_post_does_not_trigger_when_no_new_passes(
+    client, mock_conn, monkeypatch
+):
+    """No new roundings in the batch — even on a fully-completed race
+    a re-flushed batch shouldn't re-fire the job."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    fake_trigger = _AsyncMock()
+    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+
+    # Far-away mark; no points round it.
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}],
+    )
+    r = client.post(
+        f"/api/races/{uuid4()}/track", json={"points": _sample_points(3)}
+    )
+    assert r.status_code == 201
+    fake_trigger.assert_not_awaited()
+
+
 # --- GET replay --------------------------------------------------------
 
 

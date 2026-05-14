@@ -35,6 +35,7 @@ import { MapView } from "./components/MapView.jsx";
 
 const RacesListView = lazy(() => import("./RacesListView.jsx"));
 const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
+const RaceStatsView = lazy(() => import("./RaceStatsView.jsx"));
 const SensorDebugView = lazy(() => import("./SensorDebugView.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
@@ -84,6 +85,7 @@ export default function AppView({ user }) {
   // view shape: { kind: "map" }
   //           | { kind: "races" }
   //           | { kind: "editor", raceId: string | null, returnTo: "map" | "races" }
+  //           | { kind: "stats", raceId: string, returnTo: "map" | "races" }
   const [view, setView] = useState({ kind: "map" });
 
   // ── Profile ──────────────────────────────────────────────────────
@@ -197,6 +199,9 @@ export default function AppView({ user }) {
       <div data-intro="barbs" style={{ ...styles.layer, zIndex: 0 }}>
         <MapView
           activeRace={activeRace}
+          onRaceCompleted={(raceId) => {
+            if (raceId) setView({ kind: "stats", raceId, returnTo: "map" });
+          }}
           onEditActive={() =>
             activeRace &&
             setView({
@@ -224,6 +229,9 @@ export default function AppView({ user }) {
               onEdit={(id) =>
                 setView({ kind: "editor", raceId: id, returnTo: "races" })
               }
+              onViewStats={(id) =>
+                setView({ kind: "stats", raceId: id, returnTo: "races" })
+              }
             />
           </Suspense>
         </div>
@@ -241,6 +249,18 @@ export default function AppView({ user }) {
                 setActive(race);
                 setView({ kind: "map" });
               }}
+            />
+          </Suspense>
+        </div>
+      )}
+
+      {view.kind === "stats" && (
+        <div style={{ ...styles.layer, zIndex: 2 }}>
+          <Suspense fallback={<ViewLoading />}>
+            <RaceStatsView
+              raceId={view.raceId}
+              tier={profile?.tier ?? "free"}
+              onBack={() => setView({ kind: view.returnTo || "races" })}
             />
           </Suspense>
         </div>

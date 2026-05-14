@@ -38,6 +38,7 @@ export function useAutoStopRecorder({
   recording,
   stop,
   enabled = true,
+  onFired = null,
 }) {
   // Recompute mark passes whenever points change. computePasses is
   // pure and cheap: O(points * marks). At 1 Hz over a 4-hour race
@@ -84,6 +85,10 @@ export function useAutoStopRecorder({
   const firedKeyRef = useRef(null);
   const stopRef = useRef(stop);
   stopRef.current = stop;
+  // Same ref pattern so callers don't have to memoise their onFired
+  // handler — we always call the latest one.
+  const onFiredRef = useRef(onFired);
+  onFiredRef.current = onFired;
 
   const [armed, setArmed] = useState(false);
   const [msUntilStop, setMsUntilStop] = useState(null);
@@ -109,6 +114,14 @@ export function useAutoStopRecorder({
         stopRef.current?.();
       } catch {
         /* recorder may have been torn down — ignore */
+      }
+      // Optional follow-up — used by AppView to navigate to
+      // RaceStatsView once recording has cut off. Failure here is
+      // never fatal; the stop above is the actual side effect.
+      try {
+        onFiredRef.current?.(raceId);
+      } catch {
+        /* navigation handler failed — log nothing, race is still stopped */
       }
     };
 

@@ -129,7 +129,12 @@ function makeFeature(lon, lat, u, v) {
 
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 
-export function MapView({ activeRace, onEditActive, onClearActive }) {
+export function MapView({
+  activeRace,
+  onEditActive,
+  onClearActive,
+  onRaceCompleted = null,
+}) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const courseMarkersRef = useRef([]);
@@ -186,6 +191,12 @@ export function MapView({ activeRace, onEditActive, onClearActive }) {
     recording: recorder.recording,
     enabled: activeRace?.auto_start_enabled !== false,
     stop: recorder.stop,
+    // Surface the auto-stop event so AppView can navigate to the
+    // stats view as soon as recording cuts off. The Cloud Run Job
+    // is already in flight by this point (final-mark trigger in
+    // tracks.py); the stats endpoint surfaces partial data while
+    // the AI summary populates.
+    onFired: onRaceCompleted,
   });
 
   // T-5 wind-drift check against the computed route's start-mark wind.

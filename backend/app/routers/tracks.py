@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
+from app.services.job_trigger import trigger_race_postprocess
 from app.services.mark_rounding import (
     Mark as DetectorMark,
     MarkRoundingDetector,
@@ -262,6 +263,27 @@ async def append_track(
                 race_id,
                 user["uid"],
             )
+
+    # Final-mark trigger: when this batch caused mark_passes to reach
+    # the full course length, kick off the postprocess job (stats + AI
+    # summary + wind snapshot). The trigger itself is a thin
+    # fire-and-forget HTTP POST to Cloud Run — it never raises and
+    # returns as soon as the job is accepted, so awaiting it is fine
+    # (no second-long blocking). The job runs out-of-band and is
+    # idempotent (skips when ai_summary is already current), so
+    # multiple flushes that all cross the final-mark boundary are
+    # safe.
+    total_marks = len(race.get("marks") or [])
+    if (
+        new_passes
+        and total_marks > 0
+        and len(all_passes) == total_marks
+    ):
+        log.info(
+            "race %s: final mark rounded, kicking off postprocess job",
+            race_id,
+        )
+        await trigger_race_postprocess(race_id)
 
     return TrackBatchAccepted(
         inserted=n,

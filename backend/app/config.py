@@ -38,6 +38,25 @@ class Settings(BaseSettings):
     # === Cloud Storage ===
     gcs_weather_bucket: str | None = Field(default=None, alias="GCS_WEATHER_BUCKET")
 
+    # === Anthropic (post-race AI summary, Session D1) ===
+    # Nullable so the app boots without the key — the summary service
+    # returns None on missing/blank, the stats view degrades gracefully
+    # to "summary unavailable" rather than 500ing.
+    anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(
+        default="claude-haiku-4-5-20251001", alias="ANTHROPIC_MODEL"
+    )
+
+    # === Cloud Run Job: race-postprocess (Session D1) ===
+    # Fully-qualified job name used by ``app/services/job_trigger.py``
+    # to fire-and-forget the post-race postprocess. Format:
+    #   projects/{project}/locations/{region}/jobs/{job}
+    # Nullable so dev/local runs no-op the trigger silently (jobs only
+    # exist in deployed environments).
+    race_postprocess_job: str | None = Field(
+        default=None, alias="RACE_POSTPROCESS_JOB"
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:
