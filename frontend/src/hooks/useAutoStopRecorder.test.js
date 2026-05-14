@@ -119,12 +119,14 @@ describe("useAutoStopRecorder", () => {
     const bOff = offset(REF_LAT, REF_LON, 0, 500);
     const b = { lat: bOff.lat, lon: bOff.lon };
 
-    // Anchor "now" exactly at the moment the final pass would close.
-    // Build the track so the final point's ts equals current Date.now().
+    // Anchor "now" at the EXIT point of the final rounding, not the
+    // last point of the track. With spanM=200, n=21, step=10m, the exit
+    // from a 50m radius around closestM=5 happens at point index 15
+    // (d_along=50m, dist=sqrt(50^2 + 5^2)=50.25m, just outside). So the
+    // pass timestamp is trackB[15].ts. Setting t0 = now/1000 - 15 puts
+    // that exit instant exactly at Date.now().
     const now = Date.now();
-    // Last point of the second leg sits ~10s after t0 across 21 steps
-    // (t0 + 20s). Set t0 so that (t0 + 20)*1000 === now.
-    const t0_b = now / 1000 - 20;
+    const t0_b = now / 1000 - 15;
     const t0_a = t0_b - 60;
     const trackA = lineThrough(a, 5, { t0: t0_a });
     const trackB = lineThrough(b, 5, { t0: t0_b });
