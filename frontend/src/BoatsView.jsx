@@ -103,12 +103,23 @@ export default function BoatsView({ onBack, onCreate, onEdit }) {
 
 function BoatCard({ boat, isDefault, onSetDefault, onEdit, onDelete }) {
   const rating = boat.hcp ?? boat.dhcp ?? boat.nshcp ?? boat.dnshcp ?? null;
+  const role = boat.viewer_role || "owner";
+  const isOwner = role === "owner";
   return (
     <li style={styles.card}>
       <div style={styles.cardMain}>
         <div style={styles.cardHeadRow}>
           <h3 style={styles.cardName}>{boat.name}</h3>
           {isDefault && <span style={styles.defaultBadge}>Default</span>}
+          {!isOwner && (
+            <span style={{
+              ...styles.defaultBadge,
+              color: role === "crew" ? "#1a73e8" : "#6a6a6f",
+              borderColor: role === "crew" ? "#1a73e8" : "#bcbcc2",
+            }}>
+              {role}
+            </span>
+          )}
         </div>
         <div style={styles.cardMeta}>
           {boat.sail_number && (
@@ -146,11 +157,13 @@ function BoatCard({ boat, isDefault, onSetDefault, onEdit, onDelete }) {
           <span>Default</span>
         </label>
         <button onClick={onEdit} style={styles.editBtn}>
-          Edit
+          {isOwner ? "Edit" : "View"}
         </button>
-        <button onClick={onDelete} style={styles.deleteBtn} aria-label="Delete boat">
-          Delete
-        </button>
+        {isOwner && (
+          <button onClick={onDelete} style={styles.deleteBtn} aria-label="Delete boat">
+            Delete
+          </button>
+        )}
       </div>
     </li>
   );

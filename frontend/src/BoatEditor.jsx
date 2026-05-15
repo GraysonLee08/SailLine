@@ -58,12 +58,14 @@ export default function BoatEditor({ boatId, onClose, onSaved, currentUid }) {
   const [parsedNotice, setParsedNotice] = useState(null);
   const fileInput = useRef(null);
 
-  // D3: only the boat owner sees the Crew section. Membership is
-  // determined by comparing the current user's uid to the boat's
-  // owner_id (kept on the row) — we don't expose /boat_crew to read
-  // role-from-list for the caller themselves; reading owner_id is
-  // sufficient and avoids a second round trip.
-  const isOwner = boatId && currentUid && form.owner_id === currentUid;
+  // D3: only the boat owner can edit. Non-owners (crew / viewer)
+  // see the same fields read-only. Backend gates writes too; this is
+  // purely UX. We use the boat's ``viewer_role`` field (returned by
+  // GET /api/boats/{id}) to decide. New boats (no boatId yet) are
+  // always editable.
+  const isOwner = !boatId || (form.viewer_role
+    ? form.viewer_role === "owner"
+    : currentUid && form.owner_id === currentUid);
 
   // Load existing boat if editing.
   useEffect(() => {
@@ -149,56 +151,79 @@ export default function BoatEditor({ boatId, onClose, onSaved, currentUid }) {
     <div style={styles.shell}>
       <header style={styles.header}>
         <button onClick={onClose} style={styles.backBtn} aria-label="Cancel">
-          ← Cancel
+          ← {isOwner ? "Cancel" : "Back"}
         </button>
-        <h1 style={styles.title}>{boatId ? "Edit boat" : "New boat"}</h1>
-        <button
-          onClick={handleSave}
-          style={styles.saveBtn}
-          disabled={loading}
-        >
-          {loading ? "Saving…" : "Save"}
-        </button>
+        <h1 style={styles.title}>
+          {boatId ? (isOwner ? "Edit boat" : "View boat") : "New boat"}
+        </h1>
+        {isOwner ? (
+          <button
+            onClick={handleSave}
+            style={styles.saveBtn}
+            disabled={loading}
+          >
+            {loading ? "Saving…" : "Save"}
+          </button>
+        ) : (
+          <span style={{
+            ...styles.saveBtn,
+            background: "transparent",
+            color: "#6a6a6f",
+            border: "1px solid #d8d8de",
+            cursor: "default",
+          }}>
+            Read-only
+          </span>
+        )}
       </header>
 
       <main style={styles.body}>
         {error && <div style={styles.error}>{error}</div>}
         {parsedNotice && <div style={styles.notice}>{parsedNotice}</div>}
 
-        <section style={styles.section}>
-          <div style={styles.sectionTitle}>Certificate (MWPHRF PDF)</div>
-          <div style={styles.row}>
-            <input
-              ref={fileInput}
-              type="file"
-              accept="application/pdf"
-              style={styles.fileInput}
-              onChange={(e) => handleCertUpload(e.target.files?.[0])}
-              disabled={!boatId || loading}
-            />
-            <div style={styles.help}>
-              {boatId
-                ? "Upload your MWPHRF cert; we'll pre-fill the fields below."
-                : "Save the boat first to enable cert upload."}
+        {isOwner && (
+          <section style={styles.section}>
+            <div style={styles.sectionTitle}>Certificate (MWPHRF PDF)</div>
+            <div style={styles.row}>
+              <input
+                ref={fileInput}
+                type="file"
+                accept="application/pdf"
+                style={styles.fileInput}
+                onChange={(e) => handleCertUpload(e.target.files?.[0])}
+                disabled={!boatId || loading}
+              />
+              <div style={styles.help}>
+                {boatId
+                  ? "Upload your MWPHRF cert; we'll pre-fill the fields below."
+                  : "Save the boat first to enable cert upload."}
+              </div>
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
         <FormSection title="Identity" form={form} setField={setField}
-                     fields={TEXT_FIELDS.slice(0, 4)} kind="text" />
+                     fields={TEXT_FIELDS.slice(0, 4)} kind="text"
+                     disabled={!isOwner} />
         <FormSection title="Handicaps (seconds per nautical mile)"
                      form={form} setField={setField}
-                     fields={INT_FIELDS.slice(2)} kind="int" />
+                     fields={INT_FIELDS.slice(2)} kind="int"
+                     disabled={!isOwner} />
         <FormSection title="Hull" form={form} setField={setField}
-                     fields={FLOAT_FIELDS.slice(0, 5)} kind="float" />
+                     fields={FLOAT_FIELDS.slice(0, 5)} kind="float"
+                     disabled={!isOwner} />
         <FormSection title="Drive train" form={form} setField={setField}
-                     fields={TEXT_FIELDS.slice(4)} kind="text" />
+                     fields={TEXT_FIELDS.slice(4)} kind="text"
+                     disabled={!isOwner} />
         <FormSection title="Rig" form={form} setField={setField}
-                     fields={FLOAT_FIELDS.slice(5)} kind="float" />
+                     fields={FLOAT_FIELDS.slice(5)} kind="float"
+                     disabled={!isOwner} />
         <FormSection title="Metadata" form={form} setField={setField}
-                     fields={INT_FIELDS.slice(0, 2)} kind="int" />
+                     fields={INT_FIELDS.slice(0, 2)} kind="int"
+                     disabled={!isOwner} />
         <FormSection title="Cert dates" form={form} setField={setField}
-                     fields={DATE_FIELDS} kind="date" />
+                     fields={DATE_FIELDS} kind="date"
+                     disabled={!isOwner} />
 
         {isOwner && <CrewSection boatId={boatId} ownerUid={currentUid} />}
       </main>
@@ -635,7 +660,7 @@ const crewStyles = {
 };
 
 
-function FormSection({ title, fields, form, setField, kind }) {
+function FormSection({ title, fields, form, setField, kind, disabled = false }) {
   return (
     <section style={styles.section}>
       <div style={styles.sectionTitle}>{title}</div>
@@ -648,7 +673,13 @@ function FormSection({ title, fields, form, setField, kind }) {
               step={kind === "float" ? "any" : undefined}
               value={form[k] ?? ""}
               onChange={(e) => setField(k, e.target.value)}
-              style={styles.input}
+              disabled={disabled}
+              readOnly={disabled}
+              style={{
+                ...styles.input,
+                background: disabled ? "#f8f8f7" : "white",
+                cursor: disabled ? "default" : "text",
+              }}
             />
           </label>
         ))}

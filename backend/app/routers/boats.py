@@ -92,6 +92,9 @@ class BoatOut(BoatBase):
     name: str
     created_at: str
     updated_at: str
+    # D3: caller's role on this boat. Frontend uses this to gate
+    # edit / delete UI without a second round trip to /crew.
+    viewer_role: Optional[str] = None  # "owner" | "crew" | "viewer" | None
 
 
 class ParsedCertOut(BaseModel):
@@ -130,17 +133,36 @@ def _row_to_out(row: asyncpg.Record) -> BoatOut:
     ):
         if d.get(k) is not None:
             d[k] = float(d[k])
+    # viewer_role is added by the list/get queries via a JOIN; if it's
+    # not present (e.g. INSERT/UPDATE RETURNING), default to "owner"
+    # because those paths are owner-only by definition.
+    if "viewer_role" not in d or d.get("viewer_role") is None:
+        d["viewer_role"] = "owner"
     return BoatOut(**d)
 
 
 async def _load_readable(
     conn: asyncpg.Connection, boat_id: UUID, uid: str,
 ) -> asyncpg.Record:
-    """404 unless caller can READ the boat (creator OR any crew role)."""
+    """404 unless caller can READ the boat (creator OR any crew role).
+
+    Returns row plus a synthesised ``viewer_role`` column so the
+    frontend knows whether to render edit affordances.
+    """
     pred = boat_read_predicate(boat_alias="b", uid_placeholder="$2")
     cols_b = ", ".join(f"b.{c.strip()}" for c in _BOAT_COLS.split(","))
     row = await conn.fetchrow(
-        f"SELECT {cols_b} FROM boats b WHERE b.id = $1 AND {pred}",
+        f"""
+        SELECT {cols_b},
+            CASE
+                WHEN b.owner_id = $2 THEN 'owner'
+                ELSE (
+                    SELECT role FROM boat_crew bc
+                    WHERE bc.boat_id = b.id AND bc.user_id = $2
+                )
+            END AS viewer_role
+        FROM boats b WHERE b.id = $1 AND {pred}
+        """,
         boat_id, uid,
     )
     if row is None:
@@ -172,13 +194,29 @@ async def list_boats(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
-    """List boats the caller can see: owned + any membership."""
+    """List boats the caller can see: owned + any membership.
+
+    Each row carries the caller's role (``viewer_role``) computed
+    inline: 'owner' if the caller owns the boat, else the role from
+    their boat_crew row. The frontend uses this to gate Edit/Delete
+    affordances without a second /crew round trip.
+    """
     pred = boat_read_predicate(boat_alias="b", uid_placeholder="$1")
     cols_b = ", ".join(f"b.{c.strip()}" for c in _BOAT_COLS.split(","))
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT {cols_b} FROM boats b WHERE {pred} "
-            "ORDER BY b.created_at DESC",
+            f"""
+            SELECT {cols_b},
+                CASE
+                    WHEN b.owner_id = $1 THEN 'owner'
+                    ELSE (
+                        SELECT role FROM boat_crew bc
+                        WHERE bc.boat_id = b.id AND bc.user_id = $1
+                    )
+                END AS viewer_role
+            FROM boats b WHERE {pred}
+            ORDER BY b.created_at DESC
+            """,
             user["uid"],
         )
     return [_row_to_out(r) for r in rows]
