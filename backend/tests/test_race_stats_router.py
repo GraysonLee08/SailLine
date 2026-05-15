@@ -231,14 +231,17 @@ def test_get_wind_meta_none_when_snapshot_absent(free_client, mock_conn):
     assert body["wind"] is None
 
 
-def test_get_includes_corrected_time_when_boat_has_rating(free_client, mock_conn):
+def test_get_includes_corrected_time_when_boat_has_rating(pro_client, mock_conn):
+    # D3: corrected time is pro-tier only, so this happy-path test
+    # now uses pro_client. The free-tier behaviour is exercised in
+    # test_get_free_caller_does_not_see_corrected_time below.
     boat = {"name": "Gaucho", "hcp": 75, "dhcp": 78, "mwphrf_region": 5}
     _setup_fetches(
         mock_conn,
         _race_row(boat=boat, mode="inshore", uses_spinnaker=True),
         _track_rows(60),
     )
-    r = free_client.get(f"/api/races/{uuid4()}/stats")
+    r = pro_client.get(f"/api/races/{uuid4()}/stats")
     body = r.json()
     assert body["boat"] is not None
     assert body["boat"]["hcp"] == 75
@@ -254,6 +257,41 @@ def test_get_omits_boat_when_race_has_no_boat(free_client, mock_conn):
     body = r.json()
     assert body["boat"] is None
     assert body["stats"]["corrected_time_s"] is None
+
+
+# ─── D3 pro-tier gating ───────────────────────────────────────────────
+
+
+def test_get_free_caller_does_not_see_corrected_time(free_client, mock_conn):
+    boat = {"name": "Gaucho", "hcp": 75, "dhcp": 78}
+    _setup_fetches(
+        mock_conn,
+        _race_row(boat=boat, mode="inshore", uses_spinnaker=True),
+        _track_rows(60),
+    )
+    r = free_client.get(f"/api/races/{uuid4()}/stats")
+    body = r.json()
+    # Boat is still in response (free can see boat identity) but
+    # ratings are stripped and corrected time is None.
+    assert body["boat"] is not None
+    assert body["boat"]["hcp"] is None
+    assert body["boat"]["dhcp"] is None
+    assert body["stats"]["corrected_time_s"] is None
+    assert body["stats"]["corrected_using"] is None
+
+
+def test_get_pro_caller_sees_corrected_time(pro_client, mock_conn):
+    boat = {"name": "Gaucho", "hcp": 75, "dhcp": 78}
+    _setup_fetches(
+        mock_conn,
+        _race_row(boat=boat, mode="inshore", uses_spinnaker=True),
+        _track_rows(60),
+    )
+    r = pro_client.get(f"/api/races/{uuid4()}/stats")
+    body = r.json()
+    assert body["boat"]["hcp"] == 75
+    assert body["stats"]["corrected_using"] == "hcp"
+    assert body["stats"]["rating_seconds_per_mile"] == 75
 
 
 # ─── POST /regenerate ────────────────────────────────────────────────

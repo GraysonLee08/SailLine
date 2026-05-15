@@ -273,11 +273,16 @@ def _currents_cache_tag(currents: Optional[CurrentForecast]) -> str:
 async def _assert_race_owned(
     conn: asyncpg.Connection, race_id: UUID, uid: str,
 ) -> dict:
+    """D3: route compute is a WRITE op (owner + crew). Viewer can
+    READ the route the owner already computed via the SSE stream;
+    they can't kick off a fresh compute."""
+    from app.auth_helpers import race_write_predicate
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
-        """
-        SELECT id, marks, boat_class, start_at
-        FROM race_sessions
-        WHERE id = $1 AND user_id = $2
+        f"""
+        SELECT r.id, r.marks, r.boat_class, r.start_at
+        FROM race_sessions r
+        WHERE r.id = $1 AND {pred}
         """,
         race_id, uid,
     )
@@ -337,7 +342,16 @@ async def compute_route(
         (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat(),
     )
 
-    spec = spec_for_class(race["boat_class"])
+    # Pro-tier gating (D3): free callers route with the GENERIC polar
+    # regardless of which boat_class the race carries. Pro + Hardware
+    # tiers get the class-specific polar.
+    requested_class = race["boat_class"]
+    effective_class = (
+        requested_class
+        if user.get("tier") in ("pro", "hardware")
+        else "GENERIC"
+    )
+    spec = spec_for_class(effective_class)
     polar_path = f"app/services/polars/{spec.polar_csv}"
     polar = load_polar(polar_path)
     min_depth_m = spec.draft_m * payload.safety_factor

@@ -61,8 +61,19 @@ const COORD_FORMAT_KEY = "sailline.coordFormat";
 const isPlaced = (m) =>
   Number.isFinite(m?.lat) && Number.isFinite(m?.lon);
 
-export default function RaceEditor({ raceId, onClose, onSaved }) {
+export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   const isNew = !raceId;
+
+  // D3: when editing an existing race, the caller might be a crew or
+  // viewer rather than the owner. We only know "creator" cheaply
+  // (race.user_id from the API). Crew vs viewer requires a /crew
+  // fetch we'd rather avoid for every editor load — so we render in
+  // read-only mode when the caller isn't the creator, and trust the
+  // backend's write predicate to enforce the real check. Crew who
+  // try to save will get a 404 from the server; we surface that as a
+  // friendly error in the existing error handling below.
+  const [raceUserId, setRaceUserId] = useState(null);
+  const isCreator = isNew || (raceUserId && raceUserId === currentUid);
 
   const [name, setName] = useState("");
   const [mode, setMode] = useState("inshore");
@@ -132,6 +143,7 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         setAutoStartEnabled(race.auto_start_enabled !== false);
         setBoatId(race.boat_id ?? null);
         setUsesSpinnaker(race.uses_spinnaker !== false);
+        setRaceUserId(race.user_id ?? null);
         const parts = isoToLocalParts(race.start_at);
         setStartDate(parts.date);
         setStartTime(parts.time);
@@ -482,6 +494,20 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
 
         <aside style={styles.sidebar}>
           {error && <div style={styles.error}>{error}</div>}
+          {!isCreator && (
+            <div style={{
+              padding: "10px 12px",
+              background: "#eef4fd",
+              border: "1px solid #bcd6f7",
+              color: "#1a4d8f",
+              borderRadius: 8,
+              fontSize: 12,
+              margin: "0 16px 12px",
+            }}>
+              You're not the creator of this race. Saves will be rejected
+              by the server. View-only.
+            </div>
+          )}
 
           <div style={styles.scrollArea}>
             <Section label="Name">

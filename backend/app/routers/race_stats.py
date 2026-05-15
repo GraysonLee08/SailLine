@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from app import db, redis_client
 from app.auth import get_current_user, require_pro
+from app.auth_helpers import race_owner_predicate, race_read_predicate
 from app.services.job_trigger import trigger_race_postprocess
 from app.services.race_stats import (
     compute_stats,
@@ -157,14 +158,15 @@ class RegenerateAccepted(BaseModel):
 async def _load_race_row(
     conn: asyncpg.Connection, race_id: UUID, uid: str,
 ) -> dict:
-    """Auth + load. 404 on missing-or-not-owned (we don't leak existence).
+    """Auth + load. 404 on missing-or-no-access (we don't leak existence).
 
-    LEFT JOINs the boat so the stats endpoint can compute corrected
-    time and surface the boat summary without a second round trip.
-    Boat columns come back NULL when the race has no boat_id set.
+    Read access: caller created the race OR is a member of the race's
+    boat at ANY role (including viewer). LEFT JOIN the boats table so
+    corrected time + boat summary come back in the same round trip.
     """
+    pred = race_read_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
-        """
+        f"""
         SELECT
             r.id, r.name, r.boat_class, r.start_at, r.marks,
             r.mark_passes, r.ai_summary, r.wind_snapshot,
@@ -179,7 +181,7 @@ async def _load_race_row(
             b.dnshcp       AS boat_dnshcp
         FROM race_sessions r
         LEFT JOIN boats b ON b.id = r.boat_id
-        WHERE r.id = $1 AND r.user_id = $2
+        WHERE r.id = $1 AND {pred}
         """,
         race_id, uid,
     )
@@ -208,11 +210,17 @@ async def _load_track_rows(
     return [dict(r) for r in rows]
 
 
-def _cache_key(race_id: UUID, point_count: int) -> str:
-    return f"race_stats:{race_id}:{point_count}:v{_CACHE_VERSION}"
+def _cache_key(race_id: UUID, point_count: int, tier: Optional[str] = None) -> str:
+    # Tier in the key so free vs pro cached responses don't collide.
+    # None tier (unauthenticated callers can't reach this endpoint, but
+    # defensive) folds into 'free'.
+    t = tier or "free"
+    return f"race_stats:{race_id}:{point_count}:t{t}:v{_CACHE_VERSION}"
 
 
-async def _cached_stats(race_id: UUID, point_count: int) -> Optional[dict]:
+async def _cached_stats(
+    race_id: UUID, point_count: int, *, tier: Optional[str] = None,
+) -> Optional[dict]:
     """Best-effort read of the cached stats dict. Returns None when
     Redis is unavailable or the key doesn't exist — caller falls back
     to recomputing."""
@@ -221,7 +229,7 @@ async def _cached_stats(race_id: UUID, point_count: int) -> Optional[dict]:
     except HTTPException:
         return None
     try:
-        raw = await client.get(_cache_key(race_id, point_count))
+        raw = await client.get(_cache_key(race_id, point_count, tier))
     except Exception as e:  # noqa: BLE001
         log.warning("race_stats: cache read failed (%s)", e)
         return None
@@ -233,14 +241,17 @@ async def _cached_stats(race_id: UUID, point_count: int) -> Optional[dict]:
         return None
 
 
-async def _cache_stats(race_id: UUID, point_count: int, stats_dict: dict) -> None:
+async def _cache_stats(
+    race_id: UUID, point_count: int, stats_dict: dict,
+    *, tier: Optional[str] = None,
+) -> None:
     try:
         client = redis_client.get_client()
     except HTTPException:
         return
     try:
         await client.setex(
-            _cache_key(race_id, point_count),
+            _cache_key(race_id, point_count, tier),
             _CACHE_TTL_S,
             json.dumps(stats_dict),
         )
@@ -290,8 +301,12 @@ async def get_stats(
 
     # Pull the boat fields out of the joined row into a dict the
     # service layer recognises. None when the race has no boat_id.
+    # D3 pro-tier gating: ratings are stripped from the response when
+    # the CALLER is free-tier (`is_pro` computed below). The boat's
+    # identity (name, sail #, region) is still surfaced.
     boat_for_math = None
     boat_summary = None
+    is_pro_caller = user.get("tier") in ("pro", "hardware")
     if race.get("boat_pk") is not None:
         boat_for_math = {
             "hcp": race.get("boat_hcp"),
@@ -304,11 +319,17 @@ async def get_stats(
             name=race.get("boat_name") or "",
             sail_number=race.get("boat_sail_number"),
             mwphrf_region=race.get("boat_mwphrf_region"),
-            hcp=race.get("boat_hcp"),
-            dhcp=race.get("boat_dhcp"),
-            nshcp=race.get("boat_nshcp"),
-            dnshcp=race.get("boat_dnshcp"),
+            hcp=race.get("boat_hcp") if is_pro_caller else None,
+            dhcp=race.get("boat_dhcp") if is_pro_caller else None,
+            nshcp=race.get("boat_nshcp") if is_pro_caller else None,
+            dnshcp=race.get("boat_dnshcp") if is_pro_caller else None,
         )
+
+    # D3 pro-tier gating: free callers don't see corrected time.
+    # The math runs only for pro+/hardware; for free we pass boat=None
+    # so the service skips the corrected-time fields entirely.
+    is_pro = user.get("tier") in ("pro", "hardware")
+    boat_for_compute = boat_for_math if is_pro else None
 
     stats_dict: Optional[dict] = None
     if track_rows:
@@ -318,7 +339,9 @@ async def get_stats(
         # we re-derive on every read from the boat row. If we cached
         # corrected time together with elapsed, a rating edit would
         # leave stale data behind until the next track flush.
-        stats_dict = await _cached_stats(race_id, point_count)
+        # D3: cache key DOES include tier so a free → pro upgrade
+        # surfaces the corrected time on next fetch.
+        stats_dict = await _cached_stats(race_id, point_count, tier=user.get("tier"))
         if stats_dict is None:
             pts = track_points_from_rows(track_rows)
             computed = compute_stats(
@@ -326,13 +349,15 @@ async def get_stats(
                 marks=race.get("marks") or [],
                 mark_passes=race.get("mark_passes") or [],
                 race_start_at=race.get("start_at"),
-                boat=boat_for_math,
+                boat=boat_for_compute,
                 mode=race.get("mode"),
                 uses_spinnaker=bool(race.get("uses_spinnaker", True)),
             )
             if computed is not None:
                 stats_dict = computed.to_dict()
-                await _cache_stats(race_id, point_count, stats_dict)
+                await _cache_stats(
+                    race_id, point_count, stats_dict, tier=user.get("tier"),
+                )
 
     ai_summary = race.get("ai_summary")
     wind = _build_wind_meta(race.get("wind_snapshot"))
@@ -374,10 +399,12 @@ async def regenerate_summary(
     miss). The trigger itself is fire-and-forget and the job is
     idempotent, so a double-click results in the same final state.
     """
+    pred = race_owner_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
-        # Auth check only — we don't need the row.
+        # Auth check: owner-only (crew + viewer cannot trigger a paid
+        # Anthropic call). require_pro above also gates by tier.
         owned = await conn.fetchrow(
-            "SELECT 1 FROM race_sessions WHERE id = $1 AND user_id = $2",
+            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
             race_id, user["uid"],
         )
         if owned is None:

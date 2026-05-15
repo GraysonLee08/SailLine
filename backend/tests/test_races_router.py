@@ -303,6 +303,9 @@ def test_patch_404(client, mock_conn):
 # ─── Delete ──────────────────────────────────────────────────────────────
 
 def test_delete_success(client, mock_conn):
+    # D3: delete is gated by an auth precheck (fetchrow) before the
+    # actual DELETE. Auth row truthy → 204.
+    mock_conn.fetchrow.return_value = {"?column?": 1}
     mock_conn.execute.return_value = "DELETE 1"
 
     r = client.delete(f"/api/races/{uuid4()}")
@@ -311,7 +314,10 @@ def test_delete_success(client, mock_conn):
 
 
 def test_delete_404(client, mock_conn):
-    mock_conn.execute.return_value = "DELETE 0"
+    # D3: 404 now comes from the auth precheck (not the DELETE
+    # result count). Returning None from fetchrow means the caller
+    # can't see / write the race.
+    mock_conn.fetchrow.return_value = None
 
     r = client.delete(f"/api/races/{uuid4()}")
 

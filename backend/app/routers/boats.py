@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
+from app.auth_helpers import boat_owner_predicate, boat_read_predicate
 from app.config import get_settings
 from app.services.phrf_cert import parse_mwphrf_cert
 
@@ -132,11 +133,30 @@ def _row_to_out(row: asyncpg.Record) -> BoatOut:
     return BoatOut(**d)
 
 
+async def _load_readable(
+    conn: asyncpg.Connection, boat_id: UUID, uid: str,
+) -> asyncpg.Record:
+    """404 unless caller can READ the boat (creator OR any crew role)."""
+    pred = boat_read_predicate(boat_alias="b", uid_placeholder="$2")
+    cols_b = ", ".join(f"b.{c.strip()}" for c in _BOAT_COLS.split(","))
+    row = await conn.fetchrow(
+        f"SELECT {cols_b} FROM boats b WHERE b.id = $1 AND {pred}",
+        boat_id, uid,
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "boat not found")
+    return row
+
+
 async def _load_owned(
     conn: asyncpg.Connection, boat_id: UUID, uid: str,
 ) -> asyncpg.Record:
+    """404 unless caller OWNS the boat (boats.owner_id OR boat_crew
+    role='owner'). Used for write operations."""
+    pred = boat_owner_predicate(boat_alias="b", uid_placeholder="$2")
+    cols_b = ", ".join(f"b.{c.strip()}" for c in _BOAT_COLS.split(","))
     row = await conn.fetchrow(
-        f"SELECT {_BOAT_COLS} FROM boats WHERE id = $1 AND owner_id = $2",
+        f"SELECT {cols_b} FROM boats b WHERE b.id = $1 AND {pred}",
         boat_id, uid,
     )
     if row is None:
@@ -152,10 +172,13 @@ async def list_boats(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
+    """List boats the caller can see: owned + any membership."""
+    pred = boat_read_predicate(boat_alias="b", uid_placeholder="$1")
+    cols_b = ", ".join(f"b.{c.strip()}" for c in _BOAT_COLS.split(","))
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT {_BOAT_COLS} FROM boats "
-            "WHERE owner_id = $1 ORDER BY created_at DESC",
+            f"SELECT {cols_b} FROM boats b WHERE {pred} "
+            "ORDER BY b.created_at DESC",
             user["uid"],
         )
     return [_row_to_out(r) for r in rows]
@@ -189,8 +212,9 @@ async def get_boat(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
+    """Any member can read the boat record."""
     async with pool.acquire() as conn:
-        row = await _load_owned(conn, boat_id, user["uid"])
+        row = await _load_readable(conn, boat_id, user["uid"])
     return _row_to_out(row)
 
 

@@ -31,6 +31,11 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
+from app.auth_helpers import (
+    race_owner_predicate,
+    race_read_predicate,
+    race_write_predicate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +93,9 @@ class RaceOut(BaseModel):
     auto_start_enabled: bool = True
     boat_id: Optional[UUID] = None
     uses_spinnaker: bool = True
+    # D3: who created the race. Frontend uses this to decide whether
+    # to render the editor as read-only (creator vs crew/viewer).
+    user_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -96,8 +104,16 @@ class RaceOut(BaseModel):
 
 _SELECT_COLS = """
     id, name, mode, boat_class, marks, start_at, started_at, ended_at,
-    auto_start_enabled, boat_id, uses_spinnaker,
+    auto_start_enabled, boat_id, uses_spinnaker, user_id,
     created_at, updated_at
+"""
+
+# Same columns, aliased to the ``r`` table for queries that JOIN
+# boat_crew. Pull whichever projection your query needs.
+_SELECT_COLS_R = """
+    r.id, r.name, r.mode, r.boat_class, r.marks, r.start_at,
+    r.started_at, r.ended_at, r.auto_start_enabled, r.boat_id,
+    r.uses_spinnaker, r.user_id, r.created_at, r.updated_at
 """
 
 
@@ -123,6 +139,7 @@ def _row_to_race(row: asyncpg.Record) -> dict:
         "auto_start_enabled": row["auto_start_enabled"],
         "boat_id": row["boat_id"],
         "uses_spinnaker": row["uses_spinnaker"],
+        "user_id": row.get("user_id") if hasattr(row, "get") else row["user_id"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -144,13 +161,20 @@ async def list_races(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
+    """List races the caller can see.
+
+    Visible races: created by the caller OR on a boat the caller is a
+    member of. Legacy races (boat_id NULL, created before D2) stay
+    private to their creator.
+    """
+    pred = race_read_predicate(race_alias="r", uid_placeholder="$1")
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT {_SELECT_COLS}
-            FROM race_sessions
-            WHERE user_id = $1
-            ORDER BY created_at DESC
+            SELECT {_SELECT_COLS_R}
+            FROM race_sessions r
+            WHERE {pred}
+            ORDER BY r.created_at DESC
             """,
             user["uid"],
         )
@@ -192,12 +216,13 @@ async def get_race(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
+    pred = race_read_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             f"""
-            SELECT {_SELECT_COLS}
-            FROM race_sessions
-            WHERE id = $1 AND user_id = $2
+            SELECT {_SELECT_COLS_R}
+            FROM race_sessions r
+            WHERE r.id = $1 AND {pred}
             """,
             race_id,
             user["uid"],
@@ -237,17 +262,25 @@ async def update_race(
             args.append(value)
 
     set_parts.append("updated_at = NOW()")
-    args.extend([race_id, user["uid"]])
-    id_idx = len(args) - 1
-    uid_idx = len(args)
+    # Append race_id as the final placeholder for the UPDATE.
+    args.append(race_id)
+    id_idx = len(args)   # 1-based
 
-    sql = f"""
-        UPDATE race_sessions
-        SET {", ".join(set_parts)}
-        WHERE id = ${id_idx} AND user_id = ${uid_idx}
-        RETURNING {_SELECT_COLS}
-    """
+    # Auth pre-check: caller can write the race (owner OR crew).
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
+        allowed = await conn.fetchrow(
+            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
+            race_id, user["uid"],
+        )
+        if allowed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+        sql = f"""
+            UPDATE race_sessions
+            SET {", ".join(set_parts)}
+            WHERE id = ${id_idx}
+            RETURNING {_SELECT_COLS}
+        """
         row = await conn.fetchrow(sql, *args)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
@@ -260,12 +293,17 @@ async def delete_race(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
+    """Owner-only. Crew + viewers can't delete races, even on boats
+    they're members of."""
+    pred = race_owner_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM race_sessions WHERE id = $1 AND user_id = $2",
-            race_id,
-            user["uid"],
+        allowed = await conn.fetchrow(
+            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
+            race_id, user["uid"],
         )
-    if result.rsplit(" ", 1)[-1] == "0":
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+        if allowed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+        await conn.execute(
+            "DELETE FROM race_sessions WHERE id = $1", race_id,
+        )
     return None

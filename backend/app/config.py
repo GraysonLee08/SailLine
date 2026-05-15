@@ -61,6 +61,23 @@ class Settings(BaseSettings):
         default=None, alias="RACE_POSTPROCESS_JOB"
     )
 
+    # === Email / invites (Session D3) ===
+    # SendGrid API key, mounted from Secret Manager in prod. When
+    # unset, app/services/email.py logs and returns False; the invite
+    # endpoint still creates the row and returns the accept_url so the
+    # owner can share it manually.
+    sendgrid_api_key: str | None = Field(default=None, alias="SENDGRID_API_KEY")
+    email_from_address: str = Field(
+        default="noreply@sailline.app", alias="EMAIL_FROM_ADDRESS"
+    )
+    email_from_name: str = Field(
+        default="SailLine", alias="EMAIL_FROM_NAME"
+    )
+    # Used to build accept-invite URLs in outgoing emails.
+    app_base_url: str = Field(
+        default="https://sailline.web.app", alias="APP_BASE_URL"
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

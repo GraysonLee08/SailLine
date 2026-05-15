@@ -105,9 +105,13 @@ async def notifications(
     EventSource's auto-reconnect handles that transparently from the
     frontend's perspective.
     """
+    # D3: any member of the race's boat (including viewer) can
+    # subscribe to better-route notifications.
+    from app.auth_helpers import race_read_predicate
+    pred = race_read_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT id FROM race_sessions WHERE id = $1 AND user_id = $2",
+            f"SELECT r.id FROM race_sessions r WHERE r.id = $1 AND {pred}",
             race_id, user["uid"],
         )
         if row is None:

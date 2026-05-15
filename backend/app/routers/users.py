@@ -76,8 +76,13 @@ async def update_me(
     new_default = payload.default_boat_id
     async with pool.acquire() as conn:
         if new_default is not None:
+            # D3: pre-select any boat the caller is a member of, not
+            # just boats they own. A crew member who races on someone
+            # else's boat can pick that boat as their default.
+            from app.auth_helpers import boat_read_predicate
+            pred = boat_read_predicate(boat_alias="b", uid_placeholder="$2")
             owns = await conn.fetchrow(
-                "SELECT 1 FROM boats WHERE id = $1 AND owner_id = $2",
+                f"SELECT 1 FROM boats b WHERE b.id = $1 AND {pred}",
                 new_default, user["uid"],
             )
             if owns is None:

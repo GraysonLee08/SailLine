@@ -1,11 +1,15 @@
 // BoatEditor — create or edit a boat. Form fields mirror the MWPHRF
 // cert. The cert-upload button parses a PDF server-side and pre-fills
 // the form with what came back; the user reviews and clicks Save.
+//
+// D3: when editing an existing boat AND the caller is the owner, a
+// Crew section appears with member management + invite UI.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiFetch } from "./api";
 import { useBoats } from "./hooks/useBoats";
+import { useCrew } from "./hooks/useCrew";
 
 const TEXT_FIELDS = [
   ["name",         "Name",          { required: true }],
@@ -46,13 +50,20 @@ const DATE_FIELDS = [
 ];
 
 
-export default function BoatEditor({ boatId, onClose, onSaved }) {
+export default function BoatEditor({ boatId, onClose, onSaved, currentUid }) {
   const { create, update, uploadCert } = useBoats();
   const [form, setForm] = useState(() => emptyForm());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [parsedNotice, setParsedNotice] = useState(null);
   const fileInput = useRef(null);
+
+  // D3: only the boat owner sees the Crew section. Membership is
+  // determined by comparing the current user's uid to the boat's
+  // owner_id (kept on the row) — we don't expose /boat_crew to read
+  // role-from-list for the caller themselves; reading owner_id is
+  // sufficient and avoids a second round trip.
+  const isOwner = boatId && currentUid && form.owner_id === currentUid;
 
   // Load existing boat if editing.
   useEffect(() => {
@@ -188,10 +199,440 @@ export default function BoatEditor({ boatId, onClose, onSaved }) {
                      fields={INT_FIELDS.slice(0, 2)} kind="int" />
         <FormSection title="Cert dates" form={form} setField={setField}
                      fields={DATE_FIELDS} kind="date" />
+
+        {isOwner && <CrewSection boatId={boatId} ownerUid={currentUid} />}
       </main>
     </div>
   );
 }
+
+
+// ─── Crew section (owner-only) ──────────────────────────────────────
+
+
+function CrewSection({ boatId, ownerUid }) {
+  const {
+    members, invites, loading, error,
+    updateRole, removeMember, createInvite, revokeInvite,
+  } = useCrew(boatId);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState("crew");
+  const [busy, setBusy] = useState(false);
+  const [lastCreatedCode, setLastCreatedCode] = useState(null);
+  const [actionError, setActionError] = useState(null);
+
+  const handleInviteEmail = async () => {
+    if (!inviteEmail) return;
+    setBusy(true);
+    setActionError(null);
+    setLastCreatedCode(null);
+    try {
+      const inv = await createInvite({
+        role: inviteRole, email: inviteEmail,
+      });
+      setLastCreatedCode({
+        url: inv.accept_url,
+        emailed: inv.emailed,
+        email: inv.email,
+      });
+      setInviteEmail("");
+    } catch (e) {
+      setActionError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleGenerateCode = async () => {
+    setBusy(true);
+    setActionError(null);
+    setLastCreatedCode(null);
+    try {
+      const inv = await createInvite({ role: inviteRole });
+      setLastCreatedCode({ code: inv.code, url: inv.accept_url });
+    } catch (e) {
+      setActionError(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copyToClipboard = (text) => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+  };
+
+  return (
+    <section style={crewStyles.section}>
+      <div style={crewStyles.sectionTitle}>Crew</div>
+      {error && <div style={crewStyles.errorRow}>{error}</div>}
+      {actionError && <div style={crewStyles.errorRow}>{actionError}</div>}
+
+      <ul style={crewStyles.memberList}>
+        {(members || []).map((m) => (
+          <li key={m.user_id} style={crewStyles.memberRow}>
+            <div style={crewStyles.memberMain}>
+              <code style={crewStyles.uid}>{m.user_id}</code>
+              <span style={crewStyles.roleBadge(m.role)}>{m.role}</span>
+            </div>
+            {m.user_id !== ownerUid && (
+              <div style={crewStyles.memberActions}>
+                <select
+                  value={m.role}
+                  onChange={(e) =>
+                    updateRole(m.user_id, e.target.value).catch((err) =>
+                      setActionError(err.message),
+                    )
+                  }
+                  style={crewStyles.roleSelect}
+                  disabled={m.role === "owner"}
+                >
+                  {m.role === "owner" && <option value="owner">owner</option>}
+                  <option value="crew">crew</option>
+                  <option value="viewer">viewer</option>
+                </select>
+                <button
+                  onClick={() =>
+                    removeMember(m.user_id).catch((err) =>
+                      setActionError(err.message),
+                    )
+                  }
+                  style={crewStyles.removeBtn}
+                >
+                  Remove
+                </button>
+              </div>
+            )}
+          </li>
+        ))}
+        {members && members.length === 1 && (
+          <li style={crewStyles.empty}>
+            No crew yet — invite someone below.
+          </li>
+        )}
+      </ul>
+
+      <div style={crewStyles.inviteBox}>
+        <div style={crewStyles.inviteRow}>
+          <label style={crewStyles.smallLabel}>Role</label>
+          <select
+            value={inviteRole}
+            onChange={(e) => setInviteRole(e.target.value)}
+            style={crewStyles.input}
+          >
+            <option value="crew">crew (can record + view)</option>
+            <option value="viewer">viewer (read only)</option>
+          </select>
+        </div>
+
+        <div style={crewStyles.inviteRow}>
+          <label style={crewStyles.smallLabel}>Email invite</label>
+          <input
+            type="email"
+            placeholder="crew@example.com"
+            value={inviteEmail}
+            onChange={(e) => setInviteEmail(e.target.value)}
+            style={crewStyles.input}
+          />
+          <button
+            onClick={handleInviteEmail}
+            disabled={busy || !inviteEmail}
+            style={crewStyles.primaryBtn}
+          >
+            Send
+          </button>
+        </div>
+
+        <div style={crewStyles.inviteRow}>
+          <label style={crewStyles.smallLabel}>Or generate code</label>
+          <button
+            onClick={handleGenerateCode}
+            disabled={busy}
+            style={crewStyles.secondaryBtn}
+          >
+            Generate join code
+          </button>
+        </div>
+
+        {lastCreatedCode && (
+          <div style={crewStyles.codeNotice}>
+            {lastCreatedCode.code ? (
+              <>
+                <div style={crewStyles.codeTitle}>Share this code:</div>
+                <div style={crewStyles.codeRow}>
+                  <code style={crewStyles.codeText}>
+                    {lastCreatedCode.code}
+                  </code>
+                  <button
+                    onClick={() => copyToClipboard(lastCreatedCode.code)}
+                    style={crewStyles.copyBtn}
+                  >
+                    Copy
+                  </button>
+                </div>
+                <div style={crewStyles.codeHint}>
+                  Recipient pastes this on the Accept Invite screen,
+                  or uses the full link:
+                </div>
+              </>
+            ) : (
+              <div style={crewStyles.codeTitle}>
+                {lastCreatedCode.emailed
+                  ? `Email sent to ${lastCreatedCode.email}.`
+                  : `Email send failed — copy the link below and share it manually.`}
+              </div>
+            )}
+            <div style={crewStyles.urlRow}>
+              <code style={crewStyles.urlText}>
+                {lastCreatedCode.url}
+              </code>
+              <button
+                onClick={() => copyToClipboard(lastCreatedCode.url)}
+                style={crewStyles.copyBtn}
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {invites && invites.length > 0 && (
+        <div style={crewStyles.pendingBlock}>
+          <div style={crewStyles.smallLabel}>Pending invites</div>
+          <ul style={crewStyles.pendingList}>
+            {invites.map((inv) => (
+              <li key={inv.code} style={crewStyles.pendingRow}>
+                <span style={crewStyles.roleBadge(inv.role)}>
+                  {inv.role}
+                </span>
+                <code style={crewStyles.codeTextSmall}>
+                  {inv.email || inv.code}
+                </code>
+                <button
+                  onClick={() =>
+                    revokeInvite(inv.code).catch((err) =>
+                      setActionError(err.message),
+                    )
+                  }
+                  style={crewStyles.removeBtn}
+                >
+                  Revoke
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+const crewStyles = {
+  section: {
+    background: "white",
+    border: "1px solid var(--rule, #eaeaea)",
+    borderRadius: 10,
+    padding: "14px 16px 16px",
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  },
+  sectionTitle: {
+    fontSize: 12,
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    color: "#3a3a40",
+    fontWeight: 600,
+  },
+  errorRow: {
+    padding: 8,
+    border: "1px solid #f0c4c4",
+    background: "#fdecec",
+    color: "#8a1f1f",
+    borderRadius: 6,
+    fontSize: 12,
+  },
+  memberList: {
+    listStyle: "none",
+    margin: 0,
+    padding: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  empty: {
+    fontSize: 12, color: "#6a6a6f", padding: "8px 0",
+  },
+  memberRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    padding: "8px 10px",
+    background: "#f8f8f7",
+    borderRadius: 6,
+  },
+  memberMain: { display: "flex", alignItems: "center", gap: 10, minWidth: 0, flex: 1 },
+  uid: {
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    fontSize: 11,
+    color: "#3a3a40",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  roleBadge: (role) => ({
+    fontSize: 10,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase",
+    fontWeight: 600,
+    border: "1px solid",
+    borderRadius: 4,
+    padding: "1px 6px",
+    ...(role === "owner"
+      ? { color: "#16161a", borderColor: "#16161a" }
+      : role === "crew"
+        ? { color: "#1a73e8", borderColor: "#1a73e8" }
+        : { color: "#6a6a6f", borderColor: "#bcbcc2" }),
+  }),
+  memberActions: { display: "flex", gap: 6, alignItems: "center" },
+  roleSelect: {
+    fontSize: 12,
+    padding: "4px 6px",
+    border: "1px solid #d8d8de",
+    borderRadius: 4,
+  },
+  removeBtn: {
+    fontSize: 11,
+    padding: "4px 8px",
+    border: "1px solid #e0a0a0",
+    background: "white",
+    color: "#8a1f1f",
+    borderRadius: 4,
+    cursor: "pointer",
+  },
+  inviteBox: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    padding: 12,
+    border: "1px dashed #d8d8de",
+    borderRadius: 8,
+  },
+  inviteRow: { display: "flex", alignItems: "center", gap: 8 },
+  smallLabel: {
+    fontSize: 11,
+    color: "#6a6a6f",
+    width: 110,
+    flexShrink: 0,
+  },
+  input: {
+    flex: 1,
+    padding: "6px 10px",
+    border: "1px solid #d8d8de",
+    borderRadius: 6,
+    fontSize: 13,
+    fontFamily: "inherit",
+  },
+  primaryBtn: {
+    padding: "6px 12px",
+    background: "#16161a",
+    color: "white",
+    border: "none",
+    borderRadius: 6,
+    fontSize: 12,
+    fontWeight: 500,
+    cursor: "pointer",
+  },
+  secondaryBtn: {
+    padding: "6px 12px",
+    background: "white",
+    color: "#16161a",
+    border: "1px solid #d8d8de",
+    borderRadius: 6,
+    fontSize: 12,
+    cursor: "pointer",
+  },
+  codeNotice: {
+    padding: 10,
+    background: "#eef4fd",
+    border: "1px solid #bcd6f7",
+    borderRadius: 6,
+    fontSize: 12,
+    color: "#1a4d8f",
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  codeTitle: { fontWeight: 600 },
+  codeRow: { display: "flex", alignItems: "center", gap: 8 },
+  codeText: {
+    fontFamily: "ui-monospace, monospace",
+    fontSize: 16,
+    fontWeight: 600,
+    padding: "4px 10px",
+    background: "white",
+    border: "1px solid #bcd6f7",
+    borderRadius: 4,
+    letterSpacing: "0.05em",
+  },
+  codeTextSmall: {
+    fontFamily: "ui-monospace, monospace",
+    fontSize: 12,
+    color: "#3a3a40",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    flex: 1,
+  },
+  copyBtn: {
+    padding: "4px 10px",
+    background: "white",
+    border: "1px solid #bcd6f7",
+    color: "#1a4d8f",
+    borderRadius: 4,
+    fontSize: 11,
+    cursor: "pointer",
+  },
+  codeHint: { fontSize: 11, color: "#1a4d8f", opacity: 0.85 },
+  urlRow: { display: "flex", alignItems: "center", gap: 8 },
+  urlText: {
+    fontFamily: "ui-monospace, monospace",
+    fontSize: 11,
+    background: "white",
+    padding: "4px 6px",
+    border: "1px solid #bcd6f7",
+    borderRadius: 4,
+    flex: 1,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  pendingBlock: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+  },
+  pendingList: {
+    listStyle: "none",
+    margin: 0,
+    padding: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+  },
+  pendingRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "6px 10px",
+    background: "#f8f8f7",
+    borderRadius: 6,
+  },
+};
 
 
 function FormSection({ title, fields, form, setField, kind }) {

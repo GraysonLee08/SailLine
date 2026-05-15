@@ -8,7 +8,7 @@
 import { useRaces } from "./hooks/useRaces";
 
 export default function RacesListView({
-  onBack, onOpen, onEdit, onCreate, onViewStats,
+  onBack, onOpen, onEdit, onCreate, onViewStats, currentUid,
 }) {
   const { races, error, remove } = useRaces();
 
@@ -48,6 +48,7 @@ export default function RacesListView({
               <RaceCard
                 key={r.id}
                 race={r}
+                isShared={!!currentUid && r.user_id && r.user_id !== currentUid}
                 onOpen={() => onOpen(r)}
                 onEdit={() => onEdit(r.id)}
                 onViewStats={
@@ -76,7 +77,7 @@ export default function RacesListView({
   );
 }
 
-function RaceCard({ race, onOpen, onEdit, onViewStats, onDelete }) {
+function RaceCard({ race, isShared, onOpen, onEdit, onViewStats, onDelete }) {
   // Card body click = the primary action (load on map). Edit and Delete
   // are explicit buttons in the action cluster on the right. Keyboard
   // users get the same primary action via Enter on the focused row.
@@ -95,7 +96,25 @@ function RaceCard({ race, onOpen, onEdit, onViewStats, onDelete }) {
         role="button"
         tabIndex={0}
       >
-        <h3 style={styles.cardName}>{race.name}</h3>
+        <h3 style={styles.cardName}>
+          {race.name}
+          {isShared && (
+            <span style={{
+              marginLeft: 8,
+              fontSize: 10,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              color: "#1a4d8f",
+              border: "1px solid #1a4d8f",
+              borderRadius: 4,
+              padding: "1px 6px",
+              fontWeight: 600,
+              verticalAlign: "middle",
+            }}>
+              Shared
+            </span>
+          )}
+        </h3>
         <div style={styles.cardMeta}>
           <span style={styles.badge}>{race.mode}</span>
           <span style={styles.metaSep}>·</span>

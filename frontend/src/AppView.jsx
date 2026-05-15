@@ -38,6 +38,7 @@ const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
 const RaceStatsView = lazy(() => import("./RaceStatsView.jsx"));
 const BoatsView = lazy(() => import("./BoatsView.jsx"));
 const BoatEditor = lazy(() => import("./BoatEditor.jsx"));
+const AcceptInviteView = lazy(() => import("./AcceptInviteView.jsx"));
 const SensorDebugView = lazy(() => import("./SensorDebugView.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
@@ -90,7 +91,12 @@ export default function AppView({ user }) {
   //           | { kind: "stats", raceId: string, returnTo: "map" | "races" }
   //           | { kind: "boats" }
   //           | { kind: "boat-editor", boatId: string | null, returnTo: "boats" }
-  const [view, setView] = useState({ kind: "map" });
+  //           | { kind: "accept-invite", code: string }
+  const [view, setView] = useState(() => {
+    if (typeof window === "undefined") return { kind: "map" };
+    const code = new URLSearchParams(window.location.search).get("invite");
+    return code ? { kind: "accept-invite", code } : { kind: "map" };
+  });
 
   // ── Profile ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -222,6 +228,7 @@ export default function AppView({ user }) {
         <div style={{ ...styles.layer, zIndex: 1 }}>
           <Suspense fallback={<ViewLoading />}>
             <RacesListView
+              currentUid={user?.uid}
               onBack={() => setView({ kind: "map" })}
               onCreate={() =>
                 setView({ kind: "editor", raceId: null, returnTo: "races" })
@@ -246,6 +253,7 @@ export default function AppView({ user }) {
           <Suspense fallback={<ViewLoading />}>
             <RaceEditor
               raceId={view.raceId}
+              currentUid={user?.uid}
               onClose={() => setView({ kind: view.returnTo || "races" })}
               onSaved={(race) => {
                 // After save, the just-saved race becomes active and we
@@ -291,8 +299,42 @@ export default function AppView({ user }) {
           <Suspense fallback={<ViewLoading />}>
             <BoatEditor
               boatId={view.boatId}
+              currentUid={user?.uid}
               onClose={() => setView({ kind: view.returnTo || "boats" })}
               onSaved={() => setView({ kind: view.returnTo || "boats" })}
+            />
+          </Suspense>
+        </div>
+      )}
+
+      {view.kind === "accept-invite" && (
+        <div style={{ ...styles.layer, zIndex: 3 }}>
+          <Suspense fallback={<ViewLoading />}>
+            <AcceptInviteView
+              code={view.code}
+              onAccepted={() => {
+                // Strip the ?invite= param so a refresh doesn't try
+                // to re-accept, then go to Boats so the newly-added
+                // boat is visible.
+                try {
+                  const url = new URL(window.location.href);
+                  url.searchParams.delete("invite");
+                  window.history.replaceState({}, "", url.toString());
+                } catch {
+                  /* old browser */
+                }
+                setView({ kind: "boats" });
+              }}
+              onCancel={() => {
+                try {
+                  const url = new URL(window.location.href);
+                  url.searchParams.delete("invite");
+                  window.history.replaceState({}, "", url.toString());
+                } catch {
+                  /* ignore */
+                }
+                setView({ kind: "map" });
+              }}
             />
           </Suspense>
         </div>

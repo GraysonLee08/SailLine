@@ -45,6 +45,7 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
+from app.auth_helpers import race_read_predicate, race_write_predicate
 from app.services.job_trigger import trigger_race_postprocess
 from app.services.mark_rounding import (
     Mark as DetectorMark,
@@ -120,13 +121,16 @@ async def _load_race_for_ingest(
 ) -> dict:
     """Fetch the bits of the race row needed to run mark rounding.
 
-    404 if the race doesn't exist OR isn't owned by this user.
+    404 if the race doesn't exist OR the caller can't write to it.
+    Crew members can record tracks (the crew member might be the one
+    holding the phone); viewers cannot.
     """
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
-        """
-        SELECT marks, mark_passes
-        FROM race_sessions
-        WHERE id = $1 AND user_id = $2
+        f"""
+        SELECT r.marks, r.mark_passes
+        FROM race_sessions r
+        WHERE r.id = $1 AND {pred}
         """,
         race_id,
         uid,
@@ -252,16 +256,17 @@ async def append_track(
 
         all_passes = list(race["mark_passes"]) + new_passes
         if new_passes:
+            # Auth was already checked in _load_race_for_ingest; the
+            # UPDATE just hits the row by id.
             await conn.execute(
                 """
                 UPDATE race_sessions
                 SET mark_passes = $1::jsonb,
                     updated_at = NOW()
-                WHERE id = $2 AND user_id = $3
+                WHERE id = $2
                 """,
                 json.dumps(all_passes),
                 race_id,
-                user["uid"],
             )
 
     # Final-mark trigger: when this batch caused mark_passes to reach
@@ -298,10 +303,14 @@ async def get_track(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
-    """Return every recorded point for the race in chronological order."""
+    """Return every recorded point for the race in chronological order.
+
+    Read access: caller created the race OR is a member of the boat
+    at any role (including viewer)."""
+    pred = race_read_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
         owned = await conn.fetchrow(
-            "SELECT 1 FROM race_sessions WHERE id = $1 AND user_id = $2",
+            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
             race_id,
             user["uid"],
         )
