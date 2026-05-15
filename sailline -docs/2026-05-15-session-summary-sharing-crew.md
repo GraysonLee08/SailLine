@@ -162,6 +162,21 @@ Cloud Build runs the gated `pytest -m "not slow"` + `npm test` before deploy. If
 9. **`isOwner` check in BoatEditor relies on `form.owner_id`** which isn't a form field — it's data the API returns. The current code spreads the response into the form so `form.owner_id` reads back correctly, but it's load-bearing in a way that's easy to miss. Worth refactoring to a separate `meta` state.
 10. **Email body is HTML-only with inline styles, no plaintext-first preference.** Most email clients render fine; some accessibility tools prefer plain text. Marginal.
 
+## Post-deploy fixes (after the morning smoke test)
+
+Two issues surfaced when smoke-testing D3 against prod. Both shipped as a follow-up commit.
+
+1. **Crew could see Edit + Delete on the boat row.** The boats endpoint didn't surface the caller's role, so BoatsView + BoatEditor showed owner-grade controls to crew. Fix: `BoatOut` gained a `viewer_role` field computed inline in the GET queries via a `CASE WHEN owner_id = $1 THEN 'owner' ELSE (SELECT role FROM boat_crew ...) END` sub-select. Frontend now hides Delete for non-owners, renames Edit → View, disables all form inputs in BoatEditor for non-owners, and shows a "Read-only" badge instead of Save.
+
+2. **Crew saw no races even after joining the boat.** Diagnosed as expected behaviour: legacy test races had `boat_id = NULL`, so the membership predicate didn't match. Confirmed by editing a test race to set `boat_id = Gaucho` — crew immediately saw it on next load. No code change required; flagged as a UX gap (creating a race before having a boat orphans it from the crew's view forever unless the owner later edits).
+
+Files touched in the post-deploy fix:
+- `backend/app/routers/boats.py` — `BoatOut` gains `viewer_role`; `list_boats` + `_load_readable` add the CASE-WHEN computation.
+- `frontend/src/BoatsView.jsx` — role chip + conditional Edit/Delete buttons; Edit → View label for non-owners.
+- `frontend/src/BoatEditor.jsx` — `isOwner` now reads `form.viewer_role`; cert upload section hidden for non-owners; form inputs disabled + greyed; Save replaced with "Read-only" badge.
+
+End-to-end smoke confirmed working: owner generates code → second account redeems via incognito → boat appears with "crew" chip and View button → race assigned to the boat shows up in second account's Races with "Shared" chip.
+
 ## What's next
 
 - **D4 candidates:**
