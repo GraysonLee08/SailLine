@@ -12,14 +12,20 @@
 //     chunk has already paid the mapbox-gl cost — adding a Suspense
 //     boundary around the always-mounted base layer would just flicker
 //     on every login without saving anything.
-//   - RacesListView and RaceEditor are lazy-loaded. Both only mount on
-//     user navigation (menu drawer / button click), so the common
-//     "open the app, look at wind on the map" path doesn't pull editor
-//     code. Each chunk is cached after first use, so the fallback
-//     effectively never appears more than once per session.
+//   - RacesListView, RaceEditor, ProfileView etc. are lazy-loaded.
+//     Each chunk is cached after first use, so the fallback effectively
+//     never appears more than once per session.
 //   - SensorDebugView is a hidden diagnostic page reachable only via
 //     the URL parameter ?debug=sensors. Lazy-loaded so it doesn't
 //     bloat the main bundle for normal users.
+//
+// D4: ``profile_complete`` gates a forced ProfileView. When the
+// backend returns ``profile_complete: false`` on /me, we drop the
+// user into ProfileView before they can interact with the map. This
+// catches first-time email sign-ups (Google sign-ins are auto-
+// completed from the ``name`` claim and skip the prompt). The
+// accept-invite flow is exempted so a brand-new user can redeem an
+// invite link before completing their profile.
 
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
@@ -39,6 +45,7 @@ const RaceStatsView = lazy(() => import("./RaceStatsView.jsx"));
 const BoatsView = lazy(() => import("./BoatsView.jsx"));
 const BoatEditor = lazy(() => import("./BoatEditor.jsx"));
 const AcceptInviteView = lazy(() => import("./AcceptInviteView.jsx"));
+const ProfileView = lazy(() => import("./ProfileView.jsx"));
 const SensorDebugView = lazy(() => import("./SensorDebugView.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
@@ -92,6 +99,7 @@ export default function AppView({ user }) {
   //           | { kind: "boats" }
   //           | { kind: "boat-editor", boatId: string | null, returnTo: "boats" }
   //           | { kind: "accept-invite", code: string }
+  //           | { kind: "profile", forced: boolean, returnTo: "map" }
   const [view, setView] = useState(() => {
     if (typeof window === "undefined") return { kind: "map" };
     const code = new URLSearchParams(window.location.search).get("invite");
@@ -99,14 +107,28 @@ export default function AppView({ user }) {
   });
 
   // ── Profile ──────────────────────────────────────────────────────
+  // D4: if profile_complete is false AND we're not in the middle of
+  // an invite redemption, force the user into ProfileView. We don't
+  // route around accept-invite so a brand-new sign-up from an
+  // invitation can still join the boat before completing their
+  // profile — the forced view will appear next time they open the
+  // app (or by accepting we have an opportunity to show the name
+  // they got picked from the invite, future enhancement).
   useEffect(() => {
     let cancelled = false;
     apiFetch("/api/users/me")
-      .then((p) => !cancelled && setProfile(p))
+      .then((p) => {
+        if (cancelled) return;
+        setProfile(p);
+        if (p && p.profile_complete === false && view.kind !== "accept-invite") {
+          setView({ kind: "profile", forced: true, returnTo: "map" });
+        }
+      })
       .catch(() => { });
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Restore active race from localStorage on first mount ─────────
@@ -201,6 +223,11 @@ export default function AppView({ user }) {
     setMenuOpen(false);
     setView(next);
   };
+
+  // Display name we show in the menu drawer header. Falls back through
+  // display_name → token email → uid so it's never blank.
+  const displayLabel =
+    profile?.display_name || user?.email || profile?.email || user?.uid || "";
 
   return (
     <div ref={introContainerRef} style={styles.shell}>
@@ -340,6 +367,33 @@ export default function AppView({ user }) {
         </div>
       )}
 
+      {view.kind === "profile" && (
+        <div style={{ ...styles.layer, zIndex: 3 }}>
+          <Suspense fallback={<ViewLoading />}>
+            <ProfileView
+              profile={profile}
+              forced={!!view.forced}
+              onSaved={(updated) => {
+                setProfile(updated);
+                // After a successful save we hand the user back to
+                // whichever view sent them here (default: map). If
+                // they were *forced* in, they only escape once their
+                // profile is complete — defensive double-check
+                // mirroring the backend so a buggy response can't
+                // strand them.
+                if (view.forced && !updated.profile_complete) return;
+                setView({ kind: view.returnTo || "map" });
+              }}
+              onCancel={
+                view.forced
+                  ? undefined
+                  : () => setView({ kind: view.returnTo || "map" })
+              }
+            />
+          </Suspense>
+        </div>
+      )}
+
       {/* Hamburger only when the map is the active view — other screens
           have their own back / cancel controls in their headers. */}
       {view.kind === "map" && (
@@ -357,7 +411,8 @@ export default function AppView({ user }) {
       <MenuDrawer
         open={menuOpen}
         onClose={() => setMenuOpen(false)}
-        user={user}
+        label={displayLabel}
+        avatarUrl={profile?.avatar_url}
         tier={profile?.tier ?? "…"}
         onNavigate={goto}
       />
@@ -377,7 +432,7 @@ function ViewLoading() {
   );
 }
 
-function MenuDrawer({ open, onClose, user, tier, onNavigate }) {
+function MenuDrawer({ open, onClose, label, avatarUrl, tier, onNavigate }) {
   return (
     <>
       <div
@@ -395,7 +450,16 @@ function MenuDrawer({ open, onClose, user, tier, onNavigate }) {
         }}
       >
         <div style={styles.drawerHeader}>
-          <p style={styles.drawerEmail}>{user.email || user.uid}</p>
+          <div style={styles.drawerIdentity}>
+            {avatarUrl ? (
+              <img src={avatarUrl} alt="" style={styles.drawerAvatar} />
+            ) : (
+              <div style={styles.drawerAvatarFallback}>
+                {(label || "?").trim().charAt(0).toUpperCase()}
+              </div>
+            )}
+            <p style={styles.drawerEmail}>{label}</p>
+          </div>
           <span style={styles.tierChip}>{tier}</span>
         </div>
 
@@ -407,7 +471,13 @@ function MenuDrawer({ open, onClose, user, tier, onNavigate }) {
             Boats
           </NavItem>
           <NavItem disabled>Home waters</NavItem>
-          <NavItem disabled>Settings</NavItem>
+          <NavItem
+            onClick={() =>
+              onNavigate({ kind: "profile", forced: false, returnTo: "map" })
+            }
+          >
+            Settings
+          </NavItem>
           <NavItem disabled>Help</NavItem>
         </nav>
 
@@ -515,6 +585,31 @@ const styles = {
     borderBottom: "1px solid var(--rule)",
     marginBottom: 16,
   },
+  drawerIdentity: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+  },
+  drawerAvatar: {
+    width: 36,
+    height: 36,
+    borderRadius: "50%",
+    objectFit: "cover",
+    flexShrink: 0,
+  },
+  drawerAvatarFallback: {
+    width: 36,
+    height: 36,
+    borderRadius: "50%",
+    background: "#16161a",
+    color: "white",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 15,
+    fontWeight: 600,
+    flexShrink: 0,
+  },
   drawerEmail: {
     margin: 0,
     fontSize: 14,
@@ -522,6 +617,8 @@ const styles = {
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+    flex: 1,
+    minWidth: 0,
   },
   tierChip: {
     display: "inline-block",

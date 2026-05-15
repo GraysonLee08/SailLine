@@ -81,12 +81,13 @@ def test_list_crew_returns_members(client, mock_conn):
         {
             "user_id": "u1", "role": "owner",
             "joined_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
-            "has_profile": True,
+            "email": "owner@x", "display_name": "Owner One",
+            "avatar_url": "https://cdn/x.webp",
         },
         {
             "user_id": "u2", "role": "crew",
             "joined_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
-            "has_profile": True,
+            "email": "c2@x", "display_name": None, "avatar_url": None,
         },
     ]
     r = client.get(f"/api/boats/{boat_id}/crew")
@@ -94,6 +95,14 @@ def test_list_crew_returns_members(client, mock_conn):
     body = r.json()
     assert len(body) == 2
     assert body[0]["role"] == "owner"
+    # D4: name + email + avatar surface through.
+    assert body[0]["display_name"] == "Owner One"
+    assert body[0]["email"] == "owner@x"
+    assert body[0]["avatar_url"] == "https://cdn/x.webp"
+    # A member with a profile but no display_name yet — frontend will
+    # fall back to email.
+    assert body[1]["display_name"] is None
+    assert body[1]["email"] == "c2@x"
 
 
 def test_list_crew_404_when_not_member(client, mock_conn):
@@ -109,6 +118,8 @@ def test_patch_role_to_viewer(client, mock_conn):
         {                                     # UPDATE RETURNING
             "user_id": "u2", "role": "viewer",
             "joined_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+            "email": "c2@x", "display_name": "Crew Two",
+            "avatar_url": None,
         },
     ]
     r = client.patch(
@@ -116,6 +127,7 @@ def test_patch_role_to_viewer(client, mock_conn):
     )
     assert r.status_code == 200
     assert r.json()["role"] == "viewer"
+    assert r.json()["display_name"] == "Crew Two"
 
 
 def test_patch_role_404_when_member_missing(client, mock_conn):

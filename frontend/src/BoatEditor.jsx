@@ -298,7 +298,23 @@ function CrewSection({ boatId, ownerUid }) {
         {(members || []).map((m) => (
           <li key={m.user_id} style={crewStyles.memberRow}>
             <div style={crewStyles.memberMain}>
-              <code style={crewStyles.uid}>{m.user_id}</code>
+              <CrewAvatar url={m.avatar_url} label={m.display_name || m.email || m.user_id} />
+              <div style={crewStyles.memberLabelStack}>
+                {/* D4: display_name → email → raw uid fallback chain.
+                    Monospace only when we're falling all the way through
+                    to the uid (it's an opaque identifier; everything else
+                    is a human-readable name). */}
+                {m.display_name ? (
+                  <span style={crewStyles.memberName}>{m.display_name}</span>
+                ) : m.email ? (
+                  <span style={crewStyles.memberName}>{m.email}</span>
+                ) : (
+                  <code style={crewStyles.uid}>{m.user_id}</code>
+                )}
+                {m.display_name && m.email && (
+                  <span style={crewStyles.memberSubtle}>{m.email}</span>
+                )}
+              </div>
               <span style={crewStyles.roleBadge(m.role)}>{m.role}</span>
             </div>
             {m.user_id !== ownerUid && (
@@ -455,6 +471,24 @@ function CrewSection({ boatId, ownerUid }) {
 }
 
 
+// Tiny circular avatar for the crew row. Falls back to an initial-
+// letter chip when the member hasn't uploaded a photo yet.
+function CrewAvatar({ url, label }) {
+  if (url) {
+    return (
+      <img
+        src={url}
+        alt=""
+        style={crewStyles.avatar}
+        onError={(e) => { e.currentTarget.style.display = "none"; }}
+      />
+    );
+  }
+  const initial = (label || "?").trim().charAt(0).toUpperCase();
+  return <div style={crewStyles.avatarFallback}>{initial}</div>;
+}
+
+
 const crewStyles = {
   section: {
     background: "white",
@@ -501,6 +535,49 @@ const crewStyles = {
     borderRadius: 6,
   },
   memberMain: { display: "flex", alignItems: "center", gap: 10, minWidth: 0, flex: 1 },
+  memberLabelStack: {
+    display: "flex",
+    flexDirection: "column",
+    minWidth: 0,
+    flex: 1,
+    gap: 1,
+  },
+  memberName: {
+    fontSize: 13,
+    color: "#16161a",
+    fontWeight: 500,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  memberSubtle: {
+    fontSize: 11,
+    color: "#6a6a6f",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  avatar: {
+    width: 28,
+    height: 28,
+    borderRadius: "50%",
+    objectFit: "cover",
+    background: "#eaeaea",
+    flexShrink: 0,
+  },
+  avatarFallback: {
+    width: 28,
+    height: 28,
+    borderRadius: "50%",
+    background: "#16161a",
+    color: "white",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 12,
+    fontWeight: 600,
+    flexShrink: 0,
+  },
   uid: {
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
     fontSize: 11,

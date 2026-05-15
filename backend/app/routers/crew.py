@@ -20,6 +20,10 @@ The redeem endpoint takes a code and:
   * 409 if single-use and already redeemed
   * 200 otherwise; creates the boat_crew row and (for single-use)
     marks the invite redeemed
+
+D4 update: ``list_crew`` now JOINs ``user_profiles`` and surfaces
+``email``, ``display_name``, and ``avatar_url`` — that's what makes
+crew rows render as "Grayson V." instead of a raw Firebase UID.
 """
 from __future__ import annotations
 
@@ -63,8 +67,19 @@ _CODE_PREFIX = "RACE-"
 
 
 class CrewMemberOut(BaseModel):
+    """One row in the crew list.
+
+    D4: ``display_name``, ``email``, and ``avatar_url`` are pulled
+    from ``user_profiles`` via a LEFT JOIN. They may be ``None`` for
+    members whose profile pre-dates the D4 migration and who haven't
+    visited the app since (the auth UPSERT backfills email + name on
+    first contact).
+    """
+
     user_id: str
     email: Optional[str] = None
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
     role: Literal["owner", "crew", "viewer"]
     joined_at: str
 
@@ -172,12 +187,21 @@ async def list_crew(
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
-    """Any member can see who's on the boat."""
+    """Any member can see who's on the boat.
+
+    Returns owner first, then crew, then viewer; within a role
+    members are sorted by ``joined_at`` so the order matches the boat's
+    natural history. We LEFT JOIN ``user_profiles`` so a freshly-
+    redeemed invite (whose owner hasn't yet hit any endpoint to
+    trigger the auth UPSERT) still shows up — just without a name
+    until they next log in.
+    """
     async with pool.acquire() as conn:
         await _require_boat_member(conn, boat_id, user["uid"])
         rows = await conn.fetch(
             """
-            SELECT bc.user_id, bc.role, bc.joined_at, up.id IS NOT NULL AS has_profile
+            SELECT bc.user_id, bc.role, bc.joined_at,
+                   up.email, up.display_name, up.avatar_url
             FROM boat_crew bc
             LEFT JOIN user_profiles up ON up.id = bc.user_id
             WHERE bc.boat_id = $1
@@ -191,14 +215,12 @@ async def list_crew(
             """,
             boat_id,
         )
-    # Note: user_profiles in this schema doesn't carry email (only id,
-    # which is the Firebase uid). Email comes from Firebase auth on
-    # the client side. We return the uid; the frontend can stitch a
-    # display name if it has one cached, or just show the uid.
     return [
         CrewMemberOut(
             user_id=r["user_id"],
-            email=None,
+            email=r["email"],
+            display_name=r["display_name"],
+            avatar_url=r["avatar_url"],
             role=r["role"],
             joined_at=r["joined_at"].isoformat(),
         )
@@ -223,12 +245,16 @@ async def update_member_role(
         await _require_boat_owner(conn, boat_id, user["uid"])
         row = await conn.fetchrow(
             """
-            UPDATE boat_crew
+            UPDATE boat_crew bc
             SET role = $3
-            WHERE boat_id = $1
-              AND user_id = $2
-              AND role IN ('crew', 'viewer')
-            RETURNING user_id, role, joined_at
+            FROM (SELECT 1) _
+            WHERE bc.boat_id = $1
+              AND bc.user_id = $2
+              AND bc.role IN ('crew', 'viewer')
+            RETURNING bc.user_id, bc.role, bc.joined_at,
+                      (SELECT email FROM user_profiles WHERE id = bc.user_id) AS email,
+                      (SELECT display_name FROM user_profiles WHERE id = bc.user_id) AS display_name,
+                      (SELECT avatar_url FROM user_profiles WHERE id = bc.user_id) AS avatar_url
             """,
             boat_id, member_uid, payload.role,
         )
@@ -239,6 +265,9 @@ async def update_member_role(
         )
     return CrewMemberOut(
         user_id=row["user_id"],
+        email=row["email"],
+        display_name=row["display_name"],
+        avatar_url=row["avatar_url"],
         role=row["role"],
         joined_at=row["joined_at"].isoformat(),
     )

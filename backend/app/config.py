@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # works without provisioning the bucket — the boats router falls
     # back to "parse but don't persist" when unset.
     gcs_certs_bucket: str | None = Field(default=None, alias="GCS_CERTS_BUCKET")
+    # User avatars uploaded via /api/users/me/avatar. Nullable so dev
+    # works without provisioning the bucket — the users router skips
+    # the ``avatar_url`` update when unset, the rest of the profile
+    # save still succeeds. Bucket should be public-read (objects are
+    # served via plain ``https://storage.googleapis.com/...`` URLs).
+    gcs_avatars_bucket: str | None = Field(default=None, alias="GCS_AVATARS_BUCKET")
 
     # === Anthropic (post-race AI summary, Session D1) ===
     # Nullable so the app boots without the key — the summary service

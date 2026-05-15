@@ -22,6 +22,13 @@ HTTP and WS uniformly.
 Firebase Admin auto-discovers credentials on Cloud Run via the runtime
 service account (`sailline-api`), which has the `firebaseauth.admin` role.
 No JSON key file or env var is required in production.
+
+Session D4: ``_ensure_profile`` now also writes ``email``, ``display_name``,
+and ``profile_complete`` from token claims on first contact. Google sign-in
+tokens carry a ``name`` claim that lets us auto-complete the profile;
+email-only sign-ups don't, so they get routed through the ProfileView on
+first visit. COALESCE on the UPDATE branch protects subsequent user edits
+from being clobbered by a stale token claim.
 """
 
 from __future__ import annotations
@@ -65,20 +72,52 @@ def initialize() -> None:
         log.info("Firebase Admin initialized")
 
 
-async def _ensure_profile(pool: asyncpg.Pool, uid: str) -> str:
+async def _ensure_profile(
+    pool: asyncpg.Pool,
+    uid: str,
+    email: str | None,
+    name: str | None,
+) -> str:
     """Return the user's tier, lazily creating their profile row if missing.
 
-    Uses an UPSERT with a no-op ON CONFLICT clause so the RETURNING projection
-    always yields a row, in a single round trip and without race conditions.
+    UPSERT semantics:
+
+      * **First contact** — INSERT writes the uid, email (if any), and
+        display_name (if any, from a Google ``name`` claim). The
+        ``profile_complete`` flag is TRUE iff we have a display name to
+        write; email-only sign-ups stay FALSE until the user submits a
+        name through ``PATCH /api/users/me``.
+
+      * **Subsequent contact** — ON CONFLICT updates each field via
+        ``COALESCE(existing, EXCLUDED)``: we only fill in a field that
+        is currently NULL. This protects user edits (someone who set
+        their own display_name doesn't get it overwritten on every
+        token verify) while still backfilling fields that were NULL
+        (e.g. accounts that pre-date the D4 migration get their email
+        filled in the first time they hit any endpoint).
+
+      * ``profile_complete`` is OR-ed: once TRUE, it stays TRUE. The
+        only way to flip it is forward (via the user submitting a
+        name) — never backward.
+
+    Single round trip, race-safe (the UPSERT is atomic).
     """
+    has_name = bool(name)
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
-            INSERT INTO user_profiles (id) VALUES ($1)
-            ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id
+            INSERT INTO user_profiles (id, email, display_name, profile_complete)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE SET
+                email            = COALESCE(user_profiles.email, EXCLUDED.email),
+                display_name     = COALESCE(user_profiles.display_name, EXCLUDED.display_name),
+                profile_complete = user_profiles.profile_complete OR EXCLUDED.profile_complete
             RETURNING tier
             """,
             uid,
+            email,
+            name,
+            has_name,
         )
 
 
@@ -103,10 +142,15 @@ async def _verify_token_string(token: str, pool: asyncpg.Pool) -> dict:
         raise InvalidTokenError(type(exc).__name__) from exc
 
     uid = decoded["uid"]
-    tier = await _ensure_profile(pool, uid)
+    email = decoded.get("email")
+    # Firebase normalises the Google profile name into the ``name`` claim;
+    # for email-only sign-ups this is absent. Don't fall back to email-as-
+    # name — the user can pick something nicer in ProfileView.
+    name = decoded.get("name")
+    tier = await _ensure_profile(pool, uid, email, name)
     return {
         "uid": uid,
-        "email": decoded.get("email"),
+        "email": email,
         "tier": tier,
         "claims": decoded,
     }
