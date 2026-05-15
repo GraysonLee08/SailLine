@@ -57,4 +57,6 @@ websockets==13.1
 
 
 anthropic==0.39.0                 # Post-race AI summary (Session D1)
+pypdf==5.1.0                      # MWPHRF cert parsing (Session D2)
+python-multipart==0.0.20          # FastAPI UploadFile for /api/boats/{id}/cert
 # stripe                            # Payments (week 7)

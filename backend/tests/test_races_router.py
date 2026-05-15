@@ -76,6 +76,9 @@ def _make_row(**overrides):
         "started_at": None,
         "ended_at": None,
         "auto_start_enabled": True,
+        # D2 columns
+        "boat_id": None,
+        "uses_spinnaker": True,
         "created_at": now,
         "updated_at": now,
     }

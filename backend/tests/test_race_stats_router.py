@@ -84,8 +84,11 @@ def _race_row(
     mark_passes=None,
     ai_summary=None,
     wind_snapshot=None,
+    boat=None,
+    mode="inshore",
+    uses_spinnaker=True,
 ):
-    return {
+    row = {
         "id": uuid4(),
         "name": name,
         "boat_class": "J/70",
@@ -94,7 +97,30 @@ def _race_row(
         "mark_passes": mark_passes or [],
         "ai_summary": ai_summary,
         "wind_snapshot": wind_snapshot,
+        "mode": mode,
+        "uses_spinnaker": uses_spinnaker,
+        "boat_id": None,
+        # LEFT JOIN columns — all None when no boat attached.
+        "boat_pk": None,
+        "boat_name": None,
+        "boat_sail_number": None,
+        "boat_mwphrf_region": None,
+        "boat_hcp": None,
+        "boat_dhcp": None,
+        "boat_nshcp": None,
+        "boat_dnshcp": None,
     }
+    if boat:
+        row["boat_id"] = boat.get("id") or uuid4()
+        row["boat_pk"] = row["boat_id"]
+        row["boat_name"] = boat.get("name", "Test boat")
+        row["boat_sail_number"] = boat.get("sail_number")
+        row["boat_mwphrf_region"] = boat.get("mwphrf_region")
+        row["boat_hcp"] = boat.get("hcp")
+        row["boat_dhcp"] = boat.get("dhcp")
+        row["boat_nshcp"] = boat.get("nshcp")
+        row["boat_dnshcp"] = boat.get("dnshcp")
+    return row
 
 
 def _track_rows(n=10):
@@ -203,6 +229,31 @@ def test_get_wind_meta_none_when_snapshot_absent(free_client, mock_conn):
     r = free_client.get(f"/api/races/{uuid4()}/stats")
     body = r.json()
     assert body["wind"] is None
+
+
+def test_get_includes_corrected_time_when_boat_has_rating(free_client, mock_conn):
+    boat = {"name": "Gaucho", "hcp": 75, "dhcp": 78, "mwphrf_region": 5}
+    _setup_fetches(
+        mock_conn,
+        _race_row(boat=boat, mode="inshore", uses_spinnaker=True),
+        _track_rows(60),
+    )
+    r = free_client.get(f"/api/races/{uuid4()}/stats")
+    body = r.json()
+    assert body["boat"] is not None
+    assert body["boat"]["hcp"] == 75
+    assert body["stats"]["corrected_using"] == "hcp"
+    assert body["stats"]["rating_seconds_per_mile"] == 75
+    # corrected_time_s should be a finite number, less than elapsed_s
+    assert isinstance(body["stats"]["corrected_time_s"], (int, float))
+
+
+def test_get_omits_boat_when_race_has_no_boat(free_client, mock_conn):
+    _setup_fetches(mock_conn, _race_row(boat=None), _track_rows(10))
+    r = free_client.get(f"/api/races/{uuid4()}/stats")
+    body = r.json()
+    assert body["boat"] is None
+    assert body["stats"]["corrected_time_s"] is None
 
 
 # ─── POST /regenerate ────────────────────────────────────────────────

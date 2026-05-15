@@ -92,14 +92,24 @@ async def _load_race(
     """Pull every column we need to run the pipeline in a single query.
 
     Returns None if the race doesn't exist.
+
+    D2: LEFT JOIN the boats table so corrected-time math has the rating
+    available without a second round trip.
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, name, boat_class, start_at,
-                   marks, mark_passes, ai_summary, wind_snapshot
-            FROM race_sessions
-            WHERE id = $1
+            SELECT
+                r.id, r.user_id, r.name, r.boat_class, r.start_at,
+                r.marks, r.mark_passes, r.ai_summary, r.wind_snapshot,
+                r.mode, r.uses_spinnaker, r.boat_id,
+                b.hcp    AS boat_hcp,
+                b.dhcp   AS boat_dhcp,
+                b.nshcp  AS boat_nshcp,
+                b.dnshcp AS boat_dnshcp
+            FROM race_sessions r
+            LEFT JOIN boats b ON b.id = r.boat_id
+            WHERE r.id = $1
             """,
             race_id,
         )
@@ -271,11 +281,22 @@ async def process_race(
     mark_passes = race["mark_passes"] or []
     race_start_at = race["start_at"]
 
+    boat_for_math = None
+    if race.get("boat_id"):
+        boat_for_math = {
+            "hcp": race.get("boat_hcp"),
+            "dhcp": race.get("boat_dhcp"),
+            "nshcp": race.get("boat_nshcp"),
+            "dnshcp": race.get("boat_dnshcp"),
+        }
     stats = compute_stats(
         track_points,
         marks=marks,
         mark_passes=mark_passes,
         race_start_at=race_start_at,
+        boat=boat_for_math,
+        mode=race.get("mode"),
+        uses_spinnaker=bool(race.get("uses_spinnaker", True)),
     )
     if stats is None:
         log.info("race %s: stats compute returned None; nothing to do", race_id)

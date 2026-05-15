@@ -56,6 +56,9 @@ class RaceCreate(BaseModel):
     # still ends up with auto_start_enabled=True. Sending False explicitly
     # at create time is supported (rare — users typically opt out later).
     auto_start_enabled: bool = True
+    # D2: per-race boat link + spinnaker choice.
+    boat_id: Optional[UUID] = None
+    uses_spinnaker: bool = True
 
 
 class RaceUpdate(BaseModel):
@@ -69,6 +72,8 @@ class RaceUpdate(BaseModel):
     marks: Optional[list[Mark]] = None
     start_at: Optional[datetime] = None
     auto_start_enabled: Optional[bool] = None
+    boat_id: Optional[UUID] = None
+    uses_spinnaker: Optional[bool] = None
 
 
 class RaceOut(BaseModel):
@@ -81,6 +86,8 @@ class RaceOut(BaseModel):
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     auto_start_enabled: bool = True
+    boat_id: Optional[UUID] = None
+    uses_spinnaker: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -89,7 +96,8 @@ class RaceOut(BaseModel):
 
 _SELECT_COLS = """
     id, name, mode, boat_class, marks, start_at, started_at, ended_at,
-    auto_start_enabled, created_at, updated_at
+    auto_start_enabled, boat_id, uses_spinnaker,
+    created_at, updated_at
 """
 
 
@@ -113,6 +121,8 @@ def _row_to_race(row: asyncpg.Record) -> dict:
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
         "auto_start_enabled": row["auto_start_enabled"],
+        "boat_id": row["boat_id"],
+        "uses_spinnaker": row["uses_spinnaker"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -158,9 +168,9 @@ async def create_race(
             f"""
             INSERT INTO race_sessions (
                 user_id, name, mode, boat_class, marks, start_at,
-                auto_start_enabled
+                auto_start_enabled, boat_id, uses_spinnaker
             )
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
             RETURNING {_SELECT_COLS}
             """,
             user["uid"],
@@ -170,6 +180,8 @@ async def create_race(
             _marks_json(payload.marks),
             payload.start_at,
             payload.auto_start_enabled,
+            payload.boat_id,
+            payload.uses_spinnaker,
         )
     return _row_to_race(row)
 

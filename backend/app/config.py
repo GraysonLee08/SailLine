@@ -37,6 +37,10 @@ class Settings(BaseSettings):
 
     # === Cloud Storage ===
     gcs_weather_bucket: str | None = Field(default=None, alias="GCS_WEATHER_BUCKET")
+    # PHRF cert PDFs uploaded via /api/boats/{id}/cert. Nullable so dev
+    # works without provisioning the bucket — the boats router falls
+    # back to "parse but don't persist" when unset.
+    gcs_certs_bucket: str | None = Field(default=None, alias="GCS_CERTS_BUCKET")
 
     # === Anthropic (post-race AI summary, Session D1) ===
     # Nullable so the app boots without the key — the summary service

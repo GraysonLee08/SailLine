@@ -131,6 +131,24 @@ def test_prompt_includes_wind_summary_when_snapshot_present():
     assert "W)" in p or "W " in p  # WSW/WNW/W all contain W
 
 
+def test_prompt_includes_corrected_time_when_present():
+    s = _stats()
+    s["corrected_time_s"] = 1500.0
+    s["corrected_using"] = "hcp"
+    s["rating_seconds_per_mile"] = 75
+    p = build_prompt(race_name=None, boat_class=None, stats=s)
+    assert "Corrected time" in p
+    assert "rating 75" in p
+    assert "ToD HCP" in p
+
+
+def test_prompt_omits_corrected_time_when_no_rating():
+    s = _stats()
+    # corrected_time_s / corrected_using / rating all unset.
+    p = build_prompt(race_name=None, boat_class=None, stats=s)
+    assert "Corrected time" not in p
+
+
 def test_prompt_notes_missing_wind():
     p = build_prompt(
         race_name=None,

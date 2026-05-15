@@ -137,7 +137,15 @@ class SpeedSample:
 
 @dataclass(frozen=True)
 class RaceStats:
-    """Everything the stats view renders, minus the AI summary."""
+    """Everything the stats view renders, minus the AI summary.
+
+    Corrected-time fields (D2): populated only when the race has a
+    ``boat_id`` pointing at a boat with the relevant rating. Math is
+    the standard ToD: ``corrected_s = elapsed_s - rating * distance_nm``
+    where rating is seconds-per-nautical-mile from the boat's cert.
+    ``corrected_using`` carries which of the four handicaps applied
+    so the UI can label it ("ToD HCP", "ToD DHCP", etc.).
+    """
     point_count: int
     started_at: datetime
     ended_at: datetime
@@ -150,6 +158,9 @@ class RaceStats:
     max_sog_kt: float
     legs: list[LegSplit]
     speed_series: list[SpeedSample]
+    corrected_time_s: Optional[float] = None
+    corrected_using: Optional[str] = None          # "hcp" | "dhcp" | "nshcp" | "dnshcp"
+    rating_seconds_per_mile: Optional[int] = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict for API responses and JSONB storage."""
@@ -317,14 +328,61 @@ def _segment_sog_kt(
     return (dist_m / dt_s) / _MPS_PER_KT
 
 
+def pick_handicap(
+    boat: Optional[dict],
+    mode: Optional[str],
+    uses_spinnaker: bool,
+) -> tuple[Optional[int], Optional[str]]:
+    """Pick (rating, name) from the boat's four ratings given the
+    course mode and spinnaker choice.
+
+    Returns ``(None, None)`` when the boat is missing or the relevant
+    rating is null on the cert — caller should then skip corrected
+    time entirely.
+
+    Mapping (MWPHRF convention):
+      * inshore  + spin     → HCP     (ToD buoy)
+      * inshore  + non-spin → NSHCP   (ToD buoy non-spinnaker)
+      * distance + spin     → DHCP    (ToD random leg)
+      * distance + non-spin → DNSHCP  (ToD random leg non-spinnaker)
+    """
+    if not boat:
+        return (None, None)
+    if mode == "distance":
+        key = "dhcp" if uses_spinnaker else "dnshcp"
+    else:
+        # Default to inshore for any unknown mode value.
+        key = "hcp" if uses_spinnaker else "nshcp"
+    rating = boat.get(key)
+    if rating is None:
+        return (None, None)
+    try:
+        return (int(rating), key)
+    except (TypeError, ValueError):
+        return (None, None)
+
+
 def compute_stats(
     track_points: list[TrackPoint],
     marks: list[dict],
     mark_passes: list[dict],
     race_start_at: Optional[datetime] = None,
+    *,
+    boat: Optional[dict] = None,
+    mode: Optional[str] = None,
+    uses_spinnaker: bool = True,
 ) -> Optional[RaceStats]:
     """The whole pipeline. Returns ``None`` if there's no track to
-    analyse."""
+    analyse.
+
+    D2 params:
+      * ``boat``           — boat row dict; ``hcp/dhcp/nshcp/dnshcp``
+                             keys when set drive corrected time.
+      * ``mode``           — ``"inshore"`` | ``"distance"`` (from
+                             race_sessions.mode). Picks HCP vs DHCP.
+      * ``uses_spinnaker`` — per-race choice. Picks HCP vs NSHCP
+                             (and DHCP vs DNSHCP for distance).
+    """
     if not track_points:
         return None
 
@@ -384,6 +442,20 @@ def compute_stats(
     )
     speed_samples = _downsample_speed_series(speed_series)
 
+    # Corrected time (ToD): seconds = elapsed - rating * distance_nm.
+    # Only meaningful when we have both a rating and non-zero distance.
+    rating, rating_key = pick_handicap(boat, mode, uses_spinnaker)
+    corrected_time_s: Optional[float] = None
+    if rating is not None and distance_m > 0 and elapsed_s > 0:
+        distance_nm = distance_m / 1852.0
+        corrected_time_s = elapsed_s - rating * distance_nm
+        # Negative corrected time is mathematically valid (you sailed
+        # faster than your rating) but cap at 0 to avoid surprising
+        # the UI. Real PHRF scoring allows negatives; we'll surface
+        # them later if anyone asks.
+        if corrected_time_s < 0:
+            corrected_time_s = 0.0
+
     return RaceStats(
         point_count=len(pts),
         started_at=started_at,
@@ -397,6 +469,9 @@ def compute_stats(
         max_sog_kt=max_sog_kt,
         legs=legs,
         speed_series=speed_samples,
+        corrected_time_s=corrected_time_s,
+        corrected_using=rating_key,
+        rating_seconds_per_mile=rating,
     )
 
 

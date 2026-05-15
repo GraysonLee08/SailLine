@@ -24,6 +24,7 @@ from app.services.race_stats import (
     _haversine_m,
     _track_distance_in_window,
     compute_stats,
+    pick_handicap,
     track_points_from_rows,
 )
 
@@ -339,6 +340,127 @@ def test_douglas_peucker_keeps_spikes():
 
 
 # ─── Row adapter ──────────────────────────────────────────────────────
+
+
+# ─── pick_handicap (D2) ─────────────────────────────────────────────
+
+
+def test_pick_handicap_inshore_spin_uses_hcp():
+    boat = {"hcp": 75, "dhcp": 78, "nshcp": 90, "dnshcp": 93}
+    rating, key = pick_handicap(boat, "inshore", True)
+    assert rating == 75 and key == "hcp"
+
+
+def test_pick_handicap_inshore_nonspin_uses_nshcp():
+    boat = {"hcp": 75, "nshcp": 90}
+    rating, key = pick_handicap(boat, "inshore", False)
+    assert rating == 90 and key == "nshcp"
+
+
+def test_pick_handicap_distance_spin_uses_dhcp():
+    boat = {"hcp": 75, "dhcp": 78}
+    rating, key = pick_handicap(boat, "distance", True)
+    assert rating == 78 and key == "dhcp"
+
+
+def test_pick_handicap_distance_nonspin_uses_dnshcp():
+    boat = {"dnshcp": 95}
+    rating, key = pick_handicap(boat, "distance", False)
+    assert rating == 95 and key == "dnshcp"
+
+
+def test_pick_handicap_returns_none_when_rating_missing():
+    boat = {"hcp": None, "dhcp": None}
+    rating, key = pick_handicap(boat, "inshore", True)
+    assert rating is None and key is None
+
+
+def test_pick_handicap_returns_none_when_boat_none():
+    rating, key = pick_handicap(None, "inshore", True)
+    assert rating is None and key is None
+
+
+def test_pick_handicap_defaults_to_inshore_for_unknown_mode():
+    boat = {"hcp": 100, "dhcp": 110}
+    rating, key = pick_handicap(boat, None, True)
+    assert key == "hcp"
+
+
+# ─── compute_stats with boat → corrected time ───────────────────────
+
+
+def test_corrected_time_set_when_boat_has_rating():
+    # 1000 m east at 5 kt → 1000/1852 nm ≈ 0.54 nm in ~388 s.
+    pts = [
+        tp(t_offset_s=i, east_m=i * 1.0, speed_kts=5.0) for i in range(389)
+    ]
+    boat = {"hcp": 75}
+    stats = compute_stats(
+        pts, marks=[], mark_passes=[],
+        boat=boat, mode="inshore", uses_spinnaker=True,
+    )
+    assert stats is not None
+    assert stats.corrected_using == "hcp"
+    assert stats.rating_seconds_per_mile == 75
+    # corrected = elapsed - 75 * 0.54 ≈ 388 - 40.5 ≈ 347.5
+    expected = stats.elapsed_s - 75 * (stats.distance_m / 1852.0)
+    assert stats.corrected_time_s == pytest.approx(expected, rel=0.01)
+
+
+def test_corrected_time_none_when_no_boat():
+    pts = [
+        tp(t_offset_s=i, east_m=i * 1.0, speed_kts=5.0) for i in range(50)
+    ]
+    stats = compute_stats(pts, marks=[], mark_passes=[])
+    assert stats is not None
+    assert stats.corrected_time_s is None
+    assert stats.corrected_using is None
+
+
+def test_corrected_time_none_when_rating_null():
+    pts = [
+        tp(t_offset_s=i, east_m=i * 1.0, speed_kts=5.0) for i in range(50)
+    ]
+    boat = {"hcp": None}
+    stats = compute_stats(
+        pts, marks=[], mark_passes=[],
+        boat=boat, mode="inshore", uses_spinnaker=True,
+    )
+    assert stats is not None
+    assert stats.corrected_time_s is None
+
+
+def test_corrected_time_clamps_at_zero_for_fast_boats():
+    # Move 100 m in 1 s → ~0.054 nm, elapsed ~1s, rating 500 → very
+    # negative corrected. Clamp to 0.
+    pts = [
+        tp(t_offset_s=0, east_m=0, speed_kts=200),
+        tp(t_offset_s=1, east_m=100, speed_kts=200),
+    ]
+    boat = {"hcp": 500}
+    stats = compute_stats(
+        pts, marks=[], mark_passes=[],
+        boat=boat, mode="inshore", uses_spinnaker=True,
+    )
+    assert stats is not None
+    assert stats.corrected_time_s == 0.0
+
+
+def test_corrected_time_distance_mode_uses_dhcp():
+    pts = [
+        tp(t_offset_s=i, east_m=i * 1.0, speed_kts=5.0) for i in range(50)
+    ]
+    boat = {"hcp": 75, "dhcp": 78}
+    stats = compute_stats(
+        pts, marks=[], mark_passes=[],
+        boat=boat, mode="distance", uses_spinnaker=True,
+    )
+    assert stats is not None
+    assert stats.corrected_using == "dhcp"
+    assert stats.rating_seconds_per_mile == 78
+
+
+# ─── Row adapter (existing test, kept) ──────────────────────────────
 
 
 def test_track_points_from_rows_handles_iso_and_dt():

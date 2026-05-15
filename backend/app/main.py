@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import auth, db, redis_client
 from app.routers import (
     ais,
+    boats,
     health,
     race_stats,
     races,
@@ -70,6 +71,7 @@ app.include_router(weather.router)                # router carries its own /api/
 app.include_router(races.router)                  # router carries its own /api/races prefix
 app.include_router(tracks.router)                 # router carries its own /api/races/{id}/track prefix
 app.include_router(race_stats.router)             # /api/races/{id}/stats (Session D1)
+app.include_router(boats.router)                  # /api/boats (Session D2)
 app.include_router(telemetry.router)              # router carries its own /api/races/{id}/telemetry prefix
 app.include_router(telemetry_stream.router)       # WS /api/races/{id}/telemetry/stream
 app.include_router(routing.router)                # /api/routing - compute endpoint

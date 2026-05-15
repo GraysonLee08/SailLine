@@ -72,6 +72,13 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
   // in the editor sidebar; honoured by useAutoStartRecorder in MapView.
   const [autoStartEnabled, setAutoStartEnabled] = useState(true);
 
+  // D2: per-race boat link + spinnaker choice. boatId may be null for
+  // races where the user hasn't picked a boat (and therefore corrected
+  // time won't be shown on the stats view).
+  const [boatId, setBoatId] = useState(null);
+  const [usesSpinnaker, setUsesSpinnaker] = useState(true);
+  const [boatOptions, setBoatOptions] = useState([]);   // [{id, name, sail_number}]
+
   // Start time, split into local date + local time strings for the two
   // <input> elements. Combined to ISO UTC only on save (and only when
   // both halves are set). Storing them as strings rather than a Date
@@ -123,6 +130,8 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         // Races created before 0007 serialise as true (column default).
         // Be defensive against an undefined response field anyway.
         setAutoStartEnabled(race.auto_start_enabled !== false);
+        setBoatId(race.boat_id ?? null);
+        setUsesSpinnaker(race.uses_spinnaker !== false);
         const parts = isoToLocalParts(race.start_at);
         setStartDate(parts.date);
         setStartTime(parts.time);
@@ -137,6 +146,27 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
       cancelled = true;
     };
   }, [raceId, isNew]);
+
+  // ── Load boats + default selection ───────────────────────────────
+  // Done independently of the race load so the dropdown is ready
+  // before the user opens it. The default boat only applies on new
+  // races; editing an existing race uses whatever it already has.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      apiFetch("/api/boats").catch(() => []),
+      apiFetch("/api/users/me").catch(() => null),
+    ]).then(([boats, profile]) => {
+      if (cancelled) return;
+      setBoatOptions(Array.isArray(boats) ? boats : []);
+      if (isNew && profile?.default_boat_id) {
+        setBoatId(profile.default_boat_id);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isNew]);
 
   // Combine date + time into an ISO UTC string for the countdown and
   // for the save payload. If either half is empty, the start is "unset".
@@ -388,6 +418,8 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
         })),
         start_at: startAtIso, // null when either half is unset
         auto_start_enabled: autoStartEnabled,
+        boat_id: boatId,
+        uses_spinnaker: usesSpinnaker,
       };
       const saved = isNew
         ? await apiFetch("/api/races", { method: "POST", body: payload })
@@ -478,6 +510,33 @@ export default function RaceEditor({ raceId, onClose, onSaved }) {
                   <option key={c} value={c}>{c}</option>
                 ))}
               </select>
+            </Section>
+
+            <Section label="Boat (for handicap)">
+              <select
+                value={boatId ?? ""}
+                onChange={(e) => setBoatId(e.target.value || null)}
+                style={styles.input}
+              >
+                <option value="">— No boat (skip corrected time) —</option>
+                {boatOptions.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}
+                    {b.sail_number ? ` (#${b.sail_number})` : ""}
+                  </option>
+                ))}
+              </select>
+              <label style={styles.autoStartRow}>
+                <input
+                  type="checkbox"
+                  checked={usesSpinnaker}
+                  onChange={(e) => setUsesSpinnaker(e.target.checked)}
+                  style={styles.autoStartCheckbox}
+                />
+                <span style={styles.autoStartLabel}>
+                  Flying spinnaker (uses HCP/DHCP; uncheck for NSHCP/DNSHCP)
+                </span>
+              </label>
             </Section>
 
             <Section

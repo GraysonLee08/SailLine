@@ -82,6 +82,24 @@ class StatsOut(BaseModel):
     max_sog_kt: float
     legs: list[LegOut]
     speed_series: list[SpeedSampleOut]
+    # D2 corrected-time fields. All None when the race has no boat
+    # set or the boat doesn't carry the relevant rating.
+    corrected_time_s: Optional[float] = None
+    corrected_using: Optional[str] = None
+    rating_seconds_per_mile: Optional[int] = None
+
+
+class BoatSummaryOut(BaseModel):
+    """Just enough of the boat record to label the corrected-time tile
+    and the stats view header. Full boat detail is at /api/boats/{id}."""
+    id: UUID
+    name: str
+    sail_number: Optional[str] = None
+    mwphrf_region: Optional[int] = None
+    hcp: Optional[int] = None
+    dhcp: Optional[int] = None
+    nshcp: Optional[int] = None
+    dnshcp: Optional[int] = None
 
 
 class AiSummaryOut(BaseModel):
@@ -113,6 +131,9 @@ class StatsResponse(BaseModel):
     name: Optional[str] = None
     boat_class: Optional[str] = None
     start_at: Optional[str] = None
+    mode: Optional[str] = None                # "inshore" | "distance"
+    uses_spinnaker: bool = True
+    boat: Optional[BoatSummaryOut] = None
     # Echo the marks so the frontend's read-only map can render them
     # without a second /api/races/{id} round trip. Same shape the
     # editor stores: list of {lat, lon, name?, ...}. Empty list when
@@ -136,13 +157,29 @@ class RegenerateAccepted(BaseModel):
 async def _load_race_row(
     conn: asyncpg.Connection, race_id: UUID, uid: str,
 ) -> dict:
-    """Auth + load. 404 on missing-or-not-owned (we don't leak existence)."""
+    """Auth + load. 404 on missing-or-not-owned (we don't leak existence).
+
+    LEFT JOINs the boat so the stats endpoint can compute corrected
+    time and surface the boat summary without a second round trip.
+    Boat columns come back NULL when the race has no boat_id set.
+    """
     row = await conn.fetchrow(
         """
-        SELECT id, name, boat_class, start_at, marks, mark_passes,
-               ai_summary, wind_snapshot
-        FROM race_sessions
-        WHERE id = $1 AND user_id = $2
+        SELECT
+            r.id, r.name, r.boat_class, r.start_at, r.marks,
+            r.mark_passes, r.ai_summary, r.wind_snapshot,
+            r.mode, r.uses_spinnaker, r.boat_id,
+            b.id           AS boat_pk,
+            b.name         AS boat_name,
+            b.sail_number  AS boat_sail_number,
+            b.mwphrf_region AS boat_mwphrf_region,
+            b.hcp          AS boat_hcp,
+            b.dhcp         AS boat_dhcp,
+            b.nshcp        AS boat_nshcp,
+            b.dnshcp       AS boat_dnshcp
+        FROM race_sessions r
+        LEFT JOIN boats b ON b.id = r.boat_id
+        WHERE r.id = $1 AND r.user_id = $2
         """,
         race_id, uid,
     )
@@ -251,9 +288,36 @@ async def get_stats(
         race = await _load_race_row(conn, race_id, user["uid"])
         track_rows = await _load_track_rows(conn, race_id)
 
+    # Pull the boat fields out of the joined row into a dict the
+    # service layer recognises. None when the race has no boat_id.
+    boat_for_math = None
+    boat_summary = None
+    if race.get("boat_pk") is not None:
+        boat_for_math = {
+            "hcp": race.get("boat_hcp"),
+            "dhcp": race.get("boat_dhcp"),
+            "nshcp": race.get("boat_nshcp"),
+            "dnshcp": race.get("boat_dnshcp"),
+        }
+        boat_summary = BoatSummaryOut(
+            id=race["boat_pk"],
+            name=race.get("boat_name") or "",
+            sail_number=race.get("boat_sail_number"),
+            mwphrf_region=race.get("boat_mwphrf_region"),
+            hcp=race.get("boat_hcp"),
+            dhcp=race.get("boat_dhcp"),
+            nshcp=race.get("boat_nshcp"),
+            dnshcp=race.get("boat_dnshcp"),
+        )
+
     stats_dict: Optional[dict] = None
     if track_rows:
         point_count = len(track_rows)
+        # Cache key intentionally does NOT include the boat — the
+        # boat's rating affects only the corrected-time field, which
+        # we re-derive on every read from the boat row. If we cached
+        # corrected time together with elapsed, a rating edit would
+        # leave stale data behind until the next track flush.
         stats_dict = await _cached_stats(race_id, point_count)
         if stats_dict is None:
             pts = track_points_from_rows(track_rows)
@@ -262,6 +326,9 @@ async def get_stats(
                 marks=race.get("marks") or [],
                 mark_passes=race.get("mark_passes") or [],
                 race_start_at=race.get("start_at"),
+                boat=boat_for_math,
+                mode=race.get("mode"),
+                uses_spinnaker=bool(race.get("uses_spinnaker", True)),
             )
             if computed is not None:
                 stats_dict = computed.to_dict()
@@ -277,6 +344,9 @@ async def get_stats(
         name=race.get("name"),
         boat_class=race.get("boat_class"),
         start_at=race["start_at"].isoformat() if race.get("start_at") else None,
+        mode=race.get("mode"),
+        uses_spinnaker=bool(race.get("uses_spinnaker", True)),
+        boat=boat_summary,
         marks=race.get("marks") or [],
         stats=StatsOut(**stats_dict) if stats_dict else None,
         ai_summary=AiSummaryOut(**ai_summary) if ai_summary else None,

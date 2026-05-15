@@ -144,16 +144,23 @@ function StatTiles({ stats }) {
       label: "Elapsed",
       value: formatDuration(stats.elapsed_s),
     },
-    {
-      label: "Avg SOG",
-      value: `${stats.avg_sog_kt.toFixed(1)} kt`,
-      sub: `moving ${stats.avg_moving_sog_kt.toFixed(1)} kt`,
-    },
-    {
-      label: "Max SOG",
-      value: `${stats.max_sog_kt.toFixed(1)} kt`,
-    },
   ];
+  if (stats.corrected_time_s != null) {
+    tiles.push({
+      label: "Corrected",
+      value: formatDuration(stats.corrected_time_s),
+      sub: handicapSublabel(stats.corrected_using, stats.rating_seconds_per_mile),
+    });
+  }
+  tiles.push({
+    label: "Avg SOG",
+    value: `${stats.avg_sog_kt.toFixed(1)} kt`,
+    sub: `moving ${stats.avg_moving_sog_kt.toFixed(1)} kt`,
+  });
+  tiles.push({
+    label: "Max SOG",
+    value: `${stats.max_sog_kt.toFixed(1)} kt`,
+  });
   return (
     <div style={styles.tilesRow}>
       {tiles.map((t) => (
@@ -165,6 +172,19 @@ function StatTiles({ stats }) {
       ))}
     </div>
   );
+}
+
+
+function handicapSublabel(key, rating) {
+  if (!key) return null;
+  const map = {
+    hcp:    "ToD HCP",
+    dhcp:   "ToD DHCP",
+    nshcp:  "ToD NSHCP",
+    dnshcp: "ToD DNSHCP",
+  };
+  const name = map[key] || key.toUpperCase();
+  return rating != null ? `${name} · rating ${rating}` : name;
 }
 
 

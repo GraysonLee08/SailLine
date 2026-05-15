@@ -53,7 +53,7 @@ log = logging.getLogger(__name__)
 # Bump this when you edit ``_SYSTEM_PROMPT`` or change the JSON shape
 # the model is asked to produce. Stored summaries with a lower version
 # get regenerated automatically.
-PROMPT_VERSION: int = 1
+PROMPT_VERSION: int = 2
 
 # Default model — the config has the override knob.
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -150,6 +150,9 @@ def build_prompt(
     max_kt = stats.get("max_sog_kt", 0.0)
     mov_kt = stats.get("avg_moving_sog_kt", 0.0)
     stopped_s = stats.get("stopped_s", 0.0)
+    corrected_s = stats.get("corrected_time_s")
+    corrected_using = stats.get("corrected_using")
+    rating = stats.get("rating_seconds_per_mile")
 
     lines = [
         f"Race: {name}",
@@ -159,8 +162,19 @@ def build_prompt(
         f"Average SOG: {avg_kt:.1f} kt (moving-only: {mov_kt:.1f} kt, "
         f"max: {max_kt:.1f} kt)",
         f"Time stopped (<0.5 kt): {_fmt_duration(stopped_s)}",
-        "",
     ]
+    if corrected_s is not None and rating is not None and corrected_using:
+        label_map = {
+            "hcp":    "ToD HCP (buoy, spinnaker)",
+            "dhcp":   "ToD DHCP (random leg, spinnaker)",
+            "nshcp":  "ToD NSHCP (buoy, non-spinnaker)",
+            "dnshcp": "ToD DNSHCP (random leg, non-spinnaker)",
+        }
+        lines.append(
+            f"Corrected time: {_fmt_duration(corrected_s)} "
+            f"(rating {rating} s/nm, {label_map.get(corrected_using, corrected_using)})"
+        )
+    lines.append("")
 
     legs = stats.get("legs") or []
     if legs:

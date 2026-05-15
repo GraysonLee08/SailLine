@@ -72,6 +72,12 @@ def _make_race_row(
         ],
         "ai_summary": ai_summary,
         "wind_snapshot": wind_snapshot,
+        # D2 columns
+        "mode": "inshore",
+        "uses_spinnaker": True,
+        "boat_id": None,
+        "boat_hcp": None, "boat_dhcp": None,
+        "boat_nshcp": None, "boat_dnshcp": None,
     }
 
 

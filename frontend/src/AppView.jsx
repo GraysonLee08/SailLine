@@ -36,6 +36,8 @@ import { MapView } from "./components/MapView.jsx";
 const RacesListView = lazy(() => import("./RacesListView.jsx"));
 const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
 const RaceStatsView = lazy(() => import("./RaceStatsView.jsx"));
+const BoatsView = lazy(() => import("./BoatsView.jsx"));
+const BoatEditor = lazy(() => import("./BoatEditor.jsx"));
 const SensorDebugView = lazy(() => import("./SensorDebugView.jsx"));
 
 const ACTIVE_RACE_KEY = "sailline.activeRaceId";
@@ -86,6 +88,8 @@ export default function AppView({ user }) {
   //           | { kind: "races" }
   //           | { kind: "editor", raceId: string | null, returnTo: "map" | "races" }
   //           | { kind: "stats", raceId: string, returnTo: "map" | "races" }
+  //           | { kind: "boats" }
+  //           | { kind: "boat-editor", boatId: string | null, returnTo: "boats" }
   const [view, setView] = useState({ kind: "map" });
 
   // ── Profile ──────────────────────────────────────────────────────
@@ -266,6 +270,34 @@ export default function AppView({ user }) {
         </div>
       )}
 
+      {view.kind === "boats" && (
+        <div style={{ ...styles.layer, zIndex: 1 }}>
+          <Suspense fallback={<ViewLoading />}>
+            <BoatsView
+              onBack={() => setView({ kind: "map" })}
+              onCreate={() =>
+                setView({ kind: "boat-editor", boatId: null, returnTo: "boats" })
+              }
+              onEdit={(id) =>
+                setView({ kind: "boat-editor", boatId: id, returnTo: "boats" })
+              }
+            />
+          </Suspense>
+        </div>
+      )}
+
+      {view.kind === "boat-editor" && (
+        <div style={{ ...styles.layer, zIndex: 2 }}>
+          <Suspense fallback={<ViewLoading />}>
+            <BoatEditor
+              boatId={view.boatId}
+              onClose={() => setView({ kind: view.returnTo || "boats" })}
+              onSaved={() => setView({ kind: view.returnTo || "boats" })}
+            />
+          </Suspense>
+        </div>
+      )}
+
       {/* Hamburger only when the map is the active view — other screens
           have their own back / cancel controls in their headers. */}
       {view.kind === "map" && (
@@ -329,7 +361,9 @@ function MenuDrawer({ open, onClose, user, tier, onNavigate }) {
           <NavItem onClick={() => onNavigate({ kind: "races" })}>
             Race setup
           </NavItem>
-          <NavItem disabled>Boat profile</NavItem>
+          <NavItem onClick={() => onNavigate({ kind: "boats" })}>
+            Boats
+          </NavItem>
           <NavItem disabled>Home waters</NavItem>
           <NavItem disabled>Settings</NavItem>
           <NavItem disabled>Help</NavItem>
