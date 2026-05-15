@@ -1,16 +1,11 @@
 // Tests for useRaceStats.
 //
-// Mocks ../api so the hook's fetch calls are intercepted. Uses
-// vitest's fake timers to drive the polling loop deterministically.
+// Mocks ../api so the hook's fetch calls are intercepted.
 //
-// What we cover:
-//   * fetches stats + track on raceId mount
-//   * exposes both via the returned object
-//   * when the response carries summary_pending=true, schedules
-//     another fetch after POLL_INTERVAL_MS
-//   * polling stops once summary_pending flips to false
-//   * regenerate() POSTs and re-enables polling
-//   * clearing raceId teardown clears the timer
+// Two of these tests need fake timers to drive the polling loop. The
+// trick is that fake timers must be enabled BEFORE the hook mounts —
+// otherwise the initial schedulePoll() captures a real setTimeout
+// that fake timers can't advance afterwards.
 
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -24,7 +19,6 @@ vi.mock("../api", () => ({
 
 
 beforeEach(() => {
-  vi.useFakeTimers();
   mockApiFetch.mockReset();
 });
 
@@ -75,11 +69,19 @@ function completeStats() {
 }
 
 
+async function flush() {
+  // Two awaits cover most chained-promise depths the hook hits
+  // (apiFetch → setData → optional schedulePoll).
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+
 describe("useRaceStats", () => {
   test("fetches stats and track on mount", async () => {
     mockApiFetch
-      .mockResolvedValueOnce(completeStats())   // /stats
-      .mockResolvedValueOnce([{ lat: 42, lon: -87.7, recorded_at: "x" }]); // /track
+      .mockResolvedValueOnce(completeStats())
+      .mockResolvedValueOnce([{ lat: 42, lon: -87.7, recorded_at: "x" }]);
 
     const { result } = renderHook(() => useRaceStats("r1"));
     await waitFor(() => expect(result.current.data).not.toBeNull());
@@ -91,6 +93,11 @@ describe("useRaceStats", () => {
   });
 
   test("polls while summary_pending=true and stops when summary arrives", async () => {
+    // Fake timers ON from the start so schedulePoll() uses fake setTimeout.
+    // shouldAdvanceTime keeps Date.now() moving so the 5-min deadline
+    // check inside the hook doesn't trip early.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
     mockApiFetch
       .mockResolvedValueOnce(pendingStats())     // initial /stats
       .mockResolvedValueOnce([])                  // initial /track
@@ -98,7 +105,12 @@ describe("useRaceStats", () => {
       .mockResolvedValueOnce(completeStats());   // poll 2 — summary lands
 
     const { result } = renderHook(() => useRaceStats("r1"));
-    await waitFor(() => expect(result.current.data).not.toBeNull());
+
+    // Let the initial Promise.all resolve under fake timers.
+    await act(async () => {
+      await flush();
+    });
+    expect(result.current.data).not.toBeNull();
     expect(result.current.data.summary_pending).toBe(true);
 
     // First poll fires at +8s.
@@ -107,14 +119,11 @@ describe("useRaceStats", () => {
     });
     expect(result.current.data.summary_pending).toBe(true);
 
-    // Second poll fires at +16s and brings the summary.
+    // Second poll fires at +16s with the completed summary.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(8000);
     });
-
-    await waitFor(() =>
-      expect(result.current.data.summary_pending).toBe(false),
-    );
+    expect(result.current.data.summary_pending).toBe(false);
     expect(result.current.data.ai_summary?.recap).toBe("Solid race.");
 
     // No further polls.
@@ -126,15 +135,20 @@ describe("useRaceStats", () => {
   });
 
   test("regenerate POSTs and re-arms polling", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
     mockApiFetch
-      .mockResolvedValueOnce(completeStats())  // initial /stats
-      .mockResolvedValueOnce([])                // initial /track
+      .mockResolvedValueOnce(completeStats())   // initial /stats
+      .mockResolvedValueOnce([])                 // initial /track
       .mockResolvedValueOnce({ accepted: true }) // POST regenerate
-      .mockResolvedValueOnce(pendingStats())   // poll after regenerate
-      .mockResolvedValueOnce(completeStats()); // resolved on second poll
+      .mockResolvedValueOnce(pendingStats())    // poll after regenerate
+      .mockResolvedValueOnce(completeStats());  // resolved on second poll
 
     const { result } = renderHook(() => useRaceStats("r1"));
-    await waitFor(() => expect(result.current.data).not.toBeNull());
+    await act(async () => {
+      await flush();
+    });
+    expect(result.current.data).not.toBeNull();
 
     await act(async () => {
       await result.current.regenerate();
@@ -144,18 +158,17 @@ describe("useRaceStats", () => {
       { method: "POST" },
     );
 
-    // Poll fires after 8s.
+    // Poll 1 at +8s — pendingStats lands.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(8000);
     });
     expect(result.current.data.summary_pending).toBe(true);
 
+    // Poll 2 at +16s — completeStats lands.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(8000);
     });
-    await waitFor(() =>
-      expect(result.current.data.summary_pending).toBe(false),
-    );
+    expect(result.current.data.summary_pending).toBe(false);
   });
 
   test("clears state and timer when raceId becomes null", async () => {
