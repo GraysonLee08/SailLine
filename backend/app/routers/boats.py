@@ -17,6 +17,7 @@ Schema notes:
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Optional
 from uuid import UUID
 
@@ -71,7 +72,11 @@ class BoatBase(BaseModel):
     nshcp: Optional[int] = None
     dnshcp: Optional[int] = None
     cert_number: Optional[str] = None
-    cert_issued_on: Optional[str] = None     # ISO date string
+    # Pydantic coerces ISO strings ("2026-03-05") to date here, which
+    # in turn lets asyncpg bind the DATE column without an explicit
+    # cast. Posting a string from the frontend works as long as it
+    # parses as ISO-8601.
+    cert_issued_on: Optional[date] = None
     cert_pdf_gcs_url: Optional[str] = None
 
 
