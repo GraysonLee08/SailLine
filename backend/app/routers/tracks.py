@@ -11,9 +11,10 @@ gets immediate feedback without polling.
 GET  /api/races/{race_id}/track  returns the full recorded track in
 chronological order - used by the post-race playback view.
 
-Both endpoints require Firebase auth and are scoped to the calling user
-via the parent race_session's user_id - we never read or write a
-race we don't own.
+Both endpoints require Firebase auth and are scoped via
+``race_write_predicate`` (POST) and ``race_read_predicate`` (GET) so
+crew members on a shared boat can record and view, but viewers can
+only view.
 
 Schema is in migration 0002 (track_points). Position is stored as
 GEOGRAPHY(POINT, 4326). On insert we build the geography from lat/lon
@@ -24,16 +25,15 @@ Bulk insert uses unnest on parallel arrays in a single statement -
 faster than executemany for the 30s/100-point batch sizes the
 recorder produces, and keeps the round trip count at 1 per flush.
 
-Mark-rounding state lives in race_sessions.mark_passes (JSONB,
-migration 0008). Each batch reads the prior list + the boat's marks,
-constructs a MarkRoundingDetector resumed at the next-unrounded
-index, feeds the new batch through it, and rewrites the column with
-old + new passes. See app/services/mark_rounding.py for the
-algorithm and the resume semantics.
+Mark-rounding side effects (detect, persist new passes, trigger
+post-process job at the final mark) are delegated to
+``app.services.track_ingest`` so the same behaviour applies whether
+the batch comes in via this router or via the newer ``/telemetry``
+endpoint. The detector algorithm itself lives in
+``app/services/mark_rounding.py``.
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -45,12 +45,12 @@ from pydantic import BaseModel, Field
 
 from app import db
 from app.auth import get_current_user
-from app.auth_helpers import race_read_predicate, race_write_predicate
-from app.services.job_trigger import trigger_race_postprocess
-from app.services.mark_rounding import (
-    Mark as DetectorMark,
-    MarkRoundingDetector,
-    Point as DetectorPoint,
+from app.auth_helpers import race_read_predicate
+from app.services.mark_rounding import Point as DetectorPoint
+from app.services.track_ingest import (
+    detect_and_persist_new_passes,
+    load_race_for_ingest,
+    maybe_trigger_postprocess,
 )
 
 log = logging.getLogger(__name__)
@@ -113,86 +113,6 @@ class TrackBatchAccepted(BaseModel):
     new_mark_passes: list[MarkPassOut] = Field(default_factory=list)
 
 
-# --- Helpers -----------------------------------------------------------
-
-
-async def _load_race_for_ingest(
-    conn: asyncpg.Connection, race_id: UUID, uid: str
-) -> dict:
-    """Fetch the bits of the race row needed to run mark rounding.
-
-    404 if the race doesn't exist OR the caller can't write to it.
-    Crew members can record tracks (the crew member might be the one
-    holding the phone); viewers cannot.
-    """
-    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
-    row = await conn.fetchrow(
-        f"""
-        SELECT r.marks, r.mark_passes
-        FROM race_sessions r
-        WHERE r.id = $1 AND {pred}
-        """,
-        race_id,
-        uid,
-    )
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
-    marks_raw = row["marks"]
-    if isinstance(marks_raw, (bytes, str)):
-        marks = json.loads(marks_raw) if marks_raw else []
-    else:
-        marks = marks_raw or []
-    passes_raw = row["mark_passes"]
-    if isinstance(passes_raw, (bytes, str)):
-        passes = json.loads(passes_raw) if passes_raw else []
-    else:
-        passes = passes_raw or []
-    return {"marks": marks, "mark_passes": passes}
-
-
-def _detect_new_passes(
-    marks: list[dict],
-    existing_passes: list[dict],
-    new_points: list[TrackPointIn],
-) -> list[dict]:
-    """Run the detector resumed at the right index over only the new
-    batch. Returns just the NEW passes (not appended to existing).
-
-    Marks without lat/lon are skipped silently - defensive against
-    pre-Alembic rows that may have an odd shape.
-    """
-    detector_marks: list[DetectorMark] = []
-    for m in marks:
-        try:
-            detector_marks.append(
-                DetectorMark(lat=float(m["lat"]), lon=float(m["lon"]))
-            )
-        except (KeyError, TypeError, ValueError):
-            return []
-    if not detector_marks:
-        return []
-
-    next_idx = len(existing_passes)
-    if next_idx >= len(detector_marks):
-        return []
-
-    det = MarkRoundingDetector(detector_marks, next_mark_index=next_idx)
-    points_iter = (
-        DetectorPoint(lat=p.lat, lon=p.lon, ts=p.recorded_at)
-        for p in new_points
-    )
-    new = det.feed_batch(points_iter)
-    return [
-        {
-            "mark_index": p.mark_index,
-            "ts": p.ts.isoformat(),
-            "lat": p.lat,
-            "lon": p.lon,
-        }
-        for p in new
-    ]
-
-
 # --- Endpoints ---------------------------------------------------------
 
 
@@ -222,7 +142,7 @@ async def append_track(
         headings.append(p.heading_deg)
 
     async with pool.acquire() as conn:
-        race = await _load_race_for_ingest(conn, race_id, user["uid"])
+        race = await load_race_for_ingest(conn, race_id, user["uid"])
 
         await conn.execute(
             """
@@ -250,45 +170,25 @@ async def append_track(
             headings,
         )
 
-        new_passes = _detect_new_passes(
-            race["marks"], race["mark_passes"], payload.points
+        detector_points = (
+            DetectorPoint(lat=p.lat, lon=p.lon, ts=p.recorded_at)
+            for p in payload.points
+        )
+        all_passes, new_passes = await detect_and_persist_new_passes(
+            conn,
+            race_id=race_id,
+            marks=race["marks"],
+            existing_passes=race["mark_passes"],
+            new_points=detector_points,
         )
 
-        all_passes = list(race["mark_passes"]) + new_passes
-        if new_passes:
-            # Auth was already checked in _load_race_for_ingest; the
-            # UPDATE just hits the row by id.
-            await conn.execute(
-                """
-                UPDATE race_sessions
-                SET mark_passes = $1::jsonb,
-                    updated_at = NOW()
-                WHERE id = $2
-                """,
-                json.dumps(all_passes),
-                race_id,
-            )
-
-    # Final-mark trigger: when this batch caused mark_passes to reach
-    # the full course length, kick off the postprocess job (stats + AI
-    # summary + wind snapshot). The trigger itself is a thin
-    # fire-and-forget HTTP POST to Cloud Run — it never raises and
-    # returns as soon as the job is accepted, so awaiting it is fine
-    # (no second-long blocking). The job runs out-of-band and is
-    # idempotent (skips when ai_summary is already current), so
-    # multiple flushes that all cross the final-mark boundary are
-    # safe.
-    total_marks = len(race.get("marks") or [])
-    if (
-        new_passes
-        and total_marks > 0
-        and len(all_passes) == total_marks
-    ):
-        log.info(
-            "race %s: final mark rounded, kicking off postprocess job",
-            race_id,
-        )
-        await trigger_race_postprocess(race_id)
+    # Final-mark trigger lives outside the conn block so a job failure
+    # can't rollback the pass persistence. The trigger itself is fully
+    # tolerant of every failure mode (missing env var, no ADC, network
+    # error) so awaiting it is safe even in dev.
+    await maybe_trigger_postprocess(
+        race_id, race["marks"], all_passes, new_passes,
+    )
 
     return TrackBatchAccepted(
         inserted=n,

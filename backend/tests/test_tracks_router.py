@@ -3,9 +3,15 @@
 Mocks the asyncpg pool by overriding the FastAPI db.get_pool dependency
 and stubbing get_current_user. No real database is touched.
 
-POST tests exercise the mark-rounding side effect added in 0008: the
-row read returns marks + existing passes, the router invokes the
-detector against the new batch, and persists any new passes via UPDATE.
+POST tests exercise the mark-rounding side effect: the row read returns
+marks + existing passes, the helper invokes the detector against the
+new batch, and persists any new passes via UPDATE.
+
+Mark-rounding and the post-process job trigger are delegated to
+``app.services.track_ingest`` — tests monkeypatch the helper's bound
+name for ``trigger_race_postprocess`` (NOT the router's), since after
+the Session E refactor the router no longer imports the trigger
+directly.
 """
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ from fastapi.testclient import TestClient
 from app import db
 from app.auth import get_current_user
 from app.routers import tracks
+from app.services import track_ingest
 
 
 # --- Fixtures ----------------------------------------------------------
@@ -119,6 +126,26 @@ def test_post_batch_inserts(client, mock_conn):
     own_args = mock_conn.fetchrow.await_args.args
     assert own_args[1] == race_id
     assert own_args[2] == "test-uid"
+
+
+def test_post_uses_race_write_predicate(client, mock_conn):
+    """The auth read must use race_write_predicate (boat_crew aware),
+    not the pre-D3 owner-only check.
+
+    Regression guard: a refactor that flips back to ``user_id = $2``
+    would silently break crew recording on shared boats.
+    """
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+
+    r = client.post(
+        f"/api/races/{uuid4()}/track", json={"points": _sample_points(1)}
+    )
+    assert r.status_code == 201
+    auth_sql = mock_conn.fetchrow.await_args.args[0]
+    assert "boat_crew" in auth_sql
+    assert "bc.role IN ('owner', 'crew')" in auth_sql
 
 
 def test_post_404_when_race_not_owned(client, mock_conn):
@@ -256,9 +283,8 @@ def test_post_triggers_postprocess_when_final_mark_rounded(
     client, mock_conn, monkeypatch
 ):
     """A batch that rounds the LAST mark should kick off the job."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    fake_trigger = _AsyncMock()
-    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+    fake_trigger = AsyncMock()
+    monkeypatch.setattr(track_ingest, "trigger_race_postprocess", fake_trigger)
 
     # Single-mark course with no prior passes — this batch should
     # round it and trip the final-mark gate.
@@ -287,9 +313,8 @@ def test_post_does_not_trigger_when_intermediate_mark(
     """A batch that rounds an EARLIER-but-not-final mark must not
     fire the trigger — beer-can layouts where start ~= finish would
     repeatedly trigger if we got this wrong."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    fake_trigger = _AsyncMock()
-    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+    fake_trigger = AsyncMock()
+    monkeypatch.setattr(track_ingest, "trigger_race_postprocess", fake_trigger)
 
     # Two-mark course — boat rounds mark 0 in this batch, mark 1 is
     # nowhere near, so passes after = 1 < 2 = total marks.
@@ -320,9 +345,8 @@ def test_post_does_not_trigger_when_no_new_passes(
 ):
     """No new roundings in the batch — even on a fully-completed race
     a re-flushed batch shouldn't re-fire the job."""
-    from unittest.mock import AsyncMock as _AsyncMock
-    fake_trigger = _AsyncMock()
-    monkeypatch.setattr(tracks, "trigger_race_postprocess", fake_trigger)
+    fake_trigger = AsyncMock()
+    monkeypatch.setattr(track_ingest, "trigger_race_postprocess", fake_trigger)
 
     # Far-away mark; no points round it.
     mock_conn.fetchrow.return_value = _race_row(
