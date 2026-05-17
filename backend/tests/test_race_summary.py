@@ -318,3 +318,92 @@ def test_generate_summary_returns_none_when_no_api_key(monkeypatch: pytest.Monke
         race_name=None, boat_class=None, stats=_stats(),
     )
     assert out is None
+
+
+# ─── Heel summary rendering (v3 prompt addition) ─────────────────────
+
+
+def _heel_summary(**overrides: Any) -> dict:
+    base = {
+        "sample_count": 12_000,
+        "max_heel_abs_deg": 27.4,
+        "max_heel_deg": -27.4,   # port heel
+        "avg_heel_abs_deg": 14.2,
+        "pct_time_heeled_gt_10": 0.62,
+        "pct_time_heeled_gt_20": 0.21,
+        "max_pitch_abs_deg": 8.1,
+        "by_leg": [
+            {
+                "leg_index": 0,
+                "max_heel_abs_deg": 24.0,
+                "avg_heel_abs_deg": 17.5,
+                "sample_count": 6000,
+            },
+            {
+                "leg_index": 1,
+                "max_heel_abs_deg": 27.4,
+                "avg_heel_abs_deg": 11.0,
+                "sample_count": 6000,
+            },
+        ],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_prompt_includes_heel_section_when_provided():
+    p = build_prompt(
+        race_name="Tuesday Beer Can",
+        boat_class="Beneteau 36.7",
+        stats=_stats(),
+        heel_summary=_heel_summary(),
+    )
+    assert "Boat heel" in p
+    # Side annotation present.
+    assert "port" in p.lower()
+    # Per-leg block rendered.
+    assert "Leg 1" in p and "Leg 2" in p
+
+
+def test_prompt_omits_heel_section_when_empty():
+    p = build_prompt(
+        race_name=None, boat_class=None, stats=_stats(),
+        heel_summary=None,
+    )
+    assert "Boat heel" not in p
+
+
+def test_prompt_omits_heel_section_when_zero_samples():
+    p = build_prompt(
+        race_name=None, boat_class=None, stats=_stats(),
+        heel_summary={"sample_count": 0},
+    )
+    assert "Boat heel" not in p
+
+
+def test_prompt_heel_starboard_label():
+    p = build_prompt(
+        race_name=None, boat_class=None, stats=_stats(),
+        heel_summary=_heel_summary(max_heel_deg=28.1),
+    )
+    assert "starboard" in p.lower()
+
+
+def test_prompt_version_is_3():
+    assert PROMPT_VERSION == 3
+
+
+def test_generate_summary_threads_heel_through(monkeypatch: pytest.MonkeyPatch):
+    """Heel summary should make it into the user message that the
+    Anthropic client receives — guards against accidentally dropping
+    the new arg in the wrapper."""
+    client = _FakeClient('{"recap": "ok", "tips": []}')
+    out = generate_summary(
+        race_name="X", boat_class="Etchells",
+        stats=_stats(), heel_summary=_heel_summary(),
+        client=client, model="test-model",
+    )
+    assert out is not None
+    user_msg = client.messages.last_call["messages"][0]["content"]
+    assert "Boat heel" in user_msg
+    assert "27" in user_msg  # max heel magnitude

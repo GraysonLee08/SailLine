@@ -56,6 +56,7 @@ import asyncpg
 
 from app import db, redis_client
 from app.regions import base_region_for_point
+from app.services.heel_stats import compute_heel_summary
 from app.services.race_stats import (
     compute_stats,
     track_points_from_rows,
@@ -133,6 +134,50 @@ async def _load_track(
             FROM track_points
             WHERE session_id = $1
             ORDER BY recorded_at ASC
+            """,
+            race_id,
+        )
+    return [dict(r) for r in rows]
+
+
+async def _load_imu_samples(
+    pool: asyncpg.Pool, race_id: UUID,
+) -> list[dict]:
+    """Pull every IMU sample for the race, oldest first.
+
+    A 2 h race at 10 Hz is ~72 k rows — manageable for the postprocess
+    job (memory-bounded by the Cloud Run Job's 512 MiB) but worth
+    keeping an eye on. If we ever stream this we'd switch to a
+    cursor + reservoir aggregation; for now, fully materialised.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT recorded_at, heel_deg, pitch_deg, yaw_deg
+            FROM imu_samples
+            WHERE session_id = $1
+            ORDER BY recorded_at ASC
+            """,
+            race_id,
+        )
+    return [dict(r) for r in rows]
+
+
+async def _load_calibrations(
+    pool: asyncpg.Pool, race_id: UUID,
+) -> list[dict]:
+    """Pull the calibration history for the race, oldest first.
+
+    Heel/pitch zero-offsets get applied at read time via
+    ``heel_stats.compute_heel_summary``. Empty list = no offsets.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT captured_at, heel_zero_offset_deg, pitch_zero_offset_deg
+            FROM race_calibrations
+            WHERE session_id = $1
+            ORDER BY captured_at ASC
             """,
             race_id,
         )
@@ -319,11 +364,29 @@ async def process_race(
         # Use the freshly-built snapshot if we have one, else the
         # already-stored one (so the summary still gets wind context).
         snapshot_for_prompt = new_snapshot or race.get("wind_snapshot")
+
+        # Heel summary — best effort. Empty IMU table (GPS-only race,
+        # iOS permission denied) just leaves the section out of the
+        # prompt. Calibration history is applied at read time.
+        try:
+            imu_rows = await _load_imu_samples(pool, race_id)
+            cal_rows = await _load_calibrations(pool, race_id)
+        except Exception as e:  # noqa: BLE001 - never let IMU load fail the summary
+            log.warning("race %s: IMU load failed (%s); skipping heel", race_id, e)
+            imu_rows = []
+            cal_rows = []
+        heel_summary = compute_heel_summary(
+            imu_rows,
+            calibrations=cal_rows,
+            mark_passes=mark_passes,
+        )
+
         new_summary = generate_summary(
             race_name=race.get("name"),
             boat_class=race.get("boat_class"),
             stats=stats.to_dict(),
             wind_snapshot=snapshot_for_prompt,
+            heel_summary=heel_summary,
         )
         if new_summary is None:
             log.warning(

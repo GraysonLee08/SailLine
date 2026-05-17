@@ -8,9 +8,10 @@
 // service + persistent notification.
 //
 // The hook (useTrackRecorder) consumes one normalised point shape:
-//   { recorded_at, lat, lon, speed_kts, heading_deg }
+//   { recorded_at, lat, lon, speed_kts, heading_deg, gps_acc_m }
 // regardless of which platform produced it. All shape translation lives
-// here.
+// here. ``gps_acc_m`` is the GPS 95% horizontal accuracy radius in
+// meters and may be null when the OS doesn't provide it.
 //
 // Native detection deliberately uses `window.Capacitor` rather than
 // importing from '@capacitor/core' so this module compiles cleanly even
@@ -60,6 +61,7 @@ export function normalizePosition(pos, source) {
     //   { latitude, longitude, accuracy, altitude, altitudeAccuracy,
     //     simulated, speed, bearing, time }
     // speed: m/s (or null), bearing: degrees true (or null), time: ms epoch.
+    // accuracy is meters (95% horizontal radius), null when unknown.
     return {
       recorded_at: new Date(
         Number.isFinite(pos.time) ? pos.time : Date.now(),
@@ -68,6 +70,7 @@ export function normalizePosition(pos, source) {
       lon: pos.longitude,
       speed_kts: Number.isFinite(pos.speed) ? pos.speed * MS_TO_KTS : null,
       heading_deg: Number.isFinite(pos.bearing) ? pos.bearing : null,
+      gps_acc_m: Number.isFinite(pos.accuracy) ? pos.accuracy : null,
     };
   }
   // Web GeolocationPosition: { coords: {latitude, longitude, speed,
@@ -81,6 +84,9 @@ export function normalizePosition(pos, source) {
       : null,
     heading_deg: Number.isFinite(pos.coords.heading)
       ? pos.coords.heading
+      : null,
+    gps_acc_m: Number.isFinite(pos.coords.accuracy)
+      ? pos.coords.accuracy
       : null,
   };
 }

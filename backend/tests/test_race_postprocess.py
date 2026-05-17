@@ -91,6 +91,7 @@ class _Spy:
         self.persist_calls: list[dict] = []
         self.wind_calls: int = 0
         self.summary_calls: int = 0
+        self.summary_kwargs: list[dict] = []
 
 
 @pytest.fixture
@@ -108,6 +109,7 @@ def spy(monkeypatch: pytest.MonkeyPatch):
 
     def fake_generate_summary(**kwargs: Any):
         s.summary_calls += 1
+        s.summary_kwargs.append(kwargs)
         return {
             "recap": "ok",
             "tips": [],
@@ -131,6 +133,8 @@ def _patch_loads(
     *,
     race: Optional[dict],
     track: list[dict],
+    imu: Optional[list[dict]] = None,
+    calibrations: Optional[list[dict]] = None,
 ) -> None:
     async def fake_load_race(pool, race_id):
         return race
@@ -138,8 +142,20 @@ def _patch_loads(
     async def fake_load_track(pool, race_id):
         return track
 
+    async def fake_load_imu_samples(pool, race_id):
+        return imu or []
+
+    async def fake_load_calibrations(pool, race_id):
+        return calibrations or []
+
     monkeypatch.setattr(race_postprocess, "_load_race", fake_load_race)
     monkeypatch.setattr(race_postprocess, "_load_track", fake_load_track)
+    monkeypatch.setattr(
+        race_postprocess, "_load_imu_samples", fake_load_imu_samples
+    )
+    monkeypatch.setattr(
+        race_postprocess, "_load_calibrations", fake_load_calibrations
+    )
 
 
 # ─── Decision-branch tests ────────────────────────────────────────────
@@ -263,3 +279,99 @@ async def test_generate_summary_failure_leaves_existing_intact(
     assert len(spy.persist_calls) == 1
     assert spy.persist_calls[0]["ai_summary"] is None
     assert spy.persist_calls[0]["wind_snapshot"] is not None
+
+
+# ─── Heel summary plumbing ────────────────────────────────────────────
+
+
+def _make_imu_rows(n: int = 30) -> list[dict]:
+    """Synthetic IMU samples — heel oscillating around 12°, pitch ~0°."""
+    rows = []
+    for i in range(n):
+        rows.append({
+            "recorded_at": T0 + timedelta(seconds=i),
+            "heel_deg": 12.0 + (i % 5) * 2.0,
+            "pitch_deg": 2.0,
+            "yaw_deg": 90.0,
+        })
+    return rows
+
+
+async def test_heel_summary_passed_to_generate_summary_when_imu_present(
+    monkeypatch, spy,
+):
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(),
+        track=_make_track_rows(),
+        imu=_make_imu_rows(),
+        calibrations=[],
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.summary_calls == 1
+    kwargs = spy.summary_kwargs[0]
+    assert "heel_summary" in kwargs
+    heel = kwargs["heel_summary"]
+    assert heel is not None
+    assert heel["sample_count"] == 30
+    assert heel["max_heel_abs_deg"] >= 12.0
+
+
+async def test_heel_summary_none_when_no_imu_rows(monkeypatch, spy):
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(),
+        track=_make_track_rows(),
+        imu=[],
+        calibrations=[],
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    kwargs = spy.summary_kwargs[0]
+    assert kwargs.get("heel_summary") is None
+
+
+async def test_imu_load_failure_does_not_break_postprocess(monkeypatch, spy):
+    """A DB exception loading IMU should be swallowed; the AI summary
+    still runs (without heel data)."""
+    async def boom(pool, race_id):
+        raise RuntimeError("simulated DB error")
+
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(),
+        track=_make_track_rows(),
+        imu=[],
+        calibrations=[],
+    )
+    monkeypatch.setattr(race_postprocess, "_load_imu_samples", boom)
+
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.summary_calls == 1
+    # heel_summary kwarg should be None (graceful degrade).
+    assert spy.summary_kwargs[0].get("heel_summary") is None
+
+
+async def test_calibration_offsets_applied_in_postprocess(monkeypatch, spy):
+    """A non-zero calibration row should shift the computed max_heel."""
+    cal = [{
+        "captured_at": T0 - timedelta(seconds=1),
+        "heel_zero_offset_deg": 10.0,
+        "pitch_zero_offset_deg": 0.0,
+    }]
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(),
+        track=_make_track_rows(),
+        imu=_make_imu_rows(),
+        calibrations=cal,
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    heel = spy.summary_kwargs[0]["heel_summary"]
+    # Raw max was ~20° (12 + 4×2). After subtracting a 10° offset, the
+    # max should drop close to ~10°.
+    assert heel is not None
+    assert heel["max_heel_abs_deg"] < 12.0

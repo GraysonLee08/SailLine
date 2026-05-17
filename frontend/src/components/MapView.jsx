@@ -27,7 +27,7 @@
 // dramatically more contrast than light-on-light, with the smoky tint
 // evoking sunglasses placed on a chart.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 
@@ -42,6 +42,7 @@ import { useFollowMode } from "../hooks/useFollowMode";
 import { useAutoStartRecorder } from "../hooks/useAutoStartRecorder";
 import { useAutoStopRecorder } from "../hooks/useAutoStopRecorder";
 import { useRouteFreshnessCheck } from "../hooks/useRouteFreshnessCheck";
+import { useHeelGauge } from "../hooks/useHeelGauge";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
@@ -49,6 +50,9 @@ import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/region
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
 import { safeAnimate, EASE_OUT_SOFT } from "../lib/motion";
+import { DEFAULT_PHONE_AXIS, PHONE_AXES } from "../lib/imuAxes";
+
+const PHONE_AXIS_STORAGE_KEY = "sailline.phoneAxis";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
@@ -163,10 +167,90 @@ export function MapView({
 
   const { position } = useGeolocation();
 
-  const recorder = useTrackRecorder(activeRace?.id ?? null);
+  // Phone axis — fore-aft (long edge along centerline) vs port-stbd.
+  // Persisted globally on the device because the placement of the
+  // phone in the cockpit is typically a per-boat habit, not per-race.
+  // Surfaced as a toggle in the race overlay.
+  const [phoneAxis, setPhoneAxis] = useState(() => {
+    try {
+      const stored = localStorage.getItem(PHONE_AXIS_STORAGE_KEY);
+      return PHONE_AXES.includes(stored) ? stored : DEFAULT_PHONE_AXIS;
+    } catch {
+      return DEFAULT_PHONE_AXIS;
+    }
+  });
+  const onPhoneAxisChange = useCallback((next) => {
+    if (!PHONE_AXES.includes(next)) return;
+    setPhoneAxis(next);
+    try {
+      localStorage.setItem(PHONE_AXIS_STORAGE_KEY, next);
+    } catch {
+      /* best effort */
+    }
+  }, []);
+
+  const recorder = useTrackRecorder(activeRace?.id ?? null, { phoneAxis });
   const routing = useRouting(activeRace?.id ?? null);
   const notif = useRouteNotifications(activeRace?.id ?? null);
   const followMode = useFollowMode(activeRace?.id ?? null);
+
+  // Active calibration for the LIVE gauge — separate from
+  // `recorder.pendingCalibration` (which clears on flush ack). Persisted
+  // per-race in localStorage so a tab reload doesn't dump the zero.
+  // Server-side calibration is the authoritative one for post-race
+  // stats; this lives purely to keep the on-screen readout sensible
+  // after the user taps Zero at the dock.
+  const calibrationStorageKey = activeRace?.id
+    ? `sailline.activeCalibration.${activeRace.id}`
+    : null;
+  const [activeCalibration, setActiveCalibration] = useState(() => {
+    if (!calibrationStorageKey) return null;
+    try {
+      const raw = localStorage.getItem(calibrationStorageKey);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+  // Re-load when the active race changes so we don't bleed one race's
+  // zero into another.
+  useEffect(() => {
+    if (!calibrationStorageKey) {
+      setActiveCalibration(null);
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(calibrationStorageKey);
+      setActiveCalibration(raw ? JSON.parse(raw) : null);
+    } catch {
+      setActiveCalibration(null);
+    }
+  }, [calibrationStorageKey]);
+
+  // Live heel/pitch readout. Sampler only attaches when we have an
+  // active race (the only screen the gauge appears on).
+  const heelGauge = useHeelGauge({
+    enabled: !!activeRace,
+    phoneAxis,
+    calibration: activeCalibration,
+  });
+
+  const onCaptureCalibration = useCallback(() => {
+    const captured = recorder.captureCalibration();
+    if (!captured) return;
+    setActiveCalibration({
+      heel_zero_offset_deg: captured.heel_zero_offset_deg,
+      pitch_zero_offset_deg: captured.pitch_zero_offset_deg,
+      captured_at: captured.captured_at,
+    });
+    if (calibrationStorageKey) {
+      try {
+        localStorage.setItem(calibrationStorageKey, JSON.stringify(captured));
+      } catch {
+        /* best effort */
+      }
+    }
+  }, [recorder, calibrationStorageKey]);
 
   // Auto-arm the recorder for T-5. `auto_start_enabled` defaults to true
   // for races created before 0007 too — the migration sets the column
@@ -601,6 +685,13 @@ export function MapView({
           autoStop={autoStop}
           freshness={freshness}
           onRecompute={routing.compute}
+          phoneAxis={phoneAxis}
+          onPhoneAxisChange={onPhoneAxisChange}
+          onCaptureCalibration={onCaptureCalibration}
+          activeCalibration={activeCalibration}
+          heelReading={heelGauge.reading}
+          orientationSupported={heelGauge.supported}
+          orientationPermission={recorder.orientationPermission}
         />
       )}
 
@@ -651,6 +742,13 @@ function RaceOverlay({
   autoStop,
   freshness,
   onRecompute,
+  phoneAxis,
+  onPhoneAxisChange,
+  onCaptureCalibration,
+  activeCalibration,
+  heelReading,
+  orientationSupported,
+  orientationPermission,
 }) {
   const cd = useCountdown(race.start_at);
 
@@ -664,6 +762,15 @@ function RaceOverlay({
   const showArmed = autoStart?.armed && !recording && inPreStartWindow;
   const showFreshness =
     freshness?.ready && freshness.stale && !cd.isPast && !cd.isUnset;
+
+  // "Pre-race" for the Zero button — calibration is dock-only. Visible
+  // any time before the gun (covers the case where the user shows up
+  // earlier than T-5 and wants to zero straight away). Once cd.isPast
+  // flips, the button hides — re-zeroing mid-race is intentionally not
+  // wired in this version. We also hide it on races without a start
+  // time (cd.isUnset) so we don't show a dead control.
+  const showZeroButton = !cd.isUnset && !cd.isPast && orientationSupported;
+  const denied = orientationPermission === "denied";
 
   return (
     <div
@@ -736,6 +843,76 @@ function RaceOverlay({
         {!recording && recorderError && (
           <div style={styles.recordError}>{recorderError}</div>
         )}
+
+        {/* Phone-axis toggle + Zero calibration. Visible whenever an
+            active race is set; the Zero button hides once the gun goes
+            off. */}
+        <div style={styles.calibrationRow}>
+          <span style={styles.calibrationLabel}>Phone:</span>
+          <button
+            type="button"
+            onClick={() => onPhoneAxisChange("fore-aft")}
+            style={{
+              ...styles.axisPill,
+              ...(phoneAxis === "fore-aft" ? styles.axisPillOn : {}),
+            }}
+            aria-pressed={phoneAxis === "fore-aft"}
+            title="Phone long edge along boat centerline"
+          >
+            Fore-aft
+          </button>
+          <button
+            type="button"
+            onClick={() => onPhoneAxisChange("port-stbd")}
+            style={{
+              ...styles.axisPill,
+              ...(phoneAxis === "port-stbd" ? styles.axisPillOn : {}),
+            }}
+            aria-pressed={phoneAxis === "port-stbd"}
+            title="Phone long edge across the boat"
+          >
+            Port-stbd
+          </button>
+          {showZeroButton && (
+            <button
+              type="button"
+              onClick={onCaptureCalibration}
+              style={styles.zeroBtn}
+              aria-label="Zero heel and pitch"
+              title="Capture current orientation as zero heel/pitch. Do this at the dock with the boat level."
+            >
+              Zero
+            </button>
+          )}
+        </div>
+        {activeCalibration && (
+          <div style={styles.calibrationStatus}>
+            ✓ Zeroed (heel {activeCalibration.heel_zero_offset_deg.toFixed(1)}°,
+            {" "}pitch {activeCalibration.pitch_zero_offset_deg.toFixed(1)}°)
+          </div>
+        )}
+        {denied && (
+          <div style={styles.queueHint}>
+            Heel/pitch unavailable — orientation permission denied. Tap Stop
+            then Start again to retry.
+          </div>
+        )}
+
+        {/* Live heel/pitch readout while recording. Subtle — sailors
+            don't want to stare at it, but a glance is useful. */}
+        {recording && heelReading && (
+          <div style={styles.heelReadout}>
+            <span style={styles.heelReadoutLabel}>Heel</span>
+            <span style={styles.heelReadoutValue}>
+              {heelReading.heelDeg.toFixed(0)}°
+            </span>
+            <span style={styles.heelReadoutLabel}>Pitch</span>
+            <span style={styles.heelReadoutValue}>
+              {heelReading.pitchDeg.toFixed(0)}°
+            </span>
+          </div>
+        )}
+
         {routing && (
           <RouteStatus meta={routing.meta} error={routing.error} />
         )}
@@ -989,6 +1166,84 @@ const styles = {
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+
+  // Phone-axis toggle + Zero button. Compact row beneath the countdown
+  // / armed hint. Dark-glass pill styling that matches the language but
+  // is small enough to disappear unless the user looks at it.
+  calibrationRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 6,
+    flexWrap: "wrap",
+  },
+  calibrationLabel: {
+    fontSize: 10,
+    color: "var(--paper-ink-3)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+    marginRight: 2,
+  },
+  axisPill: {
+    padding: "3px 9px",
+    fontSize: 11,
+    border: "1px solid rgba(255,255,255,0.18)",
+    background: "rgba(255,255,255,0.04)",
+    color: "var(--paper-ink-2)",
+    borderRadius: 999,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    letterSpacing: "0.01em",
+  },
+  axisPillOn: {
+    background: "rgba(126,182,255,0.16)",
+    color: "#cfe0ff",
+    border: "1px solid rgba(126,182,255,0.5)",
+  },
+  zeroBtn: {
+    padding: "3px 11px",
+    marginLeft: 4,
+    fontSize: 11,
+    border: "1px solid rgba(126,182,255,0.5)",
+    background: "rgba(126,182,255,0.12)",
+    color: "#cfe0ff",
+    borderRadius: 999,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    fontWeight: 500,
+    letterSpacing: "0.02em",
+  },
+  calibrationStatus: {
+    fontSize: 10,
+    color: "#9fd29f",
+    marginTop: 2,
+    fontVariantNumeric: "tabular-nums",
+    fontFamily: "var(--mono)",
+  },
+
+  // Live heel/pitch readout. Mono digits so the values don't jitter
+  // visually as they oscillate.
+  heelReadout: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: 6,
+    marginTop: 6,
+    fontFamily: "var(--mono)",
+    fontVariantNumeric: "tabular-nums",
+  },
+  heelReadoutLabel: {
+    fontSize: 10,
+    color: "var(--paper-ink-3)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+  },
+  heelReadoutValue: {
+    fontSize: 14,
+    color: "var(--paper-ink)",
+    fontWeight: 500,
+    minWidth: 36,
+    textAlign: "right",
   },
   raceActions: {
     display: "flex",

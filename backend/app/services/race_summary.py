@@ -53,7 +53,11 @@ log = logging.getLogger(__name__)
 # Bump this when you edit ``_SYSTEM_PROMPT`` or change the JSON shape
 # the model is asked to produce. Stored summaries with a lower version
 # get regenerated automatically.
-PROMPT_VERSION: int = 2
+#
+# v3 — heel summary added to the prompt (sourced from imu_samples +
+# race_calibrations). When heel data is present the coach can comment
+# on heel discipline (depowering, hiking effort, max heel by leg).
+PROMPT_VERSION: int = 3
 
 # Default model — the config has the override knob.
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -77,16 +81,33 @@ Never condescend.
 
 Calibrate length to how much there is to say:
 * If the race went smoothly — consistent speed, no long stops, leg \
-times reasonable for the wind — keep the recap short (a few sentences) \
-and give 1–2 tips at most.
+times reasonable for the wind, heel discipline reasonable — keep the \
+recap short (a few sentences) and give 1–2 tips at most.
 * If the race had clear problems — slow legs, big wind shifts the \
-boat didn't adapt to, long stops, DNF — write a longer recap that \
-walks through what likely happened, and give 3–5 specific tips.
+boat didn't adapt to, long stops, DNF, or sustained over-heeling — \
+write a longer recap that walks through what likely happened, and \
+give 3–5 specific tips.
 
 Be specific. Reference real numbers (leg times, average speeds, wind \
-direction changes) rather than generic advice. Translate \
-sailor-jargon into plain language the first time you use it in a \
-recap (e.g. "lifted (a wind shift that lets you point higher)").
+direction changes, max heel angle, time spent past target heel) rather \
+than generic advice. Translate sailor-jargon into plain language the \
+first time you use it in a recap (e.g. "lifted (a wind shift that \
+lets you point higher)").
+
+If a "Boat heel" block is present in the data, use it to coach on \
+heel discipline. Rough guidance on heel for most racing keelboats:
+* 10–20° is the productive range upwind.
+* Sustained heel past ~25° usually means the rig is overpowered — \
+  flatten with twist, traveler, or vang ease; reef in stronger air.
+* If max heel is mild but average heel is high, hiking effort is \
+  probably the lever; if max heel spikes but average is fine, those \
+  are likely puffs the trim missed.
+Frame heel comments alongside the leg they belong to where possible. \
+If heel data is missing or sparse, do not invent it.
+
+The phone might be mounted in a position that doesn't perfectly \
+represent boat axes, so treat any single sample with mild skepticism — \
+sustained trends matter more than peaks.
 
 Output STRICT JSON of exactly this shape — no markdown, no code fences:
 
@@ -134,13 +155,17 @@ def build_prompt(
     boat_class: Optional[str],
     stats: dict,
     wind_snapshot: Optional[dict] = None,
+    heel_summary: Optional[dict] = None,
 ) -> str:
     """Render a deterministic user-message payload from race data.
 
     Pure function. ``stats`` is the dict returned by
     ``race_stats.RaceStats.to_dict()``. ``wind_snapshot`` is the dict
     persisted on the race row, or None when wind data wasn't
-    available. The Cloud Run Job assembles these and passes them in.
+    available. ``heel_summary`` is the dict returned by
+    ``heel_stats.compute_heel_summary``, or None when no IMU data is
+    available for the race. The Cloud Run Job assembles these and
+    passes them in.
     """
     name = race_name or "Untitled race"
     boat = boat_class or "unspecified class"
@@ -224,6 +249,40 @@ def build_prompt(
         lines.append("Wind data: not available for this race.")
         lines.append("")
 
+    if heel_summary and heel_summary.get("sample_count", 0) > 0:
+        max_abs = heel_summary.get("max_heel_abs_deg", 0.0)
+        max_signed = heel_summary.get("max_heel_deg", 0.0)
+        avg_abs = heel_summary.get("avg_heel_abs_deg", 0.0)
+        pct10 = heel_summary.get("pct_time_heeled_gt_10", 0.0)
+        pct20 = heel_summary.get("pct_time_heeled_gt_20", 0.0)
+        max_pitch = heel_summary.get("max_pitch_abs_deg", 0.0)
+        side = "starboard" if max_signed >= 0 else "port"
+        lines.append("Boat heel (from phone orientation sensor):")
+        lines.append(
+            f"  Max heel: {max_abs:.0f}° to {side}; "
+            f"average |heel|: {avg_abs:.1f}°"
+        )
+        lines.append(
+            f"  Time past 10°: {pct10*100:.0f}% of race; "
+            f"past 20°: {pct20*100:.0f}%"
+        )
+        lines.append(f"  Max pitch: {max_pitch:.0f}°")
+        legs = heel_summary.get("by_leg") or []
+        if legs:
+            lines.append("  Per-leg heel:")
+            for leg in legs:
+                lines.append(
+                    f"    Leg {leg['leg_index'] + 1}: "
+                    f"max {leg['max_heel_abs_deg']:.0f}°, "
+                    f"avg {leg['avg_heel_abs_deg']:.1f}° "
+                    f"({leg['sample_count']} samples)"
+                )
+        lines.append(
+            "  Note: phone-on-table mount; absolute axis may be approximate "
+            "but sustained trends are reliable."
+        )
+        lines.append("")
+
     lines.append(
         "Give a debrief in the JSON shape described in the system prompt."
     )
@@ -285,6 +344,7 @@ def generate_summary(
     boat_class: Optional[str],
     stats: dict,
     wind_snapshot: Optional[dict] = None,
+    heel_summary: Optional[dict] = None,
     client: Any = None,
     model: Optional[str] = None,
 ) -> Optional[dict]:
@@ -323,6 +383,7 @@ def generate_summary(
         boat_class=boat_class,
         stats=stats,
         wind_snapshot=wind_snapshot,
+        heel_summary=heel_summary,
     )
 
     try:

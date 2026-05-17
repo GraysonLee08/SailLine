@@ -83,6 +83,7 @@ describe("normalizePosition", () => {
       lon: -87.5,
       speed_kts: 5.144 * 1.943844,
       heading_deg: 270,
+      gps_acc_m: 5,
     });
   });
 
@@ -94,6 +95,7 @@ describe("normalizePosition", () => {
       lon: -87.5,
       speed_kts: 5.144 * 1.943844,
       heading_deg: 270,
+      gps_acc_m: 5,
     });
   });
 
