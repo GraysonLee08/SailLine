@@ -16,7 +16,7 @@ What it does, in order:
      forecast is still in Redis and the marks resolve to a known
      region.
   4. Generate an AI recap+tips via Anthropic (``services/race_summary``).
-  5. UPDATE race_sessions: ``ai_summary``, ``wind_snapshot``.
+  5. UPDATE race_sessions: ``ai_summary``, ``wind_snapshot``, ``heel_summary``.
 
 Why a separate job, not in-line in the POST track endpoint:
 
@@ -103,6 +103,7 @@ async def _load_race(
             SELECT
                 r.id, r.user_id, r.name, r.boat_class, r.start_at,
                 r.marks, r.mark_passes, r.ai_summary, r.wind_snapshot,
+                r.heel_summary,
                 r.mode, r.uses_spinnaker, r.boat_id,
                 b.hcp    AS boat_hcp,
                 b.dhcp   AS boat_dhcp,
@@ -190,11 +191,17 @@ async def _persist(
     *,
     ai_summary: Optional[dict],
     wind_snapshot: Optional[dict],
+    heel_summary: Optional[dict],
 ) -> None:
     """UPDATE race_sessions with whatever new fields we produced.
 
-    Both fields are JSONB. Pass None to leave a column untouched —
+    All three fields are JSONB. Pass None to leave a column untouched —
     we only overwrite a column when we have a fresh value for it.
+
+    Note: ``compute_heel_summary`` returns None when there are no IMU
+    samples for the race; in that case the column stays null and we'll
+    cheaply recompute on the next postprocess run. No-op writes are not
+    a correctness concern, just slightly wasteful.
     """
     sets: list[str] = []
     args: list = [race_id]
@@ -206,6 +213,10 @@ async def _persist(
     if wind_snapshot is not None:
         sets.append(f"wind_snapshot = ${i}::jsonb")
         args.append(json.dumps(wind_snapshot))
+        i += 1
+    if heel_summary is not None:
+        sets.append(f"heel_summary = ${i}::jsonb")
+        args.append(json.dumps(heel_summary))
         i += 1
     if not sets:
         return
@@ -358,16 +369,19 @@ async def process_race(
             track_ended=stats.ended_at,
         )
 
-    # AI summary — skip the call if a current version already exists.
-    new_summary: Optional[dict] = None
-    if force or not _summary_is_current(race.get("ai_summary")):
-        # Use the freshly-built snapshot if we have one, else the
-        # already-stored one (so the summary still gets wind context).
-        snapshot_for_prompt = new_snapshot or race.get("wind_snapshot")
-
-        # Heel summary — best effort. Empty IMU table (GPS-only race,
-        # iOS permission denied) just leaves the section out of the
-        # prompt. Calibration history is applied at read time.
+    # Heel summary — recompute when either:
+    #   (a) we'd be regenerating the AI summary anyway (it goes into
+    #       the prompt), or
+    #   (b) the heel_summary column is null (first postprocess run for
+    #       this race after migration 0016 shipped — backfill).
+    # The compute is a cheap pure reduction over the IMU table; empty
+    # IMU (GPS-only race, iOS permission denied) returns None and the
+    # column stays null until samples exist. Calibration history is
+    # applied at read time inside compute_heel_summary.
+    ai_needs_regen = force or not _summary_is_current(race.get("ai_summary"))
+    need_heel = ai_needs_regen or race.get("heel_summary") is None
+    new_heel_summary: Optional[dict] = None
+    if need_heel:
         try:
             imu_rows = await _load_imu_samples(pool, race_id)
             cal_rows = await _load_calibrations(pool, race_id)
@@ -375,10 +389,24 @@ async def process_race(
             log.warning("race %s: IMU load failed (%s); skipping heel", race_id, e)
             imu_rows = []
             cal_rows = []
-        heel_summary = compute_heel_summary(
+        new_heel_summary = compute_heel_summary(
             imu_rows,
             calibrations=cal_rows,
             mark_passes=mark_passes,
+        )
+
+    # AI summary — skip the call if a current version already exists.
+    new_summary: Optional[dict] = None
+    if ai_needs_regen:
+        # Use the freshly-built snapshot if we have one, else the
+        # already-stored one (so the summary still gets wind context).
+        snapshot_for_prompt = new_snapshot or race.get("wind_snapshot")
+        # Same for heel: prefer the fresh compute, fall back to whatever
+        # is already on the row.
+        heel_for_prompt = (
+            new_heel_summary
+            if new_heel_summary is not None
+            else race.get("heel_summary")
         )
 
         new_summary = generate_summary(
@@ -386,7 +414,7 @@ async def process_race(
             boat_class=race.get("boat_class"),
             stats=stats.to_dict(),
             wind_snapshot=snapshot_for_prompt,
-            heel_summary=heel_summary,
+            heel_summary=heel_for_prompt,
         )
         if new_summary is None:
             log.warning(
@@ -399,12 +427,14 @@ async def process_race(
         pool, race_id,
         ai_summary=new_summary,
         wind_snapshot=new_snapshot,
+        heel_summary=new_heel_summary,
     )
     log.info(
-        "race %s: postprocess complete (summary=%s, snapshot=%s)",
+        "race %s: postprocess complete (summary=%s, snapshot=%s, heel=%s)",
         race_id,
         "regenerated" if new_summary else "skipped",
         "refreshed" if new_snapshot else "skipped",
+        "refreshed" if new_heel_summary else "skipped",
     )
     return 0
 

@@ -66,6 +66,7 @@ import { apiFetch } from "../api";
 import { createWatcher } from "../lib/geolocation";
 import {
   DEFAULT_PHONE_AXIS,
+  createAxisDetector,
   remapEulerToBoat,
 } from "../lib/imuAxes";
 import {
@@ -82,6 +83,7 @@ const IMU_SAMPLE_HZ = 10;
 const STORAGE_PREFIX_GPS = "sailline.trackQueue.";
 const STORAGE_PREFIX_IMU = "sailline.imuQueue.";
 const STORAGE_PREFIX_CAL = "sailline.calibration.";
+const STORAGE_PREFIX_AXIS = "sailline.axisDetect.";
 
 function gpsKey(raceId) {
   return `${STORAGE_PREFIX_GPS}${raceId}`;
@@ -91,6 +93,9 @@ function imuKey(raceId) {
 }
 function calKey(raceId) {
   return `${STORAGE_PREFIX_CAL}${raceId}`;
+}
+function axisKey(raceId) {
+  return `${STORAGE_PREFIX_AXIS}${raceId}`;
 }
 
 function readJSON(key, fallback) {
@@ -146,12 +151,24 @@ function gpsPointToWire(point) {
 
 /**
  * @param {string|null} raceId  the race to record into. Null disables.
- * @param {object} [opts]
- * @param {string} [opts.phoneAxis]  "fore-aft" | "port-stbd"
+ * @param {object}  [opts]
+ * @param {string}  [opts.phoneAxis]        "fore-aft" | "port-stbd".
+ *                                          Used as the fallback while
+ *                                          auto-detect hasn't locked in
+ *                                          yet (or when auto-detect is
+ *                                          off).
+ * @param {boolean} [opts.autoDetectAxis]   When true (default), the
+ *                                          recorder compares GPS COG vs
+ *                                          phone compass alpha once the
+ *                                          boat is moving and auto-
+ *                                          selects axis + 180° polarity.
+ *                                          Locked detection persists in
+ *                                          localStorage per-race.
  * @returns recorder API
  */
 export function useTrackRecorder(raceId, opts = {}) {
   const phoneAxis = opts.phoneAxis || DEFAULT_PHONE_AXIS;
+  const autoDetectAxis = opts.autoDetectAxis !== false;
 
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState(null);
@@ -160,6 +177,10 @@ export function useTrackRecorder(raceId, opts = {}) {
   const [lastPoint, setLastPoint] = useState(null);
   const [pendingCalibration, setPendingCalibration] = useState(null);
   const [orientationPermission, setOrientationPermission] = useState(null);
+  // Auto-detect result (null while pending). When set, contains
+  // { axis, polarityFlip, confidence, detected_at }. UI may surface
+  // a one-shot "auto-detected: <axis>" toast.
+  const [detectedAxis, setDetectedAxis] = useState(null);
 
   // Refs hold the live values for callbacks that close over them.
   const gpsQueueRef = useRef([]);         // unflushed GPS points (local shape)
@@ -174,8 +195,16 @@ export function useTrackRecorder(raceId, opts = {}) {
   const wakeLockRef = useRef(null);
   const raceIdRef = useRef(raceId);
   raceIdRef.current = raceId;
+  // Effective axis + polarity flip: starts at the prop default, gets
+  // overridden once auto-detect locks (or when a persisted detection
+  // is restored from localStorage at race-load time).
   const phoneAxisRef = useRef(phoneAxis);
   phoneAxisRef.current = phoneAxis;
+  const polarityFlipRef = useRef(false);
+  // The stateful detector. Recreated on each raceId change so a fresh
+  // race always re-detects from scratch (rather than carrying over a
+  // lock from a previous boat / phone orientation).
+  const axisDetectorRef = useRef(null);
 
   // ── Restore any pending queues when raceId becomes set ────────────
   useEffect(() => {
@@ -187,11 +216,16 @@ export function useTrackRecorder(raceId, opts = {}) {
       setQueueLength(0);
       setPoints([]);
       setLastPoint(null);
+      axisDetectorRef.current = null;
+      polarityFlipRef.current = false;
+      phoneAxisRef.current = phoneAxis;
+      setDetectedAxis(null);
       return;
     }
     const restoredGps = readJSON(gpsKey(raceId), []);
     const restoredImu = readJSON(imuKey(raceId), []);
     const restoredCal = readJSON(calKey(raceId), null);
+    const restoredAxis = readJSON(axisKey(raceId), null);
     if (Array.isArray(restoredGps) && restoredGps.length > 0) {
       gpsQueueRef.current = restoredGps.slice();
       setQueueLength(restoredGps.length);
@@ -205,6 +239,25 @@ export function useTrackRecorder(raceId, opts = {}) {
       pendingCalibrationRef.current = restoredCal;
       setPendingCalibration(restoredCal);
     }
+    if (
+      restoredAxis &&
+      typeof restoredAxis === "object" &&
+      typeof restoredAxis.axis === "string"
+    ) {
+      // We previously detected an axis for this race — honour it
+      // immediately so the very first IMU sample after a refresh is
+      // in the correct frame. The detector ref is left null; once
+      // locked, no further detection happens.
+      phoneAxisRef.current = restoredAxis.axis;
+      polarityFlipRef.current = !!restoredAxis.polarityFlip;
+      setDetectedAxis(restoredAxis);
+    } else if (autoDetectAxis) {
+      // Fresh race + auto-detect on → create a new detector. Default
+      // thresholds favour reliability over speed (~6 consistent fixes
+      // above 1.5 kts ≈ 30–60 s of sailing).
+      axisDetectorRef.current = createAxisDetector();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [raceId]);
 
   // ── Wake Lock helpers ─────────────────────────────────────────────
@@ -321,6 +374,33 @@ export function useTrackRecorder(raceId, opts = {}) {
       setPoints((prev) => [...prev, point]);
       setLastPoint(point);
 
+      // Feed the axis detector. Pure pass-through to a stateful pure
+      // helper; no setState until the detector locks. The detector
+      // ignores samples below its sog threshold internally.
+      const det = axisDetectorRef.current;
+      if (det) {
+        const raw = latestOrientation();
+        const locked = det.consider({
+          cog: point.heading_deg,
+          alpha: raw?.alpha,
+          sog_kts: point.speed_kts,
+        });
+        if (locked) {
+          phoneAxisRef.current = locked.axis;
+          polarityFlipRef.current = !!locked.polarityFlip;
+          const payload = {
+            axis: locked.axis,
+            polarityFlip: !!locked.polarityFlip,
+            confidence: locked.confidence,
+            detected_at: new Date().toISOString(),
+          };
+          writeJSON(axisKey(id), payload);
+          setDetectedAxis(payload);
+          // Detector has done its job; stop feeding it.
+          axisDetectorRef.current = null;
+        }
+      }
+
       if (gpsQueueRef.current.length >= FLUSH_GPS_BATCH_SIZE) {
         flushNow();
       }
@@ -341,7 +421,11 @@ export function useTrackRecorder(raceId, opts = {}) {
       const id = raceIdRef.current;
       if (!id) return;
       const raw = latestOrientation();
-      const remapped = remapEulerToBoat(raw, phoneAxisRef.current);
+      const remapped = remapEulerToBoat(
+        raw,
+        phoneAxisRef.current,
+        polarityFlipRef.current,
+      );
       // remapped may be null until the first useful event arrives; we
       // also require yaw_deg because the backend column is NOT NULL.
       if (!remapped || remapped.yaw_deg == null) return;
@@ -374,7 +458,11 @@ export function useTrackRecorder(raceId, opts = {}) {
   // ── Calibration ───────────────────────────────────────────────────
   const captureCalibration = useCallback(() => {
     const raw = latestOrientation();
-    const remapped = remapEulerToBoat(raw, phoneAxisRef.current);
+    const remapped = remapEulerToBoat(
+      raw,
+      phoneAxisRef.current,
+      polarityFlipRef.current,
+    );
     if (!remapped) {
       setError(
         "No orientation reading yet — wait a moment and try again.",
@@ -484,6 +572,11 @@ export function useTrackRecorder(raceId, opts = {}) {
     await releaseWakeLock();
     // If both queues drained cleanly, drop the localStorage entries so a
     // fresh recording session starts empty.
+    // Note: the axisDetect key is intentionally KEPT across stop/start
+    // cycles for the same race — if the user pauses and resumes, we
+    // don't want to redo the 30-60s detection. It's only cleared when
+    // the race itself is removed (handled by the raceId-null branch in
+    // the restore effect).
     const id = raceIdRef.current;
     if (
       id &&
@@ -558,6 +651,10 @@ export function useTrackRecorder(raceId, opts = {}) {
     lastPoint,
     pendingCalibration,
     orientationPermission,
+    // Auto-detect result: null while pending/disabled, or
+    // { axis, polarityFlip, confidence, detected_at }. UI may show a
+    // one-shot toast or pill when this flips from null → set.
+    detectedAxis,
     start,
     stop,
     flushNow,

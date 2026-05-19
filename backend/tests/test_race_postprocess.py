@@ -47,6 +47,7 @@ def _make_race_row(
     *,
     ai_summary: Optional[dict] = None,
     wind_snapshot: Optional[dict] = None,
+    heel_summary: Optional[dict] = None,
 ) -> dict:
     return {
         "id": RACE_ID,
@@ -72,6 +73,7 @@ def _make_race_row(
         ],
         "ai_summary": ai_summary,
         "wind_snapshot": wind_snapshot,
+        "heel_summary": heel_summary,
         # D2 columns
         "mode": "inshore",
         "uses_spinnaker": True,
@@ -98,9 +100,13 @@ class _Spy:
 def spy(monkeypatch: pytest.MonkeyPatch):
     s = _Spy()
 
-    async def fake_persist(pool, race_id, *, ai_summary, wind_snapshot):
+    async def fake_persist(pool, race_id, *, ai_summary, wind_snapshot, heel_summary):
         s.persist_calls.append(
-            {"ai_summary": ai_summary, "wind_snapshot": wind_snapshot}
+            {
+                "ai_summary": ai_summary,
+                "wind_snapshot": wind_snapshot,
+                "heel_summary": heel_summary,
+            }
         )
 
     async def fake_build_wind_snapshot(**kwargs: Any):
@@ -205,9 +211,13 @@ async def test_skips_when_summary_current_and_snapshot_present(monkeypatch, spy)
     # Neither AI nor wind ran.
     assert spy.summary_calls == 0
     assert spy.wind_calls == 0
-    # _persist still called but with both fields None — no-op UPDATE.
+    # _persist still called but with all fields None — no-op UPDATE.
+    # heel_summary is also None here because the heel_summary column
+    # was non-null in the seed row, so the "backfill" branch was skipped.
     assert len(spy.persist_calls) == 1
-    assert spy.persist_calls[0] == {"ai_summary": None, "wind_snapshot": None}
+    assert spy.persist_calls[0] == {
+        "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
+    }
 
 
 async def test_force_regenerates_both(monkeypatch, spy):
@@ -375,3 +385,142 @@ async def test_calibration_offsets_applied_in_postprocess(monkeypatch, spy):
     # max should drop close to ~10°.
     assert heel is not None
     assert heel["max_heel_abs_deg"] < 12.0
+
+
+# ─── heel_summary column persistence (migration 0016) ─────────────────
+
+
+async def test_heel_summary_persisted_when_computed(monkeypatch, spy):
+    """When IMU samples exist and the AI summary regenerates, the
+    computed heel_summary dict is passed to _persist so it lands on
+    the race_sessions.heel_summary column."""
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(),
+        track=_make_track_rows(),
+        imu=_make_imu_rows(),
+        calibrations=[],
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert len(spy.persist_calls) == 1
+    call = spy.persist_calls[0]
+    assert call["heel_summary"] is not None
+    assert call["heel_summary"]["sample_count"] == 30
+
+
+async def test_heel_summary_backfill_when_column_null_but_ai_current(
+    monkeypatch, spy,
+):
+    """When ai_summary is current but heel_summary column is null
+    (race processed before migration 0016 shipped), the next
+    postprocess run should recompute heel just to backfill the
+    column — even though the AI step is skipped."""
+    race = _make_race_row(
+        ai_summary={
+            "recap": "previously generated", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        heel_summary=None,
+    )
+    _patch_loads(
+        monkeypatch,
+        race=race,
+        track=_make_track_rows(),
+        imu=_make_imu_rows(),
+        calibrations=[],
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    # AI was skipped (current); wind was skipped (present).
+    assert spy.summary_calls == 0
+    assert spy.wind_calls == 0
+    # But heel_summary was computed and persisted.
+    assert len(spy.persist_calls) == 1
+    assert spy.persist_calls[0]["heel_summary"] is not None
+    assert spy.persist_calls[0]["ai_summary"] is None
+    assert spy.persist_calls[0]["wind_snapshot"] is None
+
+
+async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
+    monkeypatch, spy,
+):
+    """Steady-state idempotency: when both AI summary and heel_summary
+    are already on the row and prompt version matches, the postprocess
+    job should do nothing — no IMU load, no compute, no overwrite."""
+    race = _make_race_row(
+        ai_summary={
+            "recap": "previously generated", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        heel_summary={
+            "sample_count": 42,
+            "max_heel_deg": 25.0,
+            "max_heel_abs_deg": 25.0,
+            "avg_heel_abs_deg": 15.0,
+            "pct_time_heeled_gt_10": 0.7,
+            "pct_time_heeled_gt_20": 0.4,
+            "max_pitch_abs_deg": 5.0,
+            "by_leg": [],
+        },
+    )
+
+    # Track IMU loads to confirm we never reached them.
+    imu_load_calls = {"n": 0}
+
+    async def counting_imu_load(pool, race_id):
+        imu_load_calls["n"] += 1
+        return _make_imu_rows()
+
+    _patch_loads(
+        monkeypatch,
+        race=race,
+        track=_make_track_rows(),
+        imu=[], calibrations=[],
+    )
+    monkeypatch.setattr(
+        race_postprocess, "_load_imu_samples", counting_imu_load
+    )
+
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert imu_load_calls["n"] == 0
+    assert len(spy.persist_calls) == 1
+    assert spy.persist_calls[0] == {
+        "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
+    }
+
+
+async def test_force_recomputes_heel_summary(monkeypatch, spy):
+    """--force should recompute heel_summary even if ai_summary and
+    heel_summary are both already current."""
+    race = _make_race_row(
+        ai_summary={
+            "recap": "x", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        heel_summary={"sample_count": 1, "max_heel_deg": 1.0,
+                      "max_heel_abs_deg": 1.0, "avg_heel_abs_deg": 1.0,
+                      "pct_time_heeled_gt_10": 0.0,
+                      "pct_time_heeled_gt_20": 0.0,
+                      "max_pitch_abs_deg": 0.0, "by_leg": []},
+    )
+    _patch_loads(
+        monkeypatch,
+        race=race,
+        track=_make_track_rows(),
+        imu=_make_imu_rows(),
+        calibrations=[],
+    )
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID, force=True)
+    assert rc == 0
+    # All three branches ran.
+    assert spy.summary_calls == 1
+    assert spy.wind_calls == 1
+    assert len(spy.persist_calls) == 1
+    call = spy.persist_calls[0]
+    assert call["heel_summary"] is not None
+    assert call["heel_summary"]["sample_count"] == 30

@@ -45,6 +45,8 @@ import { useRouteFreshnessCheck } from "../hooks/useRouteFreshnessCheck";
 import { useHeelGauge } from "../hooks/useHeelGauge";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
+import { PermissionBanner } from "./PermissionBanner.jsx";
+import { usePermissionStatus } from "../hooks/usePermissionStatus";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
 import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
@@ -193,6 +195,7 @@ export function MapView({
   const routing = useRouting(activeRace?.id ?? null);
   const notif = useRouteNotifications(activeRace?.id ?? null);
   const followMode = useFollowMode(activeRace?.id ?? null);
+  const permissionStatus = usePermissionStatus();
 
   // Active calibration for the LIVE gauge — separate from
   // `recorder.pendingCalibration` (which clears on flush ack). Persisted
@@ -666,6 +669,11 @@ export function MapView({
           notif.accept((feature) => routing.applyAlternative(feature))
         }
         onDismiss={notif.dismiss}
+      />
+
+      <PermissionBanner
+        status={permissionStatus}
+        recording={recorder.recording}
       />
 
       {activeRace && (

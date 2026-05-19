@@ -111,6 +111,36 @@ class AiSummaryOut(BaseModel):
     generated_at: Optional[str] = None
 
 
+class HeelLegOut(BaseModel):
+    """Per-leg heel rollup. ``leg_index`` mirrors the index of the mark
+    pass that closes the leg — leg 0 is "from start to first pass."
+    """
+    leg_index: int
+    sample_count: int
+    max_heel_abs_deg: float
+    avg_heel_abs_deg: float
+
+
+class HeelSummaryOut(BaseModel):
+    """Persisted heel rollup from ``workers.race_postprocess``. Mirrors
+    the dict shape returned by
+    ``app.services.heel_stats.compute_heel_summary`` and stored in
+    ``race_sessions.heel_summary`` (JSONB).
+
+    Null on a race row when the postprocess job hasn't run yet OR the
+    race produced zero usable IMU samples (GPS-only race, iOS permission
+    denied, browser without DeviceOrientationEvent).
+    """
+    sample_count: int
+    max_heel_deg: float       # signed; + = starboard rail down
+    max_heel_abs_deg: float
+    avg_heel_abs_deg: float
+    pct_time_heeled_gt_10: float   # 0..1
+    pct_time_heeled_gt_20: float   # 0..1
+    max_pitch_abs_deg: float
+    by_leg: list[HeelLegOut] = []
+
+
 class WindSnapshotMetaOut(BaseModel):
     """Compact metadata about the wind snapshot — the full grid is
     available via a separate endpoint (or directly on the row when we
@@ -143,6 +173,13 @@ class StatsResponse(BaseModel):
     stats: Optional[StatsOut] = None
     ai_summary: Optional[AiSummaryOut] = None
     wind: Optional[WindSnapshotMetaOut] = None
+    # Structured heel rollup from the postprocess job. Null when the
+    # job hasn't run yet, when the race has no IMU samples, or when
+    # the IMU samples produced zero usable rows after filtering.
+    # Frontend stats view will render this as a heel card / per-leg
+    # tiles in a follow-up session — for now the field is wired up
+    # end-to-end and frontends ignore it unobtrusively.
+    heel_summary: Optional[HeelSummaryOut] = None
     # Hints for the frontend so it knows whether to poll for the job
     # to finish (no summary yet) or surface "regenerate" affordances.
     summary_pending: bool = False
@@ -170,6 +207,7 @@ async def _load_race_row(
         SELECT
             r.id, r.name, r.boat_class, r.start_at, r.marks,
             r.mark_passes, r.ai_summary, r.wind_snapshot,
+            r.heel_summary,
             r.mode, r.uses_spinnaker, r.boat_id,
             b.id           AS boat_pk,
             b.name         AS boat_name,
@@ -361,6 +399,7 @@ async def get_stats(
 
     ai_summary = race.get("ai_summary")
     wind = _build_wind_meta(race.get("wind_snapshot"))
+    heel_summary_row = race.get("heel_summary")
 
     summary_pending = stats_dict is not None and ai_summary is None
 
@@ -376,6 +415,7 @@ async def get_stats(
         stats=StatsOut(**stats_dict) if stats_dict else None,
         ai_summary=AiSummaryOut(**ai_summary) if ai_summary else None,
         wind=wind,
+        heel_summary=HeelSummaryOut(**heel_summary_row) if heel_summary_row else None,
         summary_pending=summary_pending,
     )
 

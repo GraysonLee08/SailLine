@@ -21,14 +21,24 @@ const TICK_HZ = 5;
 
 /**
  * @param {object}   opts
- * @param {boolean}  opts.enabled       Master gate. Off → no listener, no ticks.
- * @param {string}   [opts.phoneAxis]   "fore-aft" | "port-stbd". Default fore-aft.
- * @param {object}   [opts.calibration] Optional client-side zero offsets
- *                                      `{heel_zero_offset_deg, pitch_zero_offset_deg}`.
+ * @param {boolean}  opts.enabled        Master gate. Off → no listener, no ticks.
+ * @param {string}   [opts.phoneAxis]    "fore-aft" | "port-stbd". Default fore-aft.
+ * @param {boolean}  [opts.polarityFlip] When true the phone is mounted 180°
+ *                                       from canonical (top toward stern / port).
+ *                                       Negates heel/pitch so the gauge tracks
+ *                                       the boat frame consistently with the
+ *                                       recorder's auto-detect result.
+ * @param {object}   [opts.calibration]  Optional client-side zero offsets
+ *                                       `{heel_zero_offset_deg, pitch_zero_offset_deg}`.
  * @returns {{ reading: {heelDeg:number, pitchDeg:number, yawDeg:number|null} | null,
  *            supported: boolean }}
  */
-export function useHeelGauge({ enabled, phoneAxis = "fore-aft", calibration = null } = {}) {
+export function useHeelGauge({
+  enabled,
+  phoneAxis = "fore-aft",
+  polarityFlip = false,
+  calibration = null,
+} = {}) {
   const [reading, setReading] = useState(null);
   const supportedRef = useRef(isSupported());
 
@@ -36,6 +46,8 @@ export function useHeelGauge({ enabled, phoneAxis = "fore-aft", calibration = nu
   // doesn't need to re-create when they change.
   const axisRef = useRef(phoneAxis);
   axisRef.current = phoneAxis;
+  const flipRef = useRef(polarityFlip);
+  flipRef.current = polarityFlip;
   const calRef = useRef(calibration);
   calRef.current = calibration;
 
@@ -48,7 +60,7 @@ export function useHeelGauge({ enabled, phoneAxis = "fore-aft", calibration = nu
     const intervalMs = Math.round(1000 / TICK_HZ);
     const tick = () => {
       const raw = latestOrientation();
-      const remapped = remapEulerToBoat(raw, axisRef.current);
+      const remapped = remapEulerToBoat(raw, axisRef.current, flipRef.current);
       if (!remapped) {
         // No usable reading yet (sensors warming up). Hold the last
         // value if we have one — flicker-to-null reads as a fault.
