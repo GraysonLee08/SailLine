@@ -31,6 +31,17 @@ import {
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /**
+ * Resolve after all currently-pending microtasks have drained. A
+ * setTimeout(0) callback is a macrotask, which the event loop runs only
+ * once the microtask queue is empty — so awaiting it guarantees any
+ * promise chain kicked off synchronously before the call has settled,
+ * no matter how many `await`s deep it is.
+ */
+function flushAsync() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
  * Build a fake PermissionStatus object with controllable state and an
  * addEventListener that captures the handler so the test can fire it.
  */
@@ -201,9 +212,12 @@ describe("subscribeLocationPermission", () => {
     };
     const callback = vi.fn();
     const unsubscribe = subscribeLocationPermission(callback);
-    // Initial snapshot is async (resolves through the promise chain).
-    await Promise.resolve();
-    await Promise.resolve();
+    // Initial snapshot resolves through several promise ticks
+    // (subscribe → getLocationPermission → queryWebPermission →
+    // navigator.permissions.query). A single setTimeout(0) macrotask
+    // runs only after all pending microtasks drain, so it's a reliable
+    // flush regardless of how deep the await chain is.
+    await flushAsync();
     expect(callback).toHaveBeenCalled();
     expect(callback.mock.calls[0][0].state).toBe("granted");
 
@@ -231,8 +245,7 @@ describe("subscribeLocationPermission", () => {
     };
     const callback = vi.fn();
     subscribeLocationPermission(callback);
-    await Promise.resolve();
-    await Promise.resolve();
+    await flushAsync();
     const firstArg = callback.mock.calls[0][0];
     expect(firstArg).toBeDefined();
     expect(firstArg._raw).toBeUndefined();

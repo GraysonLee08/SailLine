@@ -24,7 +24,7 @@
 // a single ISO UTC timestamp on save. Empty inputs serialize as null —
 // users can save a course before scheduling is finalized.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { apiFetch } from "./api";
@@ -38,7 +38,10 @@ import {
   formatDecimal,
   parseCoord,
 } from "./lib/latlon";
+import { generateBarbImages, computeFeatures } from "./lib/windBarb";
 import { useCountdown } from "./hooks/useCountdown";
+import { useRegion } from "./hooks/useRegion";
+import { useWeather } from "./hooks/useWeather";
 import { safeAnimate, EASE_OUT_OVERSHOOT } from "./lib/motion";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./components/AnimatedDigit.jsx";
 
@@ -60,6 +63,8 @@ const COORD_FORMAT_KEY = "sailline.coordFormat";
 // nothing on the map, exclude it from the course line, fail to save.
 const isPlaced = (m) =>
   Number.isFinite(m?.lat) && Number.isFinite(m?.lon);
+
+const EMPTY_FC = { type: "FeatureCollection", features: [] };
 
 export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   const isNew = !raceId;
@@ -188,12 +193,45 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   );
   const countdown = useCountdown(startAtIso);
 
+  // ── Wind preview at the scheduled start ───────────────────────────
+  // Region is derived from the course centroid (falls back to the user's
+  // home base when no marks are placed yet). We only fetch — and only
+  // render barbs — once a start time is set: passing region=null disables
+  // the hook. The API serves the forecast hour nearest startAtIso, or 425
+  // (treated as "no data") when the start is past the forecast horizon.
+  const regionRace = useMemo(() => ({ marks }), [marks]);
+  const region = useRegion(regionRace);
+  const windSource = region.defaultSource;
+  const { data: weather, validTime: windValidTime } = useWeather(
+    startAtIso ? region.name : null,
+    windSource,
+    startAtIso,
+  );
+
   // ── Map init ──────────────────────────────────────────────────────
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const markersRef = useRef([]);
   const fittedRef = useRef(false);
   const [styleLoaded, setStyleLoaded] = useState(false);
+
+  // Latest weather grid, read inside the (stable) moveend handler so the
+  // barb field re-renders on pan/zoom without re-binding the listener.
+  const weatherRef = useRef(weather);
+  weatherRef.current = weather;
+
+  const renderBarbs = useCallback(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const src = map.getSource("wind-base");
+    if (!src) return;
+    const w = weatherRef.current;
+    if (!w) {
+      src.setData(EMPTY_FC);
+      return;
+    }
+    src.setData({ type: "FeatureCollection", features: computeFeatures(map, w) });
+  }, []);
 
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
@@ -207,6 +245,32 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
     mapRef.current = map;
 
     map.on("load", () => {
+      // Wind barbs sit beneath the course line. Added first so the course
+      // and markers always draw on top.
+      const images = generateBarbImages();
+      Object.entries(images).forEach(([id, dataUrl]) => {
+        const img = new Image(64, 64);
+        img.onload = () => {
+          if (!map.hasImage(id)) map.addImage(id, img);
+        };
+        img.src = dataUrl;
+      });
+
+      map.addSource("wind-base", { type: "geojson", data: EMPTY_FC });
+      map.addLayer({
+        id: "wind-barbs-base",
+        type: "symbol",
+        source: "wind-base",
+        layout: {
+          "icon-image": ["concat", "barb-", ["get", "bucket"]],
+          "icon-rotate": ["get", "dir"],
+          "icon-rotation-alignment": "map",
+          "icon-allow-overlap": true,
+          "icon-ignore-placement": true,
+          "icon-size": 0.8,
+        },
+      });
+
       map.addSource("course", { type: "geojson", data: emptyLine() });
       map.addLayer({
         id: "course-line",
@@ -218,6 +282,10 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
           "line-dasharray": [2, 1.5],
         },
       });
+
+      // Re-tile the barb field on pan/zoom (density/stride is viewport-aware).
+      map.on("moveend", renderBarbs);
+
       setStyleLoaded(true);
     });
 
@@ -240,6 +308,15 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
       mapRef.current = null;
     };
   }, []);
+
+  // ── Repaint wind barbs when the grid (or readiness) changes ───────
+  // Pan/zoom updates are handled by the moveend listener; this covers a
+  // new start time / region resolving to fresh weather, and clearing to
+  // no barbs when the start is unset or past the horizon (weather=null).
+  useEffect(() => {
+    if (!styleLoaded) return;
+    renderBarbs();
+  }, [weather, styleLoaded, renderBarbs]);
 
   // ── Sync markers + course line whenever positions/order change ────
   // Unplaced marks (null lat/lon) are invisible: no marker, no segment.
@@ -490,7 +567,17 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
       )}
 
       <div style={styles.workspace}>
-        <div ref={containerRef} style={styles.map} />
+        <div style={styles.mapWrap}>
+          <div ref={containerRef} style={styles.map} />
+          {weather && windValidTime && (
+            <div style={styles.windLabel}>
+              <span style={styles.windLabelSrc}>{windSource.toUpperCase()}</span>
+              <span style={styles.windLabelValid}>
+                valid {windValidTime.toISOString().slice(11, 16)}Z
+              </span>
+            </div>
+          )}
+        </div>
 
         <aside style={styles.sidebar}>
           {error && <div style={styles.error}>{error}</div>}
@@ -1004,7 +1091,28 @@ const styles = {
   countdownLabel: { fontSize: 10, letterSpacing: "0.08em", fontWeight: 600, color: "var(--ink-3)" },
   countdownValue: { fontSize: 14, fontWeight: 500 },
   workspace: { flex: 1, display: "flex", minHeight: 0 },
-  map: { flex: 1, minWidth: 0 },
+  mapWrap: { flex: 1, minWidth: 0, position: "relative" },
+  map: { position: "absolute", inset: 0 },
+  windLabel: {
+    position: "absolute",
+    top: 12,
+    left: 12,
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "6px 12px",
+    background: "var(--paper)",
+    border: "1px solid var(--rule)",
+    borderRadius: "var(--r-sm)",
+    boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
+    fontFamily: "var(--mono, ui-monospace, monospace)",
+    fontSize: 11,
+    fontVariantNumeric: "tabular-nums",
+    zIndex: 2,
+    pointerEvents: "none",
+  },
+  windLabelSrc: { fontWeight: 600, letterSpacing: "0.05em", color: "var(--ink)" },
+  windLabelValid: { color: "var(--ink-3)" },
   sidebar: { width: SIDEBAR_WIDTH, flexShrink: 0, borderLeft: "1px solid var(--rule)", background: "var(--paper)", display: "flex", flexDirection: "column", overflow: "hidden" },
   scrollArea: { flex: 1, overflowY: "auto", padding: "20px" },
   section: { marginBottom: 18 },

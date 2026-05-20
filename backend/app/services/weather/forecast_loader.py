@@ -214,6 +214,75 @@ async def load_forecast_for_race(
     return WindForecast(snapshots=snapshots, quality=quality)
 
 
+async def load_grid_blob_at(
+    source: str,
+    region: str,
+    valid_time: datetime,
+) -> tuple[bytes, datetime]:
+    """Return the raw gzipped wind grid whose valid_time is nearest `valid_time`.
+
+    Used by the read endpoint to render barbs at a chosen instant (e.g. a
+    race start time). Picks the nearest forecast hour from the newest cycle
+    of the given source — no interpolation, no cross-source blending. The
+    returned bytes are the same gzipped JSON the worker stored, so the
+    endpoint can pass them through exactly like the ``:latest`` blob.
+
+    The caller passes an explicit ``source`` (the contract is region+source
+    keyed). When ``valid_time`` is past the requested source's horizon this
+    raises ForecastNotAvailable rather than silently clamping to the last
+    forecast hour (which would render a misleading barb field). On conus a
+    far-future race may therefore 425 on HRRR even though GFS could cover it;
+    the frontend chooses the source by lead time before calling.
+
+    Raises
+    ------
+    ForecastNotAvailable
+        `valid_time` is beyond the newest cycle's last forecast hour.
+    RuntimeError
+        No cycle ingested yet, or the chosen snapshot blob is missing.
+    ValueError
+        Unknown region.
+    """
+    if region not in REGIONS:
+        raise ValueError(f"unknown region: {region}")
+    if valid_time.tzinfo is None:
+        valid_time = valid_time.replace(tzinfo=timezone.utc)
+
+    cycle = await _newest_cycle(source, region)
+    if cycle is None:
+        raise RuntimeError(f"no ingested {source} cycles for region={region}")
+
+    valid_times = cycle.valid_times
+    t_max = valid_times[-1]
+
+    # Past this cycle's horizon → not available yet. Estimate when a future
+    # cycle reaches it: the horizon length back from the requested instant
+    # (mirrors load_forecast_for_race's available_at arithmetic).
+    if valid_time > t_max:
+        horizon = t_max - cycle.reference_time
+        raise ForecastNotAvailable(
+            available_at=valid_time - horizon,
+            reason=f"{source} cycle horizon ends at {t_max.isoformat()}",
+        )
+
+    # Nearest forecast hour by absolute time delta. A request before F00
+    # (instant already in this cycle's past) clamps to the earliest hour
+    # rather than erroring — barbs at the start of coverage are still useful.
+    idx = min(
+        range(len(valid_times)),
+        key=lambda i: abs((valid_times[i] - valid_time).total_seconds()),
+    )
+    fhour = cycle.fhours[idx]
+    chosen_valid = valid_times[idx]
+
+    redis = redis_client.get_client()
+    key = f"weather:{source}:{region}:{cycle.cycle_iso}:f{fhour:03d}"
+    blob = await redis.get(key)
+    if blob is None:
+        raise RuntimeError(f"missing forecast snapshot: {key}")
+    return blob, chosen_valid
+
+
 def _pick_bracketing(
     fhours: list[int],
     valid_times: list[datetime],

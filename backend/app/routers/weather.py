@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from asyncio import to_thread
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from google.cloud import storage
@@ -22,6 +23,7 @@ from google.cloud.exceptions import NotFound
 from app import redis_client
 from app.config import settings
 from app.regions import REGIONS
+from app.services.weather import ForecastNotAvailable, load_grid_blob_at
 
 log = logging.getLogger(__name__)
 
@@ -33,7 +35,12 @@ CACHE_CONTROL = "public, max-age=300"
 
 
 @router.get("")
-async def get_weather(region: str, request: Request, source: str = "hrrr") -> Response:
+async def get_weather(
+    region: str,
+    request: Request,
+    source: str = "hrrr",
+    at: str | None = None,
+) -> Response:
     if region not in REGIONS:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
@@ -46,6 +53,11 @@ async def get_weather(region: str, request: Request, source: str = "hrrr") -> Re
             f"source {source!r} not available for region {region!r}. "
             f"valid: {list(region_obj.sources)}",
         )
+
+    # Time-sliced read: serve the forecast hour nearest `at` instead of the
+    # rolling latest grid. Used by the editor to preview wind at race start.
+    if at is not None:
+        return await _get_weather_at(region, source, at, request)
 
     key = f"weather:{source}:{region}:latest"
     blob = await _read_redis(key)
@@ -62,6 +74,70 @@ async def get_weather(region: str, request: Request, source: str = "hrrr") -> Re
 
     # Hash of the stored bytes — changes iff the cycle rotated. Avoids
     # decompressing just to read reference_time out of the JSON body.
+    etag = f'"{hashlib.sha256(blob).hexdigest()[:16]}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+
+    return Response(
+        content=blob,
+        media_type="application/json",
+        headers={
+            "Content-Encoding": "gzip",
+            "Cache-Control": CACHE_CONTROL,
+            "ETag": etag,
+            "Vary": "Accept-Encoding",
+        },
+    )
+
+
+def _parse_at(raw: str) -> datetime:
+    """Parse an ISO timestamp from the `at` query param. Naive → UTC.
+
+    Accepts a trailing ``Z`` (Python <3.11 fromisoformat rejects it).
+    Raises ValueError on junk so the caller can return 400.
+    """
+    s = raw.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+async def _get_weather_at(
+    region: str, source: str, at: str, request: Request
+) -> Response:
+    """Serve the forecast-hour grid nearest the requested instant.
+
+    Mirrors the latest-path response contract (gzipped passthrough, ETag,
+    304). Past the source's horizon → 425 with {available_at,
+    hours_until_available}, matching the routing endpoint so the frontend
+    can hide barbs and reschedule. No GCS fallback: time-sliced reads come
+    from Redis only (the per-fhour archive isn't a stable pointer).
+    """
+    try:
+        valid_time = _parse_at(at)
+    except ValueError:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"invalid `at` timestamp: {at!r} (expected ISO 8601)",
+        )
+
+    try:
+        blob, _chosen_valid = await load_grid_blob_at(source, region, valid_time)
+    except ForecastNotAvailable as exc:
+        raise HTTPException(
+            status_code=425,  # Too Early
+            detail={
+                "detail": str(exc),
+                "available_at": exc.available_at.isoformat(),
+                "hours_until_available": exc.hours_until_available,
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+
     etag = f'"{hashlib.sha256(blob).hexdigest()[:16]}"'
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})

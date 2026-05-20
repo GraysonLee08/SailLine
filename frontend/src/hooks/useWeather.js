@@ -19,8 +19,16 @@ const TICK_MS = 60 * 1000;        // re-render cadence to keep ageMinutes fresh
  * the user is zoomed into a venue. React doesn't allow conditional hooks,
  * so we toggle behavior via the argument instead.
  *
+ * Pass `atIso` (an ISO timestamp) to fetch the forecast hour nearest that
+ * instant instead of the rolling latest grid — used by the race editor to
+ * preview wind at the scheduled start. When the requested time is past the
+ * model horizon the API returns 425; the hook treats that as "no data"
+ * (data: null, no error) so the caller simply renders no barbs. Pass null
+ * (the default) for the live latest-grid behavior.
+ *
  * @param {string|null} region  e.g. "conus", "sf_bay", or null to skip
  * @param {"hrrr"|"gfs"} source
+ * @param {string|null} atIso   ISO timestamp, or null for the latest grid
  * @returns {{
  *   data: object|null,         // full payload: { lats, lons, u, v, shape, bbox, ... }
  *   referenceTime: Date|null,  // when the model was run
@@ -30,7 +38,7 @@ const TICK_MS = 60 * 1000;        // re-render cadence to keep ageMinutes fresh
  *   error: Error|null,
  * }}
  */
-export function useWeather(region, source = "hrrr") {
+export function useWeather(region, source = "hrrr", atIso = null) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(Boolean(region));
   const [error, setError] = useState(null);
@@ -64,7 +72,8 @@ export function useWeather(region, source = "hrrr") {
         const url =
           `${API_URL}/api/weather` +
           `?region=${encodeURIComponent(region)}` +
-          `&source=${encodeURIComponent(source)}`;
+          `&source=${encodeURIComponent(source)}` +
+          (atIso ? `&at=${encodeURIComponent(atIso)}` : "");
 
         const res = await fetch(url, { headers });
         if (cancelled) return;
@@ -73,6 +82,16 @@ export function useWeather(region, source = "hrrr") {
           // Cycle hasn't rotated — keep existing data, just clear loading.
           setLoading(false);
           setError(null);
+          return;
+        }
+        if (res.status === 425) {
+          // Requested time is past the forecast horizon (only happens with
+          // `atIso`). Not an error — there's simply no grid to show yet.
+          // Clear any stale data so the caller renders no barbs.
+          setData(null);
+          setLoading(false);
+          setError(null);
+          etagRef.current = null;
           return;
         }
         if (!res.ok) {
@@ -104,7 +123,7 @@ export function useWeather(region, source = "hrrr") {
       clearInterval(refresh);
       clearInterval(tick);
     };
-  }, [region, source]);
+  }, [region, source, atIso]);
 
   const referenceTime = data ? new Date(data.reference_time) : null;
   const validTime = data ? new Date(data.valid_time) : null;

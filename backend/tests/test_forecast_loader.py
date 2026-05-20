@@ -20,6 +20,7 @@ import pytest
 from app.services.weather.forecast_loader import (
     ForecastNotAvailable,
     load_forecast_for_race,
+    load_grid_blob_at,
 )
 
 
@@ -190,6 +191,89 @@ async def test_unknown_region_raises_value_error(freeze_now):
             await load_forecast_for_race(
                 "atlantis", freeze_now + timedelta(hours=1), duration_hours=4,
             )
+
+
+# ─── load_grid_blob_at (time-sliced read for the editor) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_grid_blob_at_picks_nearest_fhour(freeze_now):
+    """Returns the raw blob whose valid_time is nearest the request."""
+    fhours = list(range(0, 19))
+    manifest = _make_manifest("hrrr", fhours)
+    cycle = manifest["cycle"]
+    store: dict = {
+        "weather:hrrr:conus:cycles": [cycle.encode()],
+        f"weather:hrrr:conus:{cycle}:manifest": json.dumps(manifest).encode(),
+    }
+    for fh in fhours:
+        valid = (freeze_now + timedelta(hours=fh)).isoformat()
+        store[f"weather:hrrr:conus:{cycle}:f{fh:03d}"] = _wind_blob(valid)
+
+    fake = _FakeRedis(store)
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        # +2h10m → nearest forecast hour is f002 (valid = ref + 2h).
+        want_time = freeze_now + timedelta(hours=2, minutes=10)
+        blob, chosen_valid = await load_grid_blob_at("hrrr", "conus", want_time)
+
+    assert blob == store["weather:hrrr:conus:20260505T1200Z:f002"]
+    assert chosen_valid == freeze_now + timedelta(hours=2)
+
+
+@pytest.mark.asyncio
+async def test_grid_blob_at_past_horizon_raises(freeze_now):
+    """Requested instant beyond the cycle's last fhour → ForecastNotAvailable."""
+    fhours = list(range(0, 19))
+    manifest = _make_manifest("hrrr", fhours)
+    cycle = manifest["cycle"]
+    store: dict = {
+        "weather:hrrr:conus:cycles": [cycle.encode()],
+        f"weather:hrrr:conus:{cycle}:manifest": json.dumps(manifest).encode(),
+    }
+    for fh in fhours:
+        valid = (freeze_now + timedelta(hours=fh)).isoformat()
+        store[f"weather:hrrr:conus:{cycle}:f{fh:03d}"] = _wind_blob(valid)
+
+    fake = _FakeRedis(store)
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        want_time = freeze_now + timedelta(hours=25)  # past f018
+        with pytest.raises(ForecastNotAvailable) as exc:
+            await load_grid_blob_at("hrrr", "conus", want_time)
+
+    assert exc.value.available_at < want_time
+
+
+@pytest.mark.asyncio
+async def test_grid_blob_at_no_cycle_raises_runtime_error(freeze_now):
+    fake = _FakeRedis(store={})
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        with pytest.raises(RuntimeError, match="no ingested"):
+            await load_grid_blob_at("hrrr", "conus", freeze_now + timedelta(hours=2))
+
+
+@pytest.mark.asyncio
+async def test_grid_blob_at_naive_time_assumed_utc(freeze_now):
+    fhours = list(range(0, 19))
+    manifest = _make_manifest("hrrr", fhours)
+    cycle = manifest["cycle"]
+    store: dict = {
+        "weather:hrrr:conus:cycles": [cycle.encode()],
+        f"weather:hrrr:conus:{cycle}:manifest": json.dumps(manifest).encode(),
+    }
+    for fh in fhours:
+        valid = (freeze_now + timedelta(hours=fh)).isoformat()
+        store[f"weather:hrrr:conus:{cycle}:f{fh:03d}"] = _wind_blob(valid)
+
+    fake = _FakeRedis(store)
+    naive = (freeze_now + timedelta(hours=3)).replace(tzinfo=None)
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        blob, chosen_valid = await load_grid_blob_at("hrrr", "conus", naive)
+
+    assert chosen_valid == freeze_now + timedelta(hours=3)
 
 
 @pytest.mark.asyncio

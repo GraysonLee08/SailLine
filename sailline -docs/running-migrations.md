@@ -71,18 +71,43 @@ python -m alembic current
 
 ## Critical gotcha — the password secret name
 
-Despite what production config says, the **working** password for the
-`sailline` DB user is in:
+**The two secrets have drifted, and which one works has FLIPPED at least
+once.** Do not trust this section to name the live one — verify
+empirically each session (see below).
+
+As of **2026-05-19**, the **working** password for the `sailline` DB
+user is in:
 
 ```
-sailline-db-postgres-password   ✅ this is the one Alembic needs
-sailline-db-app-password        ❌ contains a stale password, do NOT use
+sailline-db-app-password        ✅ currently accepted by the database
+sailline-db-postgres-password   ❌ currently rejected (was the working one before 2026-05-19)
 ```
 
-This is a latent bug — at some point the secret rotation stopped propagating
-to the database. Production is currently running on borrowed time (a
-long-lived Cloud Run instance with a cached older value). Fix tracked
-separately; until reconciled, always pull from `postgres-password`.
+Before 2026-05-14 it was the reverse. Neither secret reliably tracks
+the database's actual `sailline` password — the rotation pipeline is
+broken and has been re-broken in both directions. Production runs on a
+long-lived Cloud Run instance with a cached value, so it keeps working
+even when both secrets are wrong.
+
+**Verify which secret works before migrating** (cheap, no migration):
+
+```powershell
+foreach ($s in "sailline-db-app-password","sailline-db-postgres-password") {
+  $p = (gcloud secrets versions access latest --secret=$s).Trim()
+  try {
+    python -c "import psycopg; psycopg.connect(host='127.0.0.1', port=5432, dbname='sailline_app', user='sailline', password='$p').close()"
+    Write-Host "$s WORKS" -ForegroundColor Green
+  } catch {
+    Write-Host "$s rejected" -ForegroundColor Red
+  }
+}
+```
+
+Set `$env:DB_PASSWORD` from whichever prints WORKS, then run Alembic.
+
+**Real fix (tracked separately):** reconcile the `sailline` role
+password with a single source of truth and repair the rotation
+pipeline. Until then this is empirical-verification-every-time.
 
 ---
 

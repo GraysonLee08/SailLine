@@ -49,7 +49,7 @@ import { PermissionBanner } from "./PermissionBanner.jsx";
 import { usePermissionStatus } from "../hooks/usePermissionStatus";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
-import { uvToSpeedDir, bilerpUV, generateBarbImages } from "../lib/windBarb";
+import { generateBarbImages, computeFeatures } from "../lib/windBarb";
 import { formatLat, formatLon } from "../lib/latlon";
 import { safeAnimate, EASE_OUT_SOFT } from "../lib/motion";
 import { DEFAULT_PHONE_AXIS, PHONE_AXES } from "../lib/imuAxes";
@@ -58,7 +58,6 @@ const PHONE_AXIS_STORAGE_KEY = "sailline.phoneAxis";
 
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
 
-const TARGET_BARB_SPACING_PX = 70;
 const REGION_FLY_ZOOM = 7;
 const GPS_FLY_ZOOM = 13;
 const COURSE_FIT_PADDING = 140;
@@ -66,72 +65,6 @@ const COURSE_FIT_MAX_ZOOM = 12;
 
 const RACE_OVERLAY_TOP_DEFAULT = 12;
 const RACE_OVERLAY_TOP_WITH_BANNER = 76;
-
-function computeFeatures(map, weather, excludeBbox = null) {
-  const { lats, lons, u, v } = weather;
-  const zoom = map.getZoom();
-  const bounds = map.getBounds();
-  const centerLat = map.getCenter().lat;
-
-  const pxPerDeg =
-    (256 * Math.pow(2, zoom) * Math.cos((centerLat * Math.PI) / 180)) / 360;
-  const targetDeg = TARGET_BARB_SPACING_PX / pxPerDeg;
-
-  const nativeLatStep = Math.abs(lats[1] - lats[0]);
-  const nativeLonStep = Math.abs(lons[1] - lons[0]);
-  const nativeStep = Math.max(nativeLatStep, nativeLonStep);
-
-  const south = bounds.getSouth();
-  const north = bounds.getNorth();
-  const west = bounds.getWest();
-  const east = bounds.getEast();
-
-  const inExcluded = (lat, lon) =>
-    excludeBbox &&
-    lat >= excludeBbox.minLat &&
-    lat <= excludeBbox.maxLat &&
-    lon >= excludeBbox.minLon &&
-    lon <= excludeBbox.maxLon;
-
-  const features = [];
-
-  if (targetDeg >= nativeStep) {
-    const stride = Math.max(1, Math.round(targetDeg / nativeStep));
-    for (let i = 0; i < lats.length; i += stride) {
-      const lat = lats[i];
-      if (lat < south || lat > north) continue;
-      for (let j = 0; j < lons.length; j += stride) {
-        const lon = lons[j];
-        if (lon < west || lon > east) continue;
-        if (inExcluded(lat, lon)) continue;
-        features.push(makeFeature(lon, lat, u[i][j], v[i][j]));
-      }
-    }
-  } else {
-    const startLat = Math.ceil(south / targetDeg) * targetDeg;
-    const startLon = Math.ceil(west / targetDeg) * targetDeg;
-
-    for (let lat = startLat; lat <= north; lat += targetDeg) {
-      for (let lon = startLon; lon <= east; lon += targetDeg) {
-        if (inExcluded(lat, lon)) continue;
-        const sample = bilerpUV(weather, lat, lon);
-        if (sample) features.push(makeFeature(lon, lat, sample.u, sample.v));
-      }
-    }
-  }
-
-  return features;
-}
-
-function makeFeature(lon, lat, u, v) {
-  const { speedKt, dirDeg } = uvToSpeedDir(u, v);
-  const bucket = Math.min(Math.round(speedKt / 5) * 5, 65);
-  return {
-    type: "Feature",
-    geometry: { type: "Point", coordinates: [lon, lat] },
-    properties: { bucket, dir: dirDeg },
-  };
-}
 
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 

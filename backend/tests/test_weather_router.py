@@ -8,6 +8,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from app import redis_client
 from app.routers import weather
+from app.services.weather import ForecastNotAvailable
 
 
 @pytest.fixture
@@ -185,5 +187,87 @@ def test_503_when_redis_and_gcs_both_empty(client, mock_redis, monkeypatch):
     monkeypatch.setattr(weather, "_read_latest_gcs", lambda src, region: None)
 
     r = client.get("/api/weather?region=conus&source=hrrr")
+
+    assert r.status_code == 503
+
+
+# -- Time-sliced read (`at`) ----------------------------------------------
+#
+# These patch the loader (load_grid_blob_at) to keep the router tests
+# focused on HTTP wiring. The nearest-fhour selection itself is covered in
+# test_forecast_loader.py against a real fake-Redis store.
+
+
+def test_at_returns_nearest_grid_with_headers(client, fake_blob, expected_etag, monkeypatch):
+    chosen = datetime(2026, 4, 29, 19, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        weather, "load_grid_blob_at", AsyncMock(return_value=(fake_blob, chosen))
+    )
+
+    r = client.get("/api/weather?region=conus&source=hrrr&at=2026-04-29T19:05:00Z")
+
+    assert r.status_code == 200
+    assert r.headers["content-encoding"] == "gzip"
+    assert r.headers["etag"] == expected_etag
+    assert r.headers["cache-control"] == "public, max-age=300"
+    assert r.headers["vary"] == "Accept-Encoding"
+    assert r.content == gzip.decompress(fake_blob)
+    weather.load_grid_blob_at.assert_awaited_once()
+    args = weather.load_grid_blob_at.await_args.args
+    assert args[0] == "hrrr"
+    assert args[1] == "conus"
+    assert args[2] == datetime(2026, 4, 29, 19, 5, tzinfo=timezone.utc)
+
+
+def test_at_if_none_match_returns_304(client, fake_blob, expected_etag, monkeypatch):
+    chosen = datetime(2026, 4, 29, 19, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        weather, "load_grid_blob_at", AsyncMock(return_value=(fake_blob, chosen))
+    )
+
+    r = client.get(
+        "/api/weather?region=conus&source=hrrr&at=2026-04-29T19:05:00Z",
+        headers={"If-None-Match": expected_etag},
+    )
+
+    assert r.status_code == 304
+    assert r.headers["etag"] == expected_etag
+    assert r.content == b""
+    assert "content-encoding" not in r.headers
+
+
+def test_at_invalid_timestamp_returns_400(client, monkeypatch):
+    spy = AsyncMock()
+    monkeypatch.setattr(weather, "load_grid_blob_at", spy)
+
+    r = client.get("/api/weather?region=conus&source=hrrr&at=not-a-date")
+
+    assert r.status_code == 400
+    spy.assert_not_awaited()
+
+
+def test_at_past_horizon_returns_425(client, monkeypatch):
+    available_at = datetime(2026, 4, 29, 18, 0, tzinfo=timezone.utc)
+
+    async def _raise(*_args, **_kwargs):
+        raise ForecastNotAvailable(available_at=available_at, reason="past horizon")
+
+    monkeypatch.setattr(weather, "load_grid_blob_at", _raise)
+
+    r = client.get("/api/weather?region=conus&source=hrrr&at=2026-05-10T12:00:00Z")
+
+    assert r.status_code == 425
+    body = r.json()["detail"]
+    assert body["available_at"] == available_at.isoformat()
+    assert "hours_until_available" in body
+
+
+def test_at_missing_snapshot_returns_503(client, monkeypatch):
+    async def _raise(*_args, **_kwargs):
+        raise RuntimeError("missing forecast snapshot")
+
+    monkeypatch.setattr(weather, "load_grid_blob_at", _raise)
+
+    r = client.get("/api/weather?region=conus&source=hrrr&at=2026-04-29T19:00:00Z")
 
     assert r.status_code == 503

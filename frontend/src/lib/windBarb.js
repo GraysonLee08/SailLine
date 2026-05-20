@@ -201,3 +201,92 @@ export function generateBarbImages() {
   }
   return images;
 }
+
+// Target on-screen spacing between rendered barbs. Drives the native-grid
+// stride (zoomed out) and the interpolation step (zoomed in).
+const TARGET_BARB_SPACING_PX = 70;
+
+/**
+ * Build GeoJSON barb features for the current map view from a wind grid.
+ *
+ * Two regimes:
+ *   - Zoomed out (target spacing >= native grid step): sample the native
+ *     grid on a stride so we don't draw more barbs than are legible.
+ *   - Zoomed in (target spacing < native step): bilinearly interpolate on
+ *     a regular target-degree lattice so barbs stay usefully dense.
+ *
+ * `excludeBbox` (optional) suppresses features inside a rectangle — used by
+ * the live map to avoid double-rendering where a venue overlay covers the
+ * base grid. Pass null when there's no overlay (e.g. the race editor).
+ *
+ * @param {mapboxgl.Map} map
+ * @param {{lats:number[], lons:number[], u:number[][], v:number[][]}} weather
+ * @param {{minLat:number,maxLat:number,minLon:number,maxLon:number}|null} excludeBbox
+ * @returns {Array<object>} GeoJSON Point features with {bucket, dir} props
+ */
+export function computeFeatures(map, weather, excludeBbox = null) {
+  const { lats, lons, u, v } = weather;
+  const zoom = map.getZoom();
+  const bounds = map.getBounds();
+  const centerLat = map.getCenter().lat;
+
+  const pxPerDeg =
+    (256 * Math.pow(2, zoom) * Math.cos((centerLat * Math.PI) / 180)) / 360;
+  const targetDeg = TARGET_BARB_SPACING_PX / pxPerDeg;
+
+  const nativeLatStep = Math.abs(lats[1] - lats[0]);
+  const nativeLonStep = Math.abs(lons[1] - lons[0]);
+  const nativeStep = Math.max(nativeLatStep, nativeLonStep);
+
+  const south = bounds.getSouth();
+  const north = bounds.getNorth();
+  const west = bounds.getWest();
+  const east = bounds.getEast();
+
+  const inExcluded = (lat, lon) =>
+    excludeBbox &&
+    lat >= excludeBbox.minLat &&
+    lat <= excludeBbox.maxLat &&
+    lon >= excludeBbox.minLon &&
+    lon <= excludeBbox.maxLon;
+
+  const features = [];
+
+  if (targetDeg >= nativeStep) {
+    const stride = Math.max(1, Math.round(targetDeg / nativeStep));
+    for (let i = 0; i < lats.length; i += stride) {
+      const lat = lats[i];
+      if (lat < south || lat > north) continue;
+      for (let j = 0; j < lons.length; j += stride) {
+        const lon = lons[j];
+        if (lon < west || lon > east) continue;
+        if (inExcluded(lat, lon)) continue;
+        features.push(makeFeature(lon, lat, u[i][j], v[i][j]));
+      }
+    }
+  } else {
+    const startLat = Math.ceil(south / targetDeg) * targetDeg;
+    const startLon = Math.ceil(west / targetDeg) * targetDeg;
+
+    for (let lat = startLat; lat <= north; lat += targetDeg) {
+      for (let lon = startLon; lon <= east; lon += targetDeg) {
+        if (inExcluded(lat, lon)) continue;
+        const sample = bilerpUV(weather, lat, lon);
+        if (sample) features.push(makeFeature(lon, lat, sample.u, sample.v));
+      }
+    }
+  }
+
+  return features;
+}
+
+/** GeoJSON Point feature with a 5kt-bucketed `bucket` and "from" `dir`. */
+export function makeFeature(lon, lat, u, v) {
+  const { speedKt, dirDeg } = uvToSpeedDir(u, v);
+  const bucket = Math.min(Math.round(speedKt / 5) * 5, 65);
+  return {
+    type: "Feature",
+    geometry: { type: "Point", coordinates: [lon, lat] },
+    properties: { bucket, dir: dirDeg },
+  };
+}

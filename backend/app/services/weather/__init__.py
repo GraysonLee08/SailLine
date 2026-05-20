@@ -3,6 +3,11 @@
 from app.services.weather.forecast_loader import (
     ForecastNotAvailable,
     load_forecast_for_race,
+    load_grid_blob_at,
 )
 
-__all__ = ["ForecastNotAvailable", "load_forecast_for_race"]
+__all__ = [
+    "ForecastNotAvailable",
+    "load_forecast_for_race",
+    "load_grid_blob_at",
+]
