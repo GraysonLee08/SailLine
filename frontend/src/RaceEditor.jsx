@@ -28,8 +28,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { apiFetch } from "./api";
-import { BOAT_CLASSES } from "./lib/boatClasses";
-import { COURSE_FAMILIES, buildCourseMarks } from "./lib/morfCourses";
+import { BOAT_CLASSES } from "@sailline/shared";
+import { COURSE_FAMILIES, buildCourseMarks } from "@sailline/shared";
 import {
   formatLat,
   formatLon,
@@ -37,8 +37,8 @@ import {
   formatLonInput,
   formatDecimal,
   parseCoord,
-} from "./lib/latlon";
-import { generateBarbImages, computeFeatures } from "./lib/windBarb";
+} from "@sailline/shared";
+import { generateBarbImages, computeFeatures } from "@sailline/shared";
 import { useCountdown } from "./hooks/useCountdown";
 import { useRegion } from "./hooks/useRegion";
 import { useWeather } from "./hooks/useWeather";

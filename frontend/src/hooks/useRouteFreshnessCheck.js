@@ -40,7 +40,7 @@
 // `!ready` as "no banner."
 
 import { useMemo } from "react";
-import { bilerpUV, uvToSpeedDir } from "../lib/windBarb";
+import { bilerpUV, uvToSpeedDir } from "@sailline/shared";
 
 // Empirical thresholds — see the file header for rationale. Bumped to
 // per-export constants so tests / future tuning can override without

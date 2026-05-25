@@ -26,7 +26,7 @@
 import { useEffect } from "react";
 
 import { useMapContext } from "../MapContext.jsx";
-import { bilerpUV, generateBarbImages, uvToSpeedDir } from "../../lib/windBarb";
+import { bilerpUV, generateBarbImages, uvToSpeedDir } from "@sailline/shared";
 
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 

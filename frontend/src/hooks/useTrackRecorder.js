@@ -68,7 +68,7 @@ import {
   DEFAULT_PHONE_AXIS,
   createAxisDetector,
   remapEulerToBoat,
-} from "../lib/imuAxes";
+} from "@sailline/shared";
 import {
   latest as latestOrientation,
   needsPermissionPrompt as orientationNeedsPrompt,

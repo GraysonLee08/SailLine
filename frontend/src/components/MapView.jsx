@@ -48,11 +48,11 @@ import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { PermissionBanner } from "./PermissionBanner.jsx";
 import { usePermissionStatus } from "../hooks/usePermissionStatus";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
-import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "../lib/regions";
-import { generateBarbImages, computeFeatures } from "../lib/windBarb";
-import { formatLat, formatLon } from "../lib/latlon";
+import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "@sailline/shared";
+import { generateBarbImages, computeFeatures } from "@sailline/shared";
+import { formatLat, formatLon } from "@sailline/shared";
 import { safeAnimate, EASE_OUT_SOFT } from "../lib/motion";
-import { DEFAULT_PHONE_AXIS, PHONE_AXES } from "../lib/imuAxes";
+import { DEFAULT_PHONE_AXIS, PHONE_AXES } from "@sailline/shared";
 
 const PHONE_AXIS_STORAGE_KEY = "sailline.phoneAxis";
 

@@ -14,7 +14,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { applyCalibration, remapEulerToBoat } from "../lib/imuAxes";
+import { applyCalibration, remapEulerToBoat } from "@sailline/shared";
 import { isSupported, latest as latestOrientation, start as startListener } from "../sensors/orientation";
 
 const TICK_HZ = 5;

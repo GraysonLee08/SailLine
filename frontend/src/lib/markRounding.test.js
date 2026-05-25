@@ -15,7 +15,7 @@ import {
   DEFAULT_RADIUS_M,
   haversineM,
   MarkRoundingDetector,
-} from "./markRounding";
+} from "@sailline/shared";
 
 const REF_LAT = 42.05;
 const REF_LON = -87.75;

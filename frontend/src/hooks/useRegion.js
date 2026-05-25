@@ -23,7 +23,7 @@ import {
   baseRegionForPoint,
   getRegion,
   marksCentroid,
-} from "../lib/regions";
+} from "@sailline/shared";
 
 const STORAGE_KEY = "sailline.region";
 const IPAPI_URL = "https://ipapi.co/json/";

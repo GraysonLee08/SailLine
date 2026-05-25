@@ -8,7 +8,7 @@ import {
   detectPhoneAxis,
   remapEulerToBoat,
   wrap360,
-} from "./imuAxes";
+} from "@sailline/shared";
 
 describe("PHONE_AXES", () => {
   it("exposes both supported axes", () => {

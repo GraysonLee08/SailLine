@@ -27,7 +27,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { computePasses } from "../lib/markRounding";
+import { computePasses } from "@sailline/shared";
 
 const AUTO_STOP_DELAY_MS = 5 * 60 * 1000;
 
