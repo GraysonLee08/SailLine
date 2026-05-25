@@ -1,0 +1,12 @@
+{
+  "name": "@sailline/shared",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Framework-agnostic SailLine client logic and data, shared by web and mobile. Single JS source of truth; backend/app/regions.py mirrors regions.js.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "sideEffects": false
+}

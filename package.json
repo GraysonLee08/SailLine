@@ -1,0 +1,11 @@
+{
+  "name": "sailline",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SailLine monorepo — web (frontend), mobile (Expo), and shared JS/TS client logic.",
+  "workspaces": [
+    "packages/*",
+    "frontend",
+    "mobile"
+  ]
+}

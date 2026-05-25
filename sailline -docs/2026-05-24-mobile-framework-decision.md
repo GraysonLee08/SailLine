@@ -22,7 +22,9 @@ Boat management, crew management, race creation, and pre-race routing are **shar
 
 ## Decision
 
-Build the mobile app in **React Native**.
+Build the mobile app in **React Native, via Expo (with EAS Build)** — not the bare RN CLI. Expo's hosted macOS build infrastructure (EAS Build) and App Store submission (EAS Submit) let us ship iOS without owning a Mac, which makes parallel iOS + Android viable for a Windows-only solo dev. Transistorsoft's `react-native-background-geolocation` ships an Expo config plugin documented to work through EAS Build, so the background-tracking requirement survives this choice.
+
+Shared client code lives in a single **npm-workspaces monorepo** (`packages/shared`) consumed by both web and mobile — see *Repository layout*.
 
 ## Rationale, against the four guiding principles
 
@@ -47,7 +49,7 @@ The dual-app scope amplifies principle #1: with four features shared between web
 **Negative / accepted**
 - RN reuses *logic*, not *UI*: JSX views (`MapView.jsx`, layer components) are rewritten in native components. Pure functions and data behind them are reused.
 - New native build/release toolchain (Xcode + Android Studio, signing, store submissions) on top of the existing Cloud Build/Firebase pipeline.
-- iOS native builds require macOS — same constraint that scoped the 2026-05-14 work to Android-only. Decide Mac access before committing to an iOS timeline.
+- **No Mac (resolved via EAS):** EAS Build compiles iOS on hosted macOS and EAS Submit ships it — no local Mac needed. Caveat: without a Mac you cannot run the iOS Simulator or debug iOS native code locally; iOS testing happens on a physical iPhone via TestFlight / EAS dev-client, so iOS-specific native iteration is slower. Thorny native iOS debugging may need occasional cloud-Mac access (MacStadium/MacinCloud). Apple Developer Program ($99/yr) required regardless.
 
 ## Platform compliance (must-do, not optional)
 
@@ -60,6 +62,29 @@ This supersedes the Capacitor *delivery mechanism* from 2026-05-14, not the anal
 
 **License reversal (deliberate):** the 2026-05-14 decision chose the *free* community geolocation plugin to avoid the ~$300/platform Transistorsoft license. For a race-critical app where a dropped track ruins the session, we now accept the paid Transistorsoft plugin on both platforms. Cost is justified by reliability; revisit only if a free plugin proves equivalent in on-water testing.
 
+## Repository layout
+
+Single monorepo using **npm workspaces** (no new tooling — the web app already uses npm), introduced minimally:
+
+```
+SailLine/
+  backend/              # unchanged (Python / FastAPI)
+  packages/
+    shared/             # @sailline/shared — the single JS/TS source of truth
+  frontend/             # existing React + Vite web app → consumes @sailline/shared
+  mobile/               # new Expo RN app → consumes @sailline/shared
+```
+
+`packages/shared` holds framework-agnostic client logic and data: `latlon`, `morfMarks`/`morfCourses`, `regions` (the JS mirror), `boatClasses`, `markRounding`, `imuAxes`, `motion`, and telemetry wire types. This promotes the existing `regions.py` ↔ `regions.js` mirror discipline into a real package both apps import, so shared changes land once.
+
+`frontend/` is deliberately **left in place** (not moved to `apps/web`) so `infra/cloudbuild.frontend.yaml` paths don't break on day one. Renaming to an `apps/` convention is a later, optional cleanup. pnpm/Turborepo only if build caching becomes painful.
+
+## Resolved questions (2026-05-24)
+
+1. **iPhone vs Android split → build in parallel.** iOS and Android ship together, not iOS-as-fast-follow. This is the primary reason for the Expo/EAS choice.
+2. **Mac access → none.** Resolved by EAS Build (cloud macOS); see the consequences caveat on local iOS debugging.
+3. **Monorepo layout → npm workspaces, minimally invasive.** See *Repository layout*.
+
 ## Tech debt flagged
 
 | Item | Why it's debt | When to address |
@@ -69,8 +94,8 @@ This supersedes the Capacitor *delivery mechanism* from 2026-05-14, not the anal
 | Two UI codebases (web React + RN) | Shared *logic* is single-source, but two UI layers drift over time. | Enforce the shared-logic package boundary from day one. |
 | iOS deferred if no Mac | iOS sailors get no background tracking until a Mac-based build ships. | Resolve Mac access; sequence iOS after Android smoke test passes. |
 
-## Open questions
+## Next decisions
 
-1. Phone split among target sailors (iPhone vs Android) — drives whether iOS is fast-follow or parallel.
-2. Mac access for iOS builds.
-3. Monorepo layout for the shared JS/TS client package (web + RN consuming one source of truth, mirroring the existing `regions.py` ↔ `regions.js` discipline).
+1. Apple Developer Program enrollment ($99/yr) — required before any iOS build/TestFlight.
+2. Transistorsoft license purchase (per-platform) ahead of background-tracking work.
+3. Expo workflow detail: prebuild / config-plugin setup for the Transistorsoft native module.
