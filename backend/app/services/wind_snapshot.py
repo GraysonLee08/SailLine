@@ -58,9 +58,10 @@ from the live ingest cache before calling in.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 
 # ─── Defaults ──────────────────────────────────────────────────────────
@@ -302,6 +303,142 @@ def summarise_snapshot(snapshot: dict) -> dict:
         "dir_range_deg": dir_range,
         "cell_coverage": coverage,
     }
+
+
+# ─── Read-side sampler (used by the Target-Actual performance engine) ──
+
+
+def snapshot_sampler(
+    snapshot: dict,
+) -> Callable[[float, float, Optional[datetime]], Optional[tuple[float, float]]]:
+    """Build a ``(lat, lon, valid_time) -> (u_mps, v_mps) | None`` sampler
+    over a frozen wind snapshot.
+
+    This is the read-side companion to ``snapshot_forecast``: it lets
+    ``app.services.performance`` score a track against the wind that was
+    present without needing the live forecast (which has long since
+    expired from Redis by the time post-race analysis runs).
+
+    Lookup is nearest-neighbour in time (the snapshot's 15-min cadence is
+    already finer than the forecast itself) and bilinear in lat/lon.
+    Null cells (forecast didn't cover them) are dropped from the bilinear
+    blend and the remaining corner weights renormalised; if all four
+    bracketing corners are null, returns ``None`` for that point.
+
+    The returned callable is safe to call many times — all parsing and
+    validation happens once, here.
+    """
+    lats = snapshot.get("lats") or []
+    lons = snapshot.get("lons") or []
+    times = [_parse_iso(t) for t in (snapshot.get("times") or [])]
+    u_grid = snapshot.get("u_mps") or []
+    v_grid = snapshot.get("v_mps") or []
+
+    usable = (
+        len(lats) >= 2
+        and len(lons) >= 2
+        and len(times) >= 1
+        and len(u_grid) == len(times)
+        and len(v_grid) == len(times)
+        and all(t is not None for t in times)
+    )
+
+    def sample(
+        lat: float, lon: float, valid_time: Optional[datetime] = None,
+    ) -> Optional[tuple[float, float]]:
+        if not usable:
+            return None
+        ti = _nearest_time_index(times, valid_time)
+        return _bilerp_uv(lats, lons, u_grid[ti], v_grid[ti], lat, lon)
+
+    return sample
+
+
+def _parse_iso(value) -> Optional[datetime]:
+    """Parse an ISO-8601 string (tolerating a trailing ``Z``) to a
+    tz-aware UTC datetime. Returns None on anything unparseable."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    try:
+        d = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _nearest_time_index(
+    times: list[datetime], valid_time: Optional[datetime],
+) -> int:
+    """Index of the snapshot time slice nearest ``valid_time``.
+
+    With no ``valid_time`` we use the middle slice (a reasonable
+    representative of the race window). A naive ``valid_time`` is
+    assumed UTC.
+    """
+    if valid_time is None:
+        return len(times) // 2
+    vt = valid_time if valid_time.tzinfo else valid_time.replace(tzinfo=timezone.utc)
+    best_i = 0
+    best_d = abs((times[0] - vt).total_seconds())
+    for i in range(1, len(times)):
+        d = abs((times[i] - vt).total_seconds())
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def _bilerp_uv(
+    lats: list[float],
+    lons: list[float],
+    u_slice: list[list[Optional[float]]],
+    v_slice: list[list[Optional[float]]],
+    lat: float,
+    lon: float,
+) -> Optional[tuple[float, float]]:
+    """Bilinear-interpolate (u, v) at (lat, lon) over one time slice.
+
+    ``lats``/``lons`` are ascending grid axes; the point is clamped to
+    the grid bounds. Null corners are excluded and the surviving corner
+    weights renormalised. Returns None if all four corners are null.
+    """
+    lat_c = min(max(lat, lats[0]), lats[-1])
+    lon_c = min(max(lon, lons[0]), lons[-1])
+
+    i = min(bisect_right(lats, lat_c) - 1, len(lats) - 2)
+    i = max(i, 0)
+    j = min(bisect_right(lons, lon_c) - 1, len(lons) - 2)
+    j = max(j, 0)
+
+    a0, a1 = lats[i], lats[i + 1]
+    o0, o1 = lons[j], lons[j + 1]
+    fa = (lat_c - a0) / (a1 - a0) if a1 > a0 else 0.0
+    fo = (lon_c - o0) / (o1 - o0) if o1 > o0 else 0.0
+
+    corners = (
+        (i, j, (1 - fa) * (1 - fo)),
+        (i, j + 1, (1 - fa) * fo),
+        (i + 1, j, fa * (1 - fo)),
+        (i + 1, j + 1, fa * fo),
+    )
+
+    u_acc = 0.0
+    v_acc = 0.0
+    w_acc = 0.0
+    for ci, cj, w in corners:
+        u = u_slice[ci][cj]
+        v = v_slice[ci][cj]
+        if u is None or v is None or w <= 0:
+            continue
+        u_acc += u * w
+        v_acc += v * w
+        w_acc += w
+
+    if w_acc <= 0:
+        return None
+    return (u_acc / w_acc, v_acc / w_acc)
 
 
 # ─── Tiny helpers ──────────────────────────────────────────────────────

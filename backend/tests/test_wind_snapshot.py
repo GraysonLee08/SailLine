@@ -22,6 +22,7 @@ from app.services.wind_snapshot import (
     MAX_TIME_STEPS,
     marks_bbox,
     snapshot_forecast,
+    snapshot_sampler,
     summarise_snapshot,
     uv_to_dir_speed_kt,
 )
@@ -309,3 +310,87 @@ def test_summary_dir_mean_handles_wraparound():
     # Mean direction should be near 0/360, not near 180.
     d = summ["mean_dir_deg"] % 360.0
     assert d < 5.0 or d > 355.0
+
+
+# ─── snapshot_sampler (read-side, used by performance.py) ─────────────
+
+
+def _const_snapshot(u=1.0, v=2.0, *, times=None):
+    """A 2x2 single-slice snapshot with a constant (u, v) everywhere."""
+    times = times or ["2026-05-20T18:00:00+00:00"]
+    T = len(times)
+    u_grid = [[[u, u], [u, u]] for _ in range(T)]
+    v_grid = [[[v, v], [v, v]] for _ in range(T)]
+    return {
+        "lats": [42.0, 42.1],
+        "lons": [-87.7, -87.6],
+        "t_start": times[0],
+        "t_end": times[-1],
+        "dt_s": 900,
+        "times": times,
+        "u_mps": u_grid,
+        "v_mps": v_grid,
+    }
+
+
+def test_snapshot_sampler_constant_inside_bbox():
+    sampler = snapshot_sampler(_const_snapshot(u=1.0, v=2.0))
+    uv = sampler(42.05, -87.65, T0)
+    assert uv is not None
+    assert uv[0] == pytest.approx(1.0)
+    assert uv[1] == pytest.approx(2.0)
+
+
+def test_snapshot_sampler_clamps_outside_bbox():
+    sampler = snapshot_sampler(_const_snapshot(u=3.0, v=-1.0))
+    # Well outside the grid — should clamp, not return None.
+    uv = sampler(50.0, -80.0, T0)
+    assert uv is not None
+    assert uv[0] == pytest.approx(3.0)
+    assert uv[1] == pytest.approx(-1.0)
+
+
+def test_snapshot_sampler_skips_null_corners():
+    snap = _const_snapshot(u=4.0, v=4.0)
+    # Null one corner; sampler should renormalise over the survivors.
+    snap["u_mps"][0][0][0] = None
+    snap["v_mps"][0][0][0] = None
+    uv = snapshot_sampler(snap)(42.05, -87.65, T0)
+    assert uv is not None
+    assert uv[0] == pytest.approx(4.0)
+
+
+def test_snapshot_sampler_all_null_returns_none():
+    snap = _const_snapshot()
+    for i in range(2):
+        for j in range(2):
+            snap["u_mps"][0][i][j] = None
+            snap["v_mps"][0][i][j] = None
+    assert snapshot_sampler(snap)(42.05, -87.65, T0) is None
+
+
+def test_snapshot_sampler_unusable_snapshot_returns_none():
+    # Empty / malformed snapshots must yield a sampler that returns None
+    # rather than raising — performance.py treats None as "no wind here."
+    assert snapshot_sampler({})(42.05, -87.65, T0) is None
+    assert snapshot_sampler({"lats": [42.0], "lons": [-87.7]})(42.05, -87.65, T0) is None
+
+
+def test_snapshot_sampler_picks_nearest_time():
+    times = [
+        "2026-05-20T18:00:00+00:00",
+        "2026-05-20T18:15:00+00:00",
+    ]
+    snap = _const_snapshot(times=times)
+    # Distinct constants per slice.
+    snap["u_mps"][0] = [[1.0, 1.0], [1.0, 1.0]]
+    snap["u_mps"][1] = [[9.0, 9.0], [9.0, 9.0]]
+    sampler = snapshot_sampler(snap)
+    # Probe times must sit inside the snapshot window (slices are dated
+    # 2026-05-20, not the file-level T0), so the nearest-slice pick is
+    # meaningful: +100s → first slice (18:00), +800s → second (18:15).
+    base = datetime(2026, 5, 20, 18, 0, tzinfo=timezone.utc)
+    near_first = sampler(42.05, -87.65, base + timedelta(seconds=100))
+    near_second = sampler(42.05, -87.65, base + timedelta(seconds=800))
+    assert near_first[0] == pytest.approx(1.0)
+    assert near_second[0] == pytest.approx(9.0)

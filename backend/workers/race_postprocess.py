@@ -57,6 +57,8 @@ import asyncpg
 from app import db, redis_client
 from app.regions import base_region_for_point
 from app.services.heel_stats import compute_heel_summary
+from app.services.performance import compute_performance_summary
+from app.services.polars import load_polar_for_class
 from app.services.race_stats import (
     compute_stats,
     track_points_from_rows,
@@ -69,7 +71,11 @@ from app.services.weather.forecast_loader import (
     ForecastNotAvailable,
     load_forecast_for_race,
 )
-from app.services.wind_snapshot import marks_bbox, snapshot_forecast
+from app.services.wind_snapshot import (
+    marks_bbox,
+    snapshot_forecast,
+    snapshot_sampler,
+)
 
 log = logging.getLogger("workers.race_postprocess")
 
@@ -103,7 +109,7 @@ async def _load_race(
             SELECT
                 r.id, r.user_id, r.name, r.boat_class, r.start_at,
                 r.marks, r.mark_passes, r.ai_summary, r.wind_snapshot,
-                r.heel_summary,
+                r.heel_summary, r.performance_summary,
                 r.mode, r.uses_spinnaker, r.boat_id,
                 b.hcp    AS boat_hcp,
                 b.dhcp   AS boat_dhcp,
@@ -192,16 +198,19 @@ async def _persist(
     ai_summary: Optional[dict],
     wind_snapshot: Optional[dict],
     heel_summary: Optional[dict],
+    performance_summary: Optional[dict] = None,
 ) -> None:
     """UPDATE race_sessions with whatever new fields we produced.
 
-    All three fields are JSONB. Pass None to leave a column untouched —
+    All four fields are JSONB. Pass None to leave a column untouched —
     we only overwrite a column when we have a fresh value for it.
 
     Note: ``compute_heel_summary`` returns None when there are no IMU
-    samples for the race; in that case the column stays null and we'll
-    cheaply recompute on the next postprocess run. No-op writes are not
-    a correctness concern, just slightly wasteful.
+    samples for the race, and ``compute_performance_summary`` returns
+    None when the track can't be scored (no speed/heading, no wind
+    coverage); in those cases the column stays null and we'll cheaply
+    recompute on the next postprocess run. No-op writes are not a
+    correctness concern, just slightly wasteful.
     """
     sets: list[str] = []
     args: list = [race_id]
@@ -217,6 +226,10 @@ async def _persist(
     if heel_summary is not None:
         sets.append(f"heel_summary = ${i}::jsonb")
         args.append(json.dumps(heel_summary))
+        i += 1
+    if performance_summary is not None:
+        sets.append(f"performance_summary = ${i}::jsonb")
+        args.append(json.dumps(performance_summary))
         i += 1
     if not sets:
         return
@@ -395,6 +408,34 @@ async def process_race(
             mark_passes=mark_passes,
         )
 
+    # Performance summary — Target-Actual: actual SOG/VMG vs the polar
+    # target for the wind that was present. Same gating as heel:
+    # recompute when we'd regenerate the AI summary anyway, or when the
+    # column is null (backfill). We sample the snapshot we just built,
+    # else the one already on the row. With no snapshot (no region, or
+    # the forecast has aged out of Redis) there's no wind to score
+    # against and the summary stays None — graceful, mirroring a
+    # GPS-only heel skip. Wrapped so a polar/scoring error can never
+    # fail the job.
+    need_perf = ai_needs_regen or race.get("performance_summary") is None
+    new_performance_summary: Optional[dict] = None
+    if need_perf:
+        snapshot_for_perf = new_snapshot or race.get("wind_snapshot")
+        if snapshot_for_perf:
+            try:
+                polar = load_polar_for_class(race.get("boat_class"))
+                new_performance_summary = compute_performance_summary(
+                    track_rows,
+                    wind_sampler=snapshot_sampler(snapshot_for_perf),
+                    polar=polar,
+                    mark_passes=mark_passes,
+                )
+            except Exception as e:  # noqa: BLE001 - never let perf fail the job
+                log.warning(
+                    "race %s: performance summary failed (%s); skipping",
+                    race_id, e,
+                )
+
     # AI summary — skip the call if a current version already exists.
     new_summary: Optional[dict] = None
     if ai_needs_regen:
@@ -428,13 +469,15 @@ async def process_race(
         ai_summary=new_summary,
         wind_snapshot=new_snapshot,
         heel_summary=new_heel_summary,
+        performance_summary=new_performance_summary,
     )
     log.info(
-        "race %s: postprocess complete (summary=%s, snapshot=%s, heel=%s)",
+        "race %s: postprocess complete (summary=%s, snapshot=%s, heel=%s, perf=%s)",
         race_id,
         "regenerated" if new_summary else "skipped",
         "refreshed" if new_snapshot else "skipped",
         "refreshed" if new_heel_summary else "skipped",
+        "refreshed" if new_performance_summary else "skipped",
     )
     return 0
 

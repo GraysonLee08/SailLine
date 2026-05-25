@@ -48,6 +48,7 @@ def _make_race_row(
     ai_summary: Optional[dict] = None,
     wind_snapshot: Optional[dict] = None,
     heel_summary: Optional[dict] = None,
+    performance_summary: Optional[dict] = None,
 ) -> dict:
     return {
         "id": RACE_ID,
@@ -74,6 +75,7 @@ def _make_race_row(
         "ai_summary": ai_summary,
         "wind_snapshot": wind_snapshot,
         "heel_summary": heel_summary,
+        "performance_summary": performance_summary,
         # D2 columns
         "mode": "inshore",
         "uses_spinnaker": True,
@@ -100,12 +102,16 @@ class _Spy:
 def spy(monkeypatch: pytest.MonkeyPatch):
     s = _Spy()
 
-    async def fake_persist(pool, race_id, *, ai_summary, wind_snapshot, heel_summary):
+    async def fake_persist(
+        pool, race_id, *, ai_summary, wind_snapshot, heel_summary,
+        performance_summary=None,
+    ):
         s.persist_calls.append(
             {
                 "ai_summary": ai_summary,
                 "wind_snapshot": wind_snapshot,
                 "heel_summary": heel_summary,
+                "performance_summary": performance_summary,
             }
         )
 
@@ -217,6 +223,7 @@ async def test_skips_when_summary_current_and_snapshot_present(monkeypatch, spy)
     assert len(spy.persist_calls) == 1
     assert spy.persist_calls[0] == {
         "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
+        "performance_summary": None,
     }
 
 
@@ -465,6 +472,17 @@ async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
             "max_pitch_abs_deg": 5.0,
             "by_leg": [],
         },
+        # Present so the performance backfill branch is also skipped —
+        # this test asserts a true steady-state no-op.
+        performance_summary={
+            "sample_count": 42,
+            "avg_speed_ratio": 0.95,
+            "avg_vmg_efficiency": 0.9,
+            "pct_time_on_target": 0.5,
+            "avg_target_kts": 6.0,
+            "avg_actual_kts": 5.7,
+            "by_leg": [],
+        },
     )
 
     # Track IMU loads to confirm we never reached them.
@@ -490,6 +508,7 @@ async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
     assert len(spy.persist_calls) == 1
     assert spy.persist_calls[0] == {
         "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
+        "performance_summary": None,
     }
 
 
@@ -524,3 +543,95 @@ async def test_force_recomputes_heel_summary(monkeypatch, spy):
     call = spy.persist_calls[0]
     assert call["heel_summary"] is not None
     assert call["heel_summary"]["sample_count"] == 30
+
+
+# ─── performance_summary plumbing (migration 0017) ────────────────────
+
+
+async def test_performance_summary_persisted_when_scoreable(monkeypatch, spy):
+    """When a wind snapshot is available, the worker scores the track
+    and persists the result to the performance_summary column. We patch
+    the engine to a sentinel and assert the wiring (polar + wind sampler
+    + mark passes) reaches it."""
+    captured: dict = {}
+
+    def fake_perf(track_points, *, wind_sampler, polar, mark_passes=None):
+        captured["wind_sampler"] = wind_sampler
+        captured["polar"] = polar
+        captured["mark_passes"] = mark_passes
+        return {"sample_count": 7, "avg_speed_ratio": 0.97,
+                "avg_vmg_efficiency": 0.9, "pct_time_on_target": 0.6,
+                "avg_target_kts": 6.0, "avg_actual_kts": 5.8, "by_leg": []}
+
+    monkeypatch.setattr(race_postprocess, "compute_performance_summary", fake_perf)
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert len(spy.persist_calls) == 1
+    perf = spy.persist_calls[0]["performance_summary"]
+    assert perf is not None
+    assert perf["sample_count"] == 7
+    # Wiring reached the engine.
+    assert callable(captured["wind_sampler"])
+    assert captured["polar"] is not None
+    assert captured["mark_passes"] is not None
+
+
+async def test_performance_summary_skipped_when_no_wind_snapshot(monkeypatch, spy):
+    """No snapshot (none on the row, none built) → the engine isn't even
+    called and performance_summary persists as None."""
+    calls = {"n": 0}
+
+    def counting_perf(*args, **kwargs):
+        calls["n"] += 1
+        return {"sample_count": 1}
+
+    async def no_snapshot(**kwargs):
+        spy.wind_calls += 1
+        return None
+
+    monkeypatch.setattr(race_postprocess, "compute_performance_summary", counting_perf)
+    monkeypatch.setattr(race_postprocess, "_build_wind_snapshot", no_snapshot)
+    _patch_loads(
+        monkeypatch,
+        race=_make_race_row(wind_snapshot=None),
+        track=_make_track_rows(),
+    )
+
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert calls["n"] == 0
+    assert spy.persist_calls[0]["performance_summary"] is None
+
+
+async def test_performance_backfill_when_column_null_but_ai_current(monkeypatch, spy):
+    """ai_summary current + wind snapshot present + performance_summary
+    column null → backfill: the engine runs and persists even though AI
+    and wind steps are skipped. Mirrors the heel backfill branch."""
+    def fake_perf(track_points, *, wind_sampler, polar, mark_passes=None):
+        return {"sample_count": 3, "avg_speed_ratio": 1.0,
+                "avg_vmg_efficiency": 1.0, "pct_time_on_target": 1.0,
+                "avg_target_kts": 6.0, "avg_actual_kts": 6.0, "by_leg": []}
+
+    monkeypatch.setattr(race_postprocess, "compute_performance_summary", fake_perf)
+    race = _make_race_row(
+        ai_summary={
+            "recap": "current", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        performance_summary=None,
+    )
+    _patch_loads(monkeypatch, race=race, track=_make_track_rows())
+
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    # AI + wind skipped, performance backfilled.
+    assert spy.summary_calls == 0
+    assert spy.wind_calls == 0
+    assert len(spy.persist_calls) == 1
+    assert spy.persist_calls[0]["ai_summary"] is None
+    assert spy.persist_calls[0]["wind_snapshot"] is None
+    assert spy.persist_calls[0]["performance_summary"] is not None
+    assert spy.persist_calls[0]["performance_summary"]["sample_count"] == 3

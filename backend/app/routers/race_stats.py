@@ -141,6 +141,38 @@ class HeelSummaryOut(BaseModel):
     by_leg: list[HeelLegOut] = []
 
 
+class PerformanceLegOut(BaseModel):
+    """Per-leg Target-Actual rollup. ``leg_index`` matches the heel
+    rollup's convention (leg 0 = start to first mark pass)."""
+    leg_index: int
+    sample_count: int
+    avg_speed_ratio: Optional[float] = None        # actual SOG / polar target
+    avg_vmg_efficiency: Optional[float] = None      # actual VMG / target VMG
+
+
+class PerformanceSummaryOut(BaseModel):
+    """Persisted Target-Actual rollup from ``workers.race_postprocess``.
+    Mirrors the dict shape returned by
+    ``app.services.performance.compute_performance_summary`` and stored in
+    ``race_sessions.performance_summary`` (JSONB).
+
+    Null on a race row when the postprocess job hasn't run yet OR the
+    track couldn't be scored (GPS without speed/heading, no wind
+    snapshot to compare against, calm wind).
+
+    ``avg_speed_ratio``/``avg_vmg_efficiency`` are 1.0 = on the polar.
+    ``pct_time_on_target`` is the fraction of (time-weighted) track
+    within +/-5% of polar boat speed.
+    """
+    sample_count: int
+    avg_speed_ratio: Optional[float] = None
+    avg_vmg_efficiency: Optional[float] = None
+    pct_time_on_target: float
+    avg_target_kts: Optional[float] = None
+    avg_actual_kts: Optional[float] = None
+    by_leg: list[PerformanceLegOut] = []
+
+
 class WindSnapshotMetaOut(BaseModel):
     """Compact metadata about the wind snapshot — the full grid is
     available via a separate endpoint (or directly on the row when we
@@ -180,6 +212,11 @@ class StatsResponse(BaseModel):
     # tiles in a follow-up session — for now the field is wired up
     # end-to-end and frontends ignore it unobtrusively.
     heel_summary: Optional[HeelSummaryOut] = None
+    # Structured Target-Actual rollup from the postprocess job. Null
+    # under the same conditions as heel_summary (job not run, or no
+    # scoreable track / no wind snapshot). Wired end-to-end now; the
+    # Performance Bar HUD that consumes it lands in a later session.
+    performance_summary: Optional[PerformanceSummaryOut] = None
     # Hints for the frontend so it knows whether to poll for the job
     # to finish (no summary yet) or surface "regenerate" affordances.
     summary_pending: bool = False
@@ -207,7 +244,7 @@ async def _load_race_row(
         SELECT
             r.id, r.name, r.boat_class, r.start_at, r.marks,
             r.mark_passes, r.ai_summary, r.wind_snapshot,
-            r.heel_summary,
+            r.heel_summary, r.performance_summary,
             r.mode, r.uses_spinnaker, r.boat_id,
             b.id           AS boat_pk,
             b.name         AS boat_name,
@@ -400,6 +437,7 @@ async def get_stats(
     ai_summary = race.get("ai_summary")
     wind = _build_wind_meta(race.get("wind_snapshot"))
     heel_summary_row = race.get("heel_summary")
+    performance_summary_row = race.get("performance_summary")
 
     summary_pending = stats_dict is not None and ai_summary is None
 
@@ -416,6 +454,11 @@ async def get_stats(
         ai_summary=AiSummaryOut(**ai_summary) if ai_summary else None,
         wind=wind,
         heel_summary=HeelSummaryOut(**heel_summary_row) if heel_summary_row else None,
+        performance_summary=(
+            PerformanceSummaryOut(**performance_summary_row)
+            if performance_summary_row
+            else None
+        ),
         summary_pending=summary_pending,
     )
 
