@@ -13,8 +13,10 @@ import { describe, it, expect } from "vitest";
 import {
   computePasses,
   DEFAULT_RADIUS_M,
+  FINAL_MARK_RADIUS_M,
   haversineM,
   MarkRoundingDetector,
+  radiiForCourse,
 } from "@sailline/shared";
 
 const REF_LAT = 42.05;
@@ -146,5 +148,86 @@ describe("markRounding", () => {
     expect(
       () => new MarkRoundingDetector([{ lat: REF_LAT, lon: REF_LON }], { radiusM: 0 }),
     ).toThrow();
+  });
+
+  // ── v2 (2026-05-26): closest-approach + per-mark radii ──────────────
+
+  it("emits the closest-approach timestamp, not the exit ts", () => {
+    // Asymmetric track: closer-then-farther across the radius. Index 4
+    // is the closest approach; index 5 is the exit.
+    const mark = { lat: REF_LAT, lon: REF_LON };
+    const distances = [60, 40, 20, 10, 5, 10, 20, 40, 60];
+    const track = distances.map((d, i) => ({
+      lat: REF_LAT,
+      lon: REF_LON + mToDLon(d),
+      ts: new Date(i * 1000).toISOString(),
+    }));
+
+    const passes = computePasses([mark], track);
+    expect(passes).toHaveLength(1);
+    expect(passes[0].ts).toBe(track[4].ts);
+    expect(passes[0].lon).toBe(track[4].lon);
+  });
+
+  it("honors per-mark radii — a tight first mark blocks progression", () => {
+    const aMark = { lat: REF_LAT, lon: REF_LON };
+    const bOff = offset(REF_LAT, REF_LON, 0, 500);
+    const bMark = { lat: bOff.lat, lon: bOff.lon };
+
+    // 50m closest approach to A — outside its custom 30m radius.
+    const leg1 = lineThrough(aMark, 50, { t0: 0 });
+    // 80m closest approach to B — inside its custom 100m radius.
+    const leg2 = lineThrough(bMark, 80, { t0: 200 });
+
+    const det = new MarkRoundingDetector([aMark, bMark], { radiusM: [30, 100] });
+    const passes = det.feedBatch([...leg1, ...leg2]);
+
+    expect(passes).toEqual([]);
+    expect(det.nextMarkIndex).toBe(0);
+  });
+
+  it("radiiForCourse widens the final mark", () => {
+    const aMark = { lat: REF_LAT, lon: REF_LON };
+    const bOff = offset(REF_LAT, REF_LON, 0, 500);
+    const bMark = { lat: bOff.lat, lon: bOff.lon };
+
+    const leg1 = lineThrough(aMark, 10, { t0: 0 });
+    // 70m closest approach to B — between DEFAULT (50) and FINAL (75).
+    const leg2 = lineThrough(bMark, 70, { t0: 200 });
+
+    // Scalar default: misses B.
+    const scalar = computePasses([aMark, bMark], [...leg1, ...leg2]);
+    expect(scalar.map((p) => p.markIndex)).toEqual([0]);
+
+    // Per-mark radii from radiiForCourse: catches B.
+    const radii = computePasses(
+      [aMark, bMark],
+      [...leg1, ...leg2],
+      radiiForCourse(2),
+    );
+    expect(radii.map((p) => p.markIndex)).toEqual([0, 1]);
+  });
+
+  it("radiiForCourse shapes match Python sibling", () => {
+    expect(radiiForCourse(0)).toEqual([]);
+    expect(radiiForCourse(1)).toEqual([FINAL_MARK_RADIUS_M]);
+    expect(radiiForCourse(3)).toEqual([
+      DEFAULT_RADIUS_M,
+      DEFAULT_RADIUS_M,
+      FINAL_MARK_RADIUS_M,
+    ]);
+  });
+
+  it("rejects mismatched per-mark radii length", () => {
+    const a = { lat: REF_LAT, lon: REF_LON };
+    const b = { lat: REF_LAT + 0.01, lon: REF_LON };
+    expect(() => new MarkRoundingDetector([a, b], { radiusM: [50] })).toThrow();
+    expect(
+      () => new MarkRoundingDetector([a, b], { radiusM: [50, 50, 50] }),
+    ).toThrow();
+  });
+
+  it("FINAL_MARK_RADIUS_M matches the Python constant", () => {
+    expect(FINAL_MARK_RADIUS_M).toBe(75);
   });
 });

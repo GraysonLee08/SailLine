@@ -257,6 +257,16 @@ async def update_race(
         if key == "marks":
             set_parts.append(f"marks = ${idx}::jsonb")
             args.append(_marks_json(value))
+        elif key == "ended_at":
+            # Manual-stop fallback PATCH (DNF / abandoned race) must NOT
+            # overwrite an authoritative ``ended_at`` already written by
+            # the mark-rounding detector when the boat crossed the
+            # finish. The detector's value is the closest-approach
+            # timestamp to the final mark — far more accurate than
+            # whatever wall-clock time the client sends from stop().
+            # COALESCE keeps the first non-NULL write.
+            set_parts.append(f"ended_at = COALESCE(ended_at, ${idx})")
+            args.append(value)
         else:
             set_parts.append(f"{key} = ${idx}")
             args.append(value)

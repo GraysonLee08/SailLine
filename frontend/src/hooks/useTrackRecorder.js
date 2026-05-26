@@ -554,6 +554,31 @@ export function useTrackRecorder(raceId, opts = {}) {
     // few seconds of points to ship.
     await flushNow();
     await releaseWakeLock();
+
+    // Manual-stop fallback for ended_at. The server-side mark-rounding
+    // detector sets ended_at to the closest-approach timestamp of the
+    // final mark when the boat actually crosses the line — that's the
+    // authoritative path. But if the user stops mid-race (DNF or just
+    // got tired of the test), the detector never fires the final pass
+    // and ended_at stays NULL.
+    //
+    // Send a wall-clock PATCH so DNFs get a closed-out timestamp. The
+    // server uses COALESCE on ended_at (races.py update_race), so this
+    // is a no-op when the detector already wrote an authoritative
+    // value. Fire-and-forget — the recorder is already torn down, so
+    // a failure here is purely cosmetic on the race list.
+    const stoppedId = raceIdRef.current;
+    if (stoppedId) {
+      apiFetch(`/api/races/${stoppedId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ended_at: new Date().toISOString() }),
+      }).catch(() => {
+        /* best effort — race row will still be readable; ended_at just
+         * stays NULL until the next mark-rounding detector firing or a
+         * manual edit */
+      });
+    }
     // If both queues drained cleanly, drop the localStorage entries so a
     // fresh recording session starts empty.
     // Note: the axisDetect key is intentionally KEPT across stop/start

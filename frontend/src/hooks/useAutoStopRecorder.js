@@ -27,7 +27,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { computePasses } from "@sailline/shared";
+import { computePasses, radiiForCourse } from "@sailline/shared";
 
 const AUTO_STOP_DELAY_MS = 5 * 60 * 1000;
 
@@ -53,7 +53,11 @@ export function useAutoStopRecorder({
       )
       .map((m) => ({ lat: m.lat, lon: m.lon }));
     if (cleanMarks.length < 2) return [];
-    return computePasses(cleanMarks, points);
+    // Per-mark radii: intermediate marks at DEFAULT (50m), final at
+    // FINAL_MARK_RADIUS_M (75m). Matches what the server-side router
+    // uses so the client banner and the authoritative server passes
+    // agree on when the finish fired.
+    return computePasses(cleanMarks, points, radiiForCourse(cleanMarks.length));
   }, [marks, points, recording, enabled]);
 
   // Gate condition: both the last and second-to-last marks rounded.

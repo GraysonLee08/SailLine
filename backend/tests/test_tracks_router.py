@@ -70,12 +70,17 @@ def client(app):
     return TestClient(app)
 
 
-def _race_row(marks=None, mark_passes=None):
+def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
     if marks is None:
         marks = [{"name": "M", "lat": 42.30, "lon": -87.80}]
     if mark_passes is None:
         mark_passes = []
-    return {"marks": json.dumps(marks), "mark_passes": json.dumps(mark_passes)}
+    return {
+        "marks": json.dumps(marks),
+        "mark_passes": json.dumps(mark_passes),
+        "started_at": started_at,
+        "start_at": start_at,
+    }
 
 
 def _owned():
@@ -200,11 +205,16 @@ def test_post_emits_mark_pass_when_batch_rounds_a_mark(client, mock_conn):
     mock_conn.fetchrow.return_value = _race_row(marks=[mark])
 
     base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    # Track spans ~±148m around the mark so it cleanly enters AND exits
+    # the 75m FINAL_MARK_RADIUS_M zone used for single-mark courses
+    # (radii_for_course(1) == [75]). The earlier ±74m geometry would
+    # leave the boat inside the radius for the entire track and never
+    # fire the exit transition.
     points = [
         {
             "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
             "lat": 42.30,
-            "lon": -87.80 - 0.0009 + i * 0.000225,
+            "lon": -87.80 - 0.0018 + i * 0.00045,
             "speed_kts": 5.0,
             "heading_deg": 90.0,
         }
@@ -276,21 +286,127 @@ def test_post_resumes_from_existing_passes(client, mock_conn):
     assert body["mark_passes"][0]["mark_index"] == 0
 
 
-# --- Postprocess trigger ----------------------------------------------
+# --- started_at / ended_at writes (v2 — 2026-05-26) -------------------
 
 
-def test_post_triggers_postprocess_when_final_mark_rounded(
-    client, mock_conn, monkeypatch
+def _finish_pass_points(
+    mark_lat: float = 42.30,
+    mark_lon: float = -87.80,
+    base: datetime = None,
 ):
-    """A batch that rounds the LAST mark should kick off the job."""
-    fake_trigger = AsyncMock()
-    monkeypatch.setattr(track_ingest, "trigger_race_postprocess", fake_trigger)
+    """A 9-point track that cleanly enters AND exits the 75m
+    ``FINAL_MARK_RADIUS_M`` zone around ``(mark_lat, mark_lon)``,
+    triggering one mark pass at the closest-approach midpoint.
 
-    # Single-mark course with no prior passes — this batch should
-    # round it and trip the final-mark gate.
+    Spans ~±148m (so the boat is well outside the 75m radius at both
+    ends), with the closest approach right at the mark.
+    """
+    base = base or datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    return [
+        {
+            "recorded_at": (base + timedelta(seconds=i * 5)).isoformat(),
+            "lat": mark_lat,
+            "lon": mark_lon - 0.0018 + i * 0.00045,
+            "speed_kts": 5.0,
+            "heading_deg": 90.0,
+        }
+        for i in range(9)
+    ]
+
+
+def test_post_backfills_started_at_when_null(client, mock_conn):
+    """First telemetry POST with a NULL started_at + populated start_at
+    should write started_at = start_at in the same UPDATE that persists
+    mark passes."""
     mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    gun = datetime(2026, 5, 14, 17, 55, tzinfo=timezone.utc)
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[mark], started_at=None, start_at=gun,
+    )
+
+    points = _finish_pass_points()
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    # Two execs: INSERT track_points + the combined UPDATE.
+    assert mock_conn.execute.await_count == 2
+    update_call = mock_conn.execute.await_args_list[1]
+    sql = update_call.args[0]
+    assert "started_at = " in sql
+    # start_at value should be in the args list.
+    assert gun in update_call.args[1:]
+
+
+def test_post_does_not_overwrite_started_at_when_already_set(client, mock_conn):
+    """Subsequent batches must NOT touch started_at — it's a once-only
+    write. Without the COALESCE-style guard this could overwrite a
+    user-edited started_at on every flush."""
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    prior_started = datetime(2026, 5, 14, 17, 50, tzinfo=timezone.utc)
+    gun = datetime(2026, 5, 14, 17, 55, tzinfo=timezone.utc)
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[mark], started_at=prior_started, start_at=gun,
+    )
+
+    points = _finish_pass_points()
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    update_call = mock_conn.execute.await_args_list[1]
+    sql = update_call.args[0]
+    assert "started_at" not in sql
+
+
+def test_post_does_not_write_started_at_when_start_at_null(client, mock_conn):
+    """Race with no scheduled gun time (ad-hoc record). Nothing to
+    backfill from — started_at stays NULL. The hook never errors; the
+    UPDATE simply omits the column."""
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[mark], started_at=None, start_at=None,
+    )
+
+    points = _finish_pass_points()
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    # Mark pass still fires, so there's still an UPDATE — just no
+    # started_at column.
+    update_call = mock_conn.execute.await_args_list[1]
+    sql = update_call.args[0]
+    assert "started_at" not in sql
+
+
+def test_post_writes_ended_at_when_final_mark_rounded(client, mock_conn):
+    """The batch that closes the course should set ended_at to the
+    final pass's timestamp (closest-approach to the final mark)."""
+    mark = {"name": "Finish", "lat": 42.30, "lon": -87.80}
     mock_conn.fetchrow.return_value = _race_row(marks=[mark])
 
+    points = _finish_pass_points()
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    update_call = mock_conn.execute.await_args_list[1]
+    sql = update_call.args[0]
+    assert "ended_at = COALESCE(ended_at," in sql
+    # The pass timestamp landed in the args.
+    body = r.json()
+    pass_ts_iso = body["new_mark_passes"][-1]["ts"]
+    expected_ts = datetime.fromisoformat(pass_ts_iso)
+    assert expected_ts in update_call.args[1:]
+
+
+def test_post_does_not_write_ended_at_on_intermediate_mark(client, mock_conn):
+    """Rounding a mark that's NOT the last in the course must not set
+    ended_at — that would mark the race "finished" prematurely on
+    multi-mark courses."""
+    marks = [
+        {"name": "A", "lat": 42.30, "lon": -87.80},
+        {"name": "B", "lat": 42.40, "lon": -87.80},
+    ]
+    mock_conn.fetchrow.return_value = _race_row(marks=marks)
+
+    # Pass through mark A only (intermediate). Mark A is at index 0 of
+    # a 2-mark course, so its radius is the DEFAULT_RADIUS_M (50m), not
+    # the wider final-mark zone. The original ±74m geometry is fine
+    # here — it cleanly enters and exits 50m.
     base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
     points = [
         {
@@ -302,6 +418,30 @@ def test_post_triggers_postprocess_when_final_mark_rounded(
         }
         for i in range(9)
     ]
+    r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
+    assert r.status_code == 201
+    update_call = mock_conn.execute.await_args_list[1]
+    sql = update_call.args[0]
+    assert "ended_at" not in sql
+
+
+# --- Postprocess trigger ----------------------------------------------
+
+
+def test_post_triggers_postprocess_when_final_mark_rounded(
+    client, mock_conn, monkeypatch
+):
+    """A batch that rounds the LAST mark should kick off the job."""
+    fake_trigger = AsyncMock()
+    monkeypatch.setattr(track_ingest, "trigger_race_postprocess", fake_trigger)
+
+    # Single-mark course with no prior passes — this batch should
+    # round it and trip the final-mark gate. Wider geometry needed
+    # because a single-mark course uses the 75m FINAL_MARK_RADIUS_M.
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    mock_conn.fetchrow.return_value = _race_row(marks=[mark])
+
+    points = _finish_pass_points()
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
     assert r.status_code == 201
     assert fake_trigger.await_count == 1

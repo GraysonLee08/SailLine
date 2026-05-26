@@ -17,10 +17,12 @@ import pytest
 
 from app.services.mark_rounding import (
     DEFAULT_RADIUS_M,
+    FINAL_MARK_RADIUS_M,
     Mark,
     MarkRoundingDetector,
     Point,
     compute_passes,
+    radii_for_course,
 )
 
 
@@ -108,10 +110,11 @@ def test_straight_pass_through_radius_emits_one_pass():
 
     assert len(passes) == 1
     assert passes[0].mark_index == 0
-    # Pass time should fall after the closest approach (by definition,
-    # the exit ends the rounding event).
+    # Pass time should fall AT the midpoint (closest approach) for a
+    # symmetric line_through track — that's the v2 behaviour (emit the
+    # closest-approach point's timestamp, not the exit point's).
     midpoint_ts = track[len(track) // 2].ts
-    assert passes[0].ts >= midpoint_ts
+    assert passes[0].ts == midpoint_ts
 
 
 def test_fly_by_outside_radius_emits_nothing():
@@ -255,3 +258,121 @@ def test_compute_passes_default_radius_matches_constant():
     default. If someone bumps DEFAULT_RADIUS_M without thinking, this
     test will surface it loudly."""
     assert DEFAULT_RADIUS_M == 50.0
+
+
+# ─── v2 (2026-05-26): closest-approach timestamps + per-mark radii ─────
+
+
+def test_closest_approach_emits_min_distance_timestamp_not_exit():
+    """Pass timestamp must be the closest-approach point inside the
+    radius, NOT the exit point. Closer to "when you actually crossed
+    the line through the mark," which is what ``ended_at`` consumes."""
+    mark = Mark(REF_LAT, REF_LON)
+    # Asymmetric track: walks closer-then-farther across the radius so
+    # the closest approach is clearly NOT the exit point.
+    #   index:  0   1   2   3   4   5   6   7   8
+    #   dist:  60  40  20  10   5  10  20  40  60   (metres from mark)
+    # Index 4 (t = 4s) is the closest approach. Index 5 is the exit.
+    base = pt(REF_LAT, REF_LON, 0).ts
+    distances = [60, 40, 20, 10, 5, 10, 20, 40, 60]
+    track = [
+        Point(
+            lat=REF_LAT,
+            lon=REF_LON + m_to_dlon(d),  # offset east by d metres
+            ts=base.replace(microsecond=0) + timedelta(seconds=i),
+        )
+        for i, d in enumerate(distances)
+    ]
+
+    passes = compute_passes([mark], track)
+
+    assert len(passes) == 1
+    # Closest-approach sample is at index 4 (5m from mark).
+    assert passes[0].ts == track[4].ts
+    # And the emitted lat/lon reflects that sample, not the exit.
+    assert passes[0].lon == track[4].lon
+
+
+def test_per_mark_radii_are_honored():
+    """A two-mark course with [30, 100] radii: the boat passes 50m
+    from mark 0 (outside its 30m zone — no fire) and 80m from mark 1
+    (inside its 100m zone — fires).
+
+    This is the basis for ``radii_for_course`` giving the final mark
+    a wider zone."""
+    a = Mark(REF_LAT, REF_LON)
+    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    b = Mark(b_lat, b_lon)
+
+    # 50m closest approach to A — outside its 30m radius.
+    leg1 = line_through(a, closest_m=50.0, t0=0.0)
+    # 80m closest approach to B — outside default 50m but INSIDE its
+    # custom 100m radius.
+    leg2 = line_through(b, closest_m=80.0, t0=200.0)
+
+    det = MarkRoundingDetector([a, b], radius_m=[30.0, 100.0])
+    passes = det.feed_batch(leg1 + leg2)
+
+    # A never fires (closest approach was outside its radius), but
+    # because A is the gate, B can't fire either — strict-order rule.
+    assert passes == []
+    assert det.next_mark_index == 0
+
+
+def test_per_mark_radii_widen_final_only():
+    """The router pattern: intermediate marks 50m, final mark 75m.
+
+    A boat that nicks the final mark at 70m (outside 50m, inside 75m)
+    should fire only when the per-mark radii list is used."""
+    a = Mark(REF_LAT, REF_LON)
+    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    b = Mark(b_lat, b_lon)
+
+    # Round A cleanly so the detector advances to B.
+    leg1 = line_through(a, closest_m=10.0, t0=0.0)
+    # Then a 70m pass at the final mark — between 50m and 75m.
+    leg2 = line_through(b, closest_m=70.0, t0=200.0)
+
+    # With the scalar default 50m, B is missed.
+    scalar_passes = compute_passes([a, b], leg1 + leg2)
+    assert [p.mark_index for p in scalar_passes] == [0]
+
+    # With the per-mark radii from radii_for_course (50, 75), B fires.
+    radii_passes = compute_passes([a, b], leg1 + leg2, radius_m=radii_for_course(2))
+    assert [p.mark_index for p in radii_passes] == [0, 1]
+
+
+def test_radii_for_course_shape():
+    """Single-mark course: just the FINAL_MARK_RADIUS_M.
+    Multi-mark course: DEFAULT for all but the last, FINAL for the last."""
+    assert radii_for_course(0) == []
+    assert radii_for_course(1) == [FINAL_MARK_RADIUS_M]
+    assert radii_for_course(3) == [
+        DEFAULT_RADIUS_M,
+        DEFAULT_RADIUS_M,
+        FINAL_MARK_RADIUS_M,
+    ]
+
+
+def test_per_mark_radii_length_mismatch_rejects():
+    """Mismatched per-mark radii length should fail loudly at
+    construction, not silently drop a mark."""
+    a = Mark(REF_LAT, REF_LON)
+    b = Mark(REF_LAT + 0.01, REF_LON)
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], radius_m=[50.0])
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], radius_m=[50.0, 50.0, 50.0])
+
+
+def test_per_mark_radii_must_all_be_positive():
+    a = Mark(REF_LAT, REF_LON)
+    b = Mark(REF_LAT + 0.01, REF_LON)
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], radius_m=[50.0, 0.0])
+
+
+def test_final_mark_radius_constant():
+    """Tripwire on the documented final-mark radius. If someone bumps
+    it without updating the docs, this test surfaces it loudly."""
+    assert FINAL_MARK_RADIUS_M == 75.0

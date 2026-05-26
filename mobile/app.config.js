@@ -1,7 +1,7 @@
 // app.config.js — dynamic Expo config.
 //
 // Extends the static base in app.json (passed in as `config`) and layers
-// on the native module wiring that Phase 1 needs:
+// on the native module wiring that Phase 1 + the blended auto-start need:
 //
 //   * expo-dev-client          — required: Transistorsoft is a native
 //                                module, so Expo Go can't load it. We run
@@ -15,7 +15,7 @@
 //                                EAS secret (never committed); the trial
 //                                works in the dev client without it. The
 //                                tsbackgroundfetch native AAR ships
-//                                inside this package's android/libs/ — do
+//                                inside this package's android/libs/ – do
 //                                NOT install react-native-background-fetch
 //                                as a direct dependency; it would build
 //                                as its own Gradle subproject and fail to
@@ -33,6 +33,13 @@
 //                                level, no redirect_uri configuration needed.
 //                                The plugin only needs an iosUrlScheme for iOS
 //                                builds; Android works without extra config.
+//   * expo-notifications        — local notifications for the T-6 "tap to start"
+//                                reminder paired with the T-5 BackgroundFetch
+//                                fallback in src/recorder/scheduledAutoStart.ts.
+//                                The plugin block lets us configure the Android
+//                                default channel + notification icon at build
+//                                time. No iOS-only config needed beyond the
+//                                runtime permission request.
 //
 // iOS background-location specifics (UIBackgroundModes + purpose strings)
 // and Android config live under ios/android below. Runtime notification
@@ -47,7 +54,8 @@ module.exports = ({ config }) => ({
     infoPlist: {
       ...(config.ios && config.ios.infoPlist),
       // Run location updates while backgrounded / screen-locked. `fetch`
-      // pairs with react-native-background-fetch.
+      // pairs with react-native-background-fetch (used by both the
+      // recorder and the T-5 auto-start fallback task).
       UIBackgroundModes: ["location", "fetch"],
       // Purpose strings shown in the iOS permission prompts. Plain,
       // honest language — App Review reads these against actual behavior.
@@ -115,5 +123,17 @@ module.exports = ({ config }) => ({
     // SHA-1 at the OS level. The iosUrlScheme key will need to be added here
     // when we cut iOS (set it to the iOS OAuth client's reversed client ID).
     "@react-native-google-signin/google-signin",
+    [
+      "expo-notifications",
+      {
+        // No custom icon yet — Expo falls back to the app icon, which is fine
+        // for dev. Add `icon` + `color` here when we have brand assets.
+        // The default channel below is configured at runtime in
+        // src/recorder/scheduledAutoStart.ts via Notifications.setNotificationChannelAsync,
+        // because channel importance for the race-start channel needs to be
+        // HIGH (heads-up display) and that's a runtime call, not a plugin
+        // option in current expo-notifications.
+      },
+    ],
   ],
 });

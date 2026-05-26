@@ -1,12 +1,16 @@
 // App.tsx — root component.
 //
 // Three responsibilities, layered top to bottom:
-//   1. Configure Google Sign-In (module load).
+//   1. Configure Google Sign-In + register OS-level auto-start handlers
+//      (module load — these MUST run before React mounts so headless
+//      BackgroundFetch wakes and notification taps can find their
+//      handlers).
 //   2. AuthGate: wait for Firebase auth state, render sign-in or the
 //      authed shell.
 //   3. AuthedShell: own the screen state machine (RacePicker → Recorder)
 //      and the long-lived useTrackRecorder hook whose lifetime is the
-//      signed-in session — not a particular screen.
+//      signed-in session — not a particular screen. Also requests
+//      notification permission once on first sign-in.
 //
 // Why the recorder lives in AuthedShell and not RecorderScreen: if the
 // user navigates back to the picker mid-recording (UI prevents this,
@@ -45,6 +49,10 @@ import type { User } from "firebase/auth";
 import { auth } from "./src/firebase";
 import { GOOGLE_WEB_CLIENT_ID } from "./src/googleAuthConfig";
 import { requestBatteryOptimizationExemption } from "./src/recorder/backgroundGeolocation";
+import {
+  registerHandlers,
+  requestNotificationPermission,
+} from "./src/recorder/scheduledAutoStart";
 import { useTrackRecorder } from "./src/recorder/useTrackRecorder";
 import RacePickerScreen from "./src/screens/RacePickerScreen";
 import RecorderScreen from "./src/screens/RecorderScreen";
@@ -54,6 +62,13 @@ GoogleSignin.configure({
   webClientId: GOOGLE_WEB_CLIENT_ID,
   offlineAccess: false,
 });
+
+// Register notification + BackgroundFetch handlers at module load. This
+// is fire-and-forget — registerHandlers is idempotent and any errors are
+// swallowed inside (they'd be invisible on Simulator anyway). MUST run
+// before React mounts so a headless BG-fetch wake or a cold-start
+// notification tap can find its handlers.
+void registerHandlers();
 
 // ── Auth gate ──────────────────────────────────────────────────────────
 export default function App() {
@@ -181,6 +196,14 @@ function AuthedShell({
   // selected race; when no race is selected it's null and the hook
   // refuses to start (see useTrackRecorder.start).
   const recorder = useTrackRecorder(selectedRace?.id ?? null);
+
+  // Request notification permission once on first authed mount. Idempotent
+  // — if already granted/denied the OS does not re-prompt. A denial
+  // silently disables the T-6 notification path; the T-5 BackgroundFetch
+  // fallback still works.
+  useEffect(() => {
+    void requestNotificationPermission();
+  }, []);
 
   const handleStart = async () => {
     await requestBatteryOptimizationExemption();

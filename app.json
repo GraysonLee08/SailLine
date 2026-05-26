@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "7a15f0b0-f2b9-4e68-8283-57f04840349e"
+      }
+    },
+    "android": {
+      "package": "com.graysonlee08.sailline"
+    },
+    "ios": {
+      "bundleIdentifier": "ios.com.graysonlee08.sailline",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
+  }
+}

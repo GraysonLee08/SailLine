@@ -119,14 +119,15 @@ describe("useAutoStopRecorder", () => {
     const bOff = offset(REF_LAT, REF_LON, 0, 500);
     const b = { lat: bOff.lat, lon: bOff.lon };
 
-    // Anchor "now" at the EXIT point of the final rounding, not the
-    // last point of the track. With spanM=200, n=21, step=10m, the exit
-    // from a 50m radius around closestM=5 happens at point index 15
-    // (d_along=50m, dist=sqrt(50^2 + 5^2)=50.25m, just outside). So the
-    // pass timestamp is trackB[15].ts. Setting t0 = now/1000 - 15 puts
-    // that exit instant exactly at Date.now().
+    // Anchor "now" at the CLOSEST-APPROACH point of the final
+    // rounding. v2 detector (2026-05-26) emits passes at the
+    // min-distance sample inside the radius, not the exit point.
+    // With spanM=200, n=21, step=10m, the midpoint (index 10) is the
+    // closest approach when closestM=5. Setting t0 = now/1000 - 10
+    // puts that midpoint instant exactly at Date.now() so the 5-min
+    // auto-stop timer fires at now + 5min.
     const now = Date.now();
-    const t0_b = now / 1000 - 15;
+    const t0_b = now / 1000 - 10;
     const t0_a = t0_b - 60;
     const trackA = lineThrough(a, 5, { t0: t0_a });
     const trackB = lineThrough(b, 5, { t0: t0_b });

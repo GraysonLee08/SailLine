@@ -180,6 +180,8 @@ async def append_track(
             marks=race["marks"],
             existing_passes=race["mark_passes"],
             new_points=detector_points,
+            started_at=race["started_at"],
+            start_at=race["start_at"],
         )
 
     # Final-mark trigger lives outside the conn block so a job failure

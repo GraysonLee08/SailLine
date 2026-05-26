@@ -7,20 +7,23 @@ Cloud Run Job when the final mark was crossed; `telemetry.py` did none
 of that. Refactoring both routers to call this module keeps the
 behaviour identical and prevents future drift between the two.
 
-Three small functions, each independently mockable so the existing
+Four small functions, each independently mockable so the existing
 test patterns (monkeypatch the trigger, assert UPDATE SQL) still work:
 
   * :func:`load_race_for_ingest` — auth-checked read of
-    ``marks`` + ``mark_passes`` from the race row. 404 if the caller
-    can't write to the race. Uses :func:`race_write_predicate` from
-    ``auth_helpers`` so crew members can record on shared boats.
+    ``marks`` + ``mark_passes`` + ``started_at`` + ``start_at`` from
+    the race row. 404 if the caller can't write to the race. Uses
+    :func:`race_write_predicate` from ``auth_helpers`` so crew members
+    can record on shared boats.
 
   * :func:`detect_and_persist_new_passes` — given a batch of GPS
     points (already translated to ``mark_rounding.Point``), run the
     detector resumed at the right index, UPDATE
     ``race_sessions.mark_passes`` if anything was found, and return
     ``(all_passes, new_passes)`` as plain dicts ready for the
-    router's response model.
+    router's response model. ALSO writes ``started_at`` (if NULL) and
+    ``ended_at`` (when the final pass closes the course) in the same
+    UPDATE — one round-trip per batch.
 
   * :func:`maybe_trigger_postprocess` — fire the postprocess job iff
     THIS batch was the one that crossed the final mark. Lives outside
@@ -37,7 +40,11 @@ JSONB shape:
   Extra keys are tolerated and round-tripped.
 * ``mark_passes``: list of ``{"mark_index": int, "ts": iso8601 str,
   "lat": float, "lon": float}``. Same shape that ``tracks.py`` has
-  written since 0008.
+  written since 0008. The ``ts``/``lat``/``lon`` are now the
+  closest-approach point during the traversal (v2 — 2026-05-26), not
+  the exit point. Existing data with exit-point timestamps remains
+  valid; downstream consumers don't care which point inside the radius
+  the timestamp came from.
 
 This module does NOT insert track points — that statement is router-
 specific (the legacy ``/track`` payload differs from the locked
@@ -48,6 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Iterable, Optional
 from uuid import UUID
 
@@ -60,6 +68,7 @@ from app.services.mark_rounding import (
     Mark as DetectorMark,
     MarkRoundingDetector,
     Point as DetectorPoint,
+    radii_for_course,
 )
 
 log = logging.getLogger(__name__)
@@ -71,9 +80,17 @@ log = logging.getLogger(__name__)
 async def load_race_for_ingest(
     conn: asyncpg.Connection, race_id: UUID, uid: str
 ) -> dict:
-    """Fetch ``marks`` + ``mark_passes`` for the race.
+    """Fetch ``marks`` + ``mark_passes`` + ``started_at`` + ``start_at``
+    for the race.
 
-    Returns ``{"marks": list[dict], "mark_passes": list[dict]}``.
+    Returns ``{"marks": list[dict], "mark_passes": list[dict],
+    "started_at": Optional[datetime], "start_at": Optional[datetime]}``.
+
+    The lifecycle columns are needed by :func:`detect_and_persist_new_passes`
+    to decide whether to backfill ``started_at`` on the first telemetry
+    batch (idempotent: only writes if currently NULL and ``start_at`` is
+    populated).
+
     Raises ``HTTPException(404)`` if the race doesn't exist OR the
     caller can't write to it.
 
@@ -88,7 +105,7 @@ async def load_race_for_ingest(
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
         f"""
-        SELECT r.marks, r.mark_passes
+        SELECT r.marks, r.mark_passes, r.started_at, r.start_at
         FROM race_sessions r
         WHERE r.id = $1 AND {pred}
         """,
@@ -110,7 +127,12 @@ async def load_race_for_ingest(
     else:
         passes = passes_raw or []
 
-    return {"marks": marks, "mark_passes": passes}
+    return {
+        "marks": marks,
+        "mark_passes": passes,
+        "started_at": row["started_at"],
+        "start_at": row["start_at"],
+    }
 
 
 # --- Detector + persistence ------------------------------------------
@@ -154,6 +176,13 @@ def _passes_to_dicts(
     ]
 
 
+def _parse_iso(ts_str: str) -> datetime:
+    """Parse an ISO-8601 timestamp string, tolerating a trailing Z."""
+    if ts_str.endswith("Z"):
+        ts_str = ts_str[:-1] + "+00:00"
+    return datetime.fromisoformat(ts_str)
+
+
 async def detect_and_persist_new_passes(
     conn: asyncpg.Connection,
     *,
@@ -161,6 +190,8 @@ async def detect_and_persist_new_passes(
     marks: list[dict],
     existing_passes: list[dict],
     new_points: Iterable[DetectorPoint],
+    started_at: Optional[datetime] = None,
+    start_at: Optional[datetime] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run the detector over a single batch, persist new passes, return
     ``(all_passes, new_passes)`` as plain JSONB-shaped dicts.
@@ -170,40 +201,124 @@ async def detect_and_persist_new_passes(
     differ between ``/track`` and ``/telemetry``) into Points before
     calling here.
 
-    Side effect: when at least one new pass is detected, executes a
-    single UPDATE on ``race_sessions.mark_passes`` to append. No UPDATE
-    runs if the batch produced nothing — keeps the hot path quiet for
-    the common no-rounding case.
+    ``started_at`` / ``start_at`` are the current values from the race
+    row (read by :func:`load_race_for_ingest`). When ``started_at`` is
+    NULL and ``start_at`` is set, this function writes
+    ``started_at = start_at`` in the same UPDATE that persists new
+    passes. Idempotent — only writes if currently NULL.
+
+    Side effect: when at least one new pass is detected, OR
+    ``started_at`` needs backfilling, OR the final pass just closed the
+    course (``ended_at`` write), executes ONE UPDATE on
+    ``race_sessions``. No UPDATE runs in the all-quiet case — keeps the
+    hot path quiet for the common no-rounding case.
 
     Auth: the caller MUST have already gone through
     :func:`load_race_for_ingest` so the UPDATE-by-id below is safe.
+
+    Per-mark radii: the detector is constructed with
+    :func:`radii_for_course`, which gives the final mark the wider
+    ``FINAL_MARK_RADIUS_M`` zone (75 m vs 50 m for intermediate
+    marks). Centralised in mark_rounding.py so changing the policy
+    doesn't require touching the router.
     """
     detector_marks = _build_detector_marks(marks)
+
+    # Always evaluate the started_at backfill, even if the course has no
+    # detectable marks — we still want the gun time recorded once
+    # telemetry starts flowing.
+    needs_started_at_write = started_at is None and start_at is not None
+
     if not detector_marks:
+        if needs_started_at_write:
+            await conn.execute(
+                """
+                UPDATE race_sessions
+                SET started_at = $1,
+                    updated_at = NOW()
+                WHERE id = $2
+                """,
+                start_at,
+                race_id,
+            )
         return list(existing_passes), []
 
     next_idx = len(existing_passes)
     if next_idx >= len(detector_marks):
-        # All marks already rounded; nothing more to detect.
+        # All marks already rounded; nothing more to detect. Still need
+        # to handle the started_at backfill if applicable.
+        if needs_started_at_write:
+            await conn.execute(
+                """
+                UPDATE race_sessions
+                SET started_at = $1,
+                    updated_at = NOW()
+                WHERE id = $2
+                """,
+                start_at,
+                race_id,
+            )
         return list(existing_passes), []
 
-    det = MarkRoundingDetector(detector_marks, next_mark_index=next_idx)
+    det = MarkRoundingDetector(
+        detector_marks,
+        radius_m=radii_for_course(len(detector_marks)),
+        next_mark_index=next_idx,
+    )
     new_pass_objs = det.feed_batch(new_points)
+
     if not new_pass_objs:
+        if needs_started_at_write:
+            await conn.execute(
+                """
+                UPDATE race_sessions
+                SET started_at = $1,
+                    updated_at = NOW()
+                WHERE id = $2
+                """,
+                start_at,
+                race_id,
+            )
         return list(existing_passes), []
 
     new_passes = _passes_to_dicts(new_pass_objs, next_idx)
     all_passes = list(existing_passes) + new_passes
 
+    # Did THIS batch close the course? If so, set ended_at to the final
+    # pass timestamp (closest-approach to the final mark). Detector
+    # emits passes in course order, so the last entry in new_passes is
+    # the latest. We rely on the existing "all_passes count == marks
+    # count" gate (same one maybe_trigger_postprocess uses).
+    final_pass_just_fired = len(all_passes) == len(detector_marks)
+    final_pass_ts: Optional[datetime] = None
+    if final_pass_just_fired:
+        final_pass_ts = _parse_iso(new_passes[-1]["ts"])
+
+    # Build the UPDATE dynamically so we only set the lifecycle columns
+    # when they need it. mark_passes is always written when we got here
+    # (new_pass_objs is non-empty by this point).
+    set_parts: list[str] = ["mark_passes = $1::jsonb", "updated_at = NOW()"]
+    args: list = [json.dumps(all_passes)]
+    if needs_started_at_write:
+        args.append(start_at)
+        set_parts.append(f"started_at = ${len(args)}")
+    if final_pass_ts is not None:
+        # COALESCE so we never overwrite a manually-set ended_at (e.g.
+        # a previous DNF PATCH). In practice these timestamps would be
+        # close anyway, but keeping the column monotonic on write is
+        # the right policy.
+        args.append(final_pass_ts)
+        set_parts.append(f"ended_at = COALESCE(ended_at, ${len(args)})")
+    args.append(race_id)
+    race_id_idx = len(args)
+
     await conn.execute(
-        """
+        f"""
         UPDATE race_sessions
-        SET mark_passes = $1::jsonb,
-            updated_at = NOW()
-        WHERE id = $2
+        SET {", ".join(set_parts)}
+        WHERE id = ${race_id_idx}
         """,
-        json.dumps(all_passes),
-        race_id,
+        *args,
     )
     return all_passes, new_passes
 
