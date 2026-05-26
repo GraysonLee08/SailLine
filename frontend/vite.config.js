@@ -13,11 +13,19 @@ export default defineConfig({
   // Vitest reads its config from the same vite.config so the test runner
   // and dev server stay in sync (plugins, aliases, etc.). jsdom gives us
   // window/WebSocket/document; setupFiles wires jest-dom matchers.
+  //
+  // include: Vitest's default is `**/*.{test,spec}.?(c|m)[jt]s?(x)` rooted
+  // at the config's directory (frontend/). That misses our pure-JS shared
+  // package tests. Explicitly include packages/shared so framework-
+  // agnostic helpers (markRounding, nextMarkGuidance, telemetry, etc.)
+  // get exercised in the same `npm test` run.
   test: {
     environment: "jsdom",
     setupFiles: ["./vitest.setup.js"],
-    // Keep test API explicit (imports, not globals) so editors track
-    // symbols and unused-import linting works.
     globals: false,
+    include: [
+      "src/**/*.{test,spec}.?(c|m)[jt]s?(x)",
+      "../packages/shared/src/**/*.{test,spec}.?(c|m)[jt]s?(x)",
+    ],
   },
 });

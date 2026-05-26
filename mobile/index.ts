@@ -1,7 +1,6 @@
-import { registerRootComponent } from "expo";
+// index.ts — DEPRECATED, replaced by expo-router/entry.
+//
+// package.json:main is now "expo-router/entry"; this file is no longer
+// the app entry point. Safe to delete with `git rm mobile/index.ts`.
 
-import App from "./App";
-
-// registerRootComponent calls AppRegistry.registerComponent('main', () => App)
-// and sets up the environment for both Expo Go and native builds.
-registerRootComponent(App);
+export {};

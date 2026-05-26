@@ -16,6 +16,7 @@ export * from "./boatClasses.js";
 export * from "./morfMarks.js";
 export * from "./morfCourses.js";
 export * from "./markRounding.js";
+export * from "./nextMarkGuidance.js";
 export * from "./windBarb.js";
 export * from "./imuAxes.js";
 export * from "./telemetry.js";

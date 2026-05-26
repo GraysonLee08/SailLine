@@ -1,50 +1,36 @@
 // app.config.js — dynamic Expo config.
 //
 // Extends the static base in app.json (passed in as `config`) and layers
-// on the native module wiring that Phase 1 + the blended auto-start need:
+// on the native module wiring that Phase 1 + the blended auto-start +
+// Phase 3 (map shell + routing) require:
 //
-//   * expo-dev-client          — required: Transistorsoft is a native
-//                                module, so Expo Go can't load it. We run
-//                                a custom dev client built by EAS.
+//   * expo-router               — file-based router. Entry point is set
+//                                 in package.json:main = "expo-router/entry".
+//                                 The plugin block here is required so the
+//                                 prebuild wires deep-linking + native nav
+//                                 dependencies (react-native-screens +
+//                                 react-native-safe-area-context).
+//   * expo-dev-client           — required: Transistorsoft is a native
+//                                 module, so Expo Go can't load it. We run
+//                                 a custom dev client built by EAS.
 //   * react-native-background-geolocation (Transistorsoft) — the capture
-//                                engine. The config plugin injects the
-//                                Android foreground-service + background
-//                                location permissions and the iOS
-//                                location background mode at prebuild.
-//                                The runtime license key is read from an
-//                                EAS secret (never committed); the trial
-//                                works in the dev client without it. The
-//                                tsbackgroundfetch native AAR ships
-//                                inside this package's android/libs/ – do
-//                                NOT install react-native-background-fetch
-//                                as a direct dependency; it would build
-//                                as its own Gradle subproject and fail to
-//                                resolve com.transistorsoft:tsbackgroundfetch.
-//   * expo-gradle-ext-vars      — Transistorsoft's required Expo companion.
-//                                Sets the Android Gradle ext vars
-//                                (Play Services location + tslocationmanager
-//                                versions) without manual gradle edits.
+//                                 engine.
+//   * expo-gradle-ext-vars      — Transistorsoft's required companion.
 //   * @react-native-google-signin/google-signin — native Google Sign-In.
-//                                Uses native Play Services (no browser-redirect
-//                                OAuth flow), which is why we picked this over
-//                                expo-auth-session: the SDK matches the calling
-//                                app to a Google OAuth Android client via
-//                                package name + signing-key SHA-1 at the OS
-//                                level, no redirect_uri configuration needed.
-//                                The plugin only needs an iosUrlScheme for iOS
-//                                builds; Android works without extra config.
-//   * expo-notifications        — local notifications for the T-6 "tap to start"
-//                                reminder paired with the T-5 BackgroundFetch
-//                                fallback in src/recorder/scheduledAutoStart.ts.
-//                                The plugin block lets us configure the Android
-//                                default channel + notification icon at build
-//                                time. No iOS-only config needed beyond the
-//                                runtime permission request.
-//
-// iOS background-location specifics (UIBackgroundModes + purpose strings)
-// and Android config live under ios/android below. Runtime notification
-// copy + tracking tuning live in src/recorder/backgroundGeolocation.ts
-// (the plugin handles build-time native config; .ready() handles runtime).
+//   * expo-notifications        — T-6 reminder paired with the T-5
+//                                 BackgroundFetch fallback.
+//   * @rnmapbox/maps            — map canvas. Requires a build-time
+//                                 download token (Mapbox secret access
+//                                 token, scoped DOWNLOADS:READ) for the
+//                                 private Maven repo + a runtime public
+//                                 token used by the JS SDK at runtime.
+//                                 Both come from EAS secrets:
+//                                   MAPBOX_DOWNLOAD_TOKEN — build-time
+//                                   EXPO_PUBLIC_MAPBOX_TOKEN — runtime (pk.*)
+//                                 The plugin block below uses the
+//                                 download token; the runtime token is
+//                                 read by src/components/MapCanvas.tsx via
+//                                 process.env.EXPO_PUBLIC_MAPBOX_TOKEN.
 
 module.exports = ({ config }) => ({
   ...config,
@@ -57,8 +43,6 @@ module.exports = ({ config }) => ({
       // pairs with react-native-background-fetch (used by both the
       // recorder and the T-5 auto-start fallback task).
       UIBackgroundModes: ["location", "fetch"],
-      // Purpose strings shown in the iOS permission prompts. Plain,
-      // honest language — App Review reads these against actual behavior.
       NSLocationWhenInUseUsageDescription:
         "SailLine records your boat's track during a race.",
       NSLocationAlwaysAndWhenInUseUsageDescription:
@@ -70,9 +54,6 @@ module.exports = ({ config }) => ({
 
   android: {
     ...config.android,
-    // The Transistorsoft config plugin adds the location + foreground-
-    // service permissions; these are listed explicitly for clarity and to
-    // cover Android 14's typed foreground-service permission.
     permissions: [
       "ACCESS_COARSE_LOCATION",
       "ACCESS_FINE_LOCATION",
@@ -85,54 +66,45 @@ module.exports = ({ config }) => ({
 
   plugins: [
     ...(config.plugins || []),
+    "expo-router",
     "expo-dev-client",
     [
       "react-native-background-geolocation",
-      // Pass the license ONLY when set. Setting `license: undefined`
-      // causes the plugin to write the literal string "UNDEFINED" into
-      // AndroidManifest.xml, which the runtime SDK then rejects as a
-      // bad license ("LICENSE VALIDATION FAILURE — Invalid license key:
-      // UNDEFINED"). Omitting the field entirely lets the SDK fall to
-      // trial mode in debug/dev-client builds. Set via:
-      //   eas secret:create --name TRANSISTOR_LICENSE --value <key>
-      // ...before a preview/production build.
       process.env.TRANSISTOR_LICENSE
         ? { license: process.env.TRANSISTOR_LICENSE }
         : {},
     ],
-    // No-op plugin today, but kept per Transistorsoft convention. The package
-    // itself MUST be a direct ^4.4.x dependency (see package.json) so it
-    // hoists to root node_modules and brings the newer tsbackgroundfetch AAR
-    // that this version's gradle expects. The 4.2.x branch bg-geo prefers
-    // requires com.transistorsoft:tsbackgroundfetch:1.0.4 which lives only
-    // inside its nested libs/ folder and which Expo's settings.gradle
-    // (FAIL_ON_PROJECT_REPOS) does not register. expo-doctor will warn about
-    // a duplicate background-fetch; that warning is load-bearing — leave it.
     "react-native-background-fetch",
     [
       "expo-gradle-ext-vars",
       {
-        // Versions documented by Transistorsoft's setup guide.
-        // tslocationmanager 4.0.+ pulls the latest 4.0.x at build time.
         googlePlayServicesLocationVersion: "21.3.0",
         tslocationmanagerVersion: "4.0.+",
       },
     ],
-    // Android-only: no plugin config needed because Google Play Services
-    // matches the calling app to its Android OAuth client via package name +
-    // SHA-1 at the OS level. The iosUrlScheme key will need to be added here
-    // when we cut iOS (set it to the iOS OAuth client's reversed client ID).
     "@react-native-google-signin/google-signin",
     [
       "expo-notifications",
       {
-        // No custom icon yet — Expo falls back to the app icon, which is fine
-        // for dev. Add `icon` + `color` here when we have brand assets.
-        // The default channel below is configured at runtime in
-        // src/recorder/scheduledAutoStart.ts via Notifications.setNotificationChannelAsync,
-        // because channel importance for the race-start channel needs to be
-        // HIGH (heads-up display) and that's a runtime call, not a plugin
-        // option in current expo-notifications.
+        // Default channel + icon: runtime config in
+        // src/recorder/scheduledAutoStart.ts.
+      },
+    ],
+    [
+      "@rnmapbox/maps",
+      {
+        // Pass the download token ONLY when set. Mirrors the
+        // transistorsoft pattern — an unset value would write the
+        // literal "UNDEFINED" into the gradle config and break the
+        // private-Maven fetch. With the token unset, the prebuild
+        // emits the @rnmapbox plugin config but gradle download
+        // resolution will fail; set the EAS secret before building:
+        //   eas secret:create --name MAPBOX_DOWNLOAD_TOKEN --value <sk.*>
+        // See https://docs.mapbox.com/help/getting-started/access-tokens/
+        // for token scopes (secret token with DOWNLOADS:READ enabled).
+        ...(process.env.MAPBOX_DOWNLOAD_TOKEN
+          ? { RNMapboxMapsDownloadToken: process.env.MAPBOX_DOWNLOAD_TOKEN }
+          : {}),
       },
     ],
   ],

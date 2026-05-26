@@ -52,19 +52,30 @@ FAKE_USER = {
 }
 
 
-def _race_row(marks=None, mark_passes=None):
+def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
     """Build the row shape that ``load_race_for_ingest`` expects.
 
     Defaults to a single mark deliberately far away from the test GPS
     fixtures so the default test doesn't accidentally trigger
     mark-rounding behaviour. Tests that want rounding pass a closer
     mark explicitly.
+
+    ``started_at`` / ``start_at`` were added when the recorder lifecycle
+    columns landed (2026-05-26). They default to None — same shape as a
+    freshly-created race with no scheduled gun time and no first
+    telemetry POST yet. Tests that exercise the backfill path override
+    them explicitly.
     """
     if marks is None:
         marks = [{"name": "Far", "lat": 0.0, "lon": 0.0}]
     if mark_passes is None:
         mark_passes = []
-    return {"marks": json.dumps(marks), "mark_passes": json.dumps(mark_passes)}
+    return {
+        "marks": json.dumps(marks),
+        "mark_passes": json.dumps(mark_passes),
+        "started_at": started_at,
+        "start_at": start_at,
+    }
 
 
 @pytest.fixture
@@ -175,19 +186,24 @@ def _calibration() -> dict:
 
 
 def _rounding_gps_batch(mark_lat: float, mark_lon: float, n: int = 9) -> list[dict]:
-    """A GPS batch designed to enter and exit a 50m radius around
-    (mark_lat, mark_lon) — same shape as the tracks router tests.
+    """A GPS batch designed to enter and exit the rounding radius around
+    (mark_lat, mark_lon).
 
-    Starts ~70m west of the mark and walks east through the radius;
-    the middle of the batch is inside the 50m default radius, the
-    tail is back outside, so the detector emits one rounding.
+    Originally tuned for the 50m radius. After 2026-05-26 a single-mark
+    course gets `FINAL_MARK_RADIUS_M = 75m` via `radii_for_course(1)`,
+    so the span was widened to ±150m: well outside the 75m zone at the
+    endpoints, on the mark at the middle. The middle samples are inside
+    either radius; the tail is back outside, so the detector emits one
+    rounding regardless of which radius the production code picked.
     """
     base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    span = 0.0018  # ~150m at 42° lat — clears the 75m final-mark radius
+    step = (2 * span) / (n - 1)
     return [
         {
             "t": (base + timedelta(seconds=i * 5)).isoformat(),
             "lat": mark_lat,
-            "lon": mark_lon - 0.0009 + i * 0.000225,
+            "lon": mark_lon - span + i * step,
             "sog_kts": 5.0,
             "cog_deg": 90.0,
             "gps_acc_m": 4.0,

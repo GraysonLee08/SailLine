@@ -37,12 +37,22 @@ def conn() -> MagicMock:
 
 
 def _rounding_points(mark_lat: float, mark_lon: float, n: int = 9):
-    """Detector points that enter and exit a 50m radius around the mark."""
+    """Detector points that enter and exit the rounding radius.
+
+    Originally tuned for the 50m radius. After 2026-05-26 the
+    single-mark "final-mark" course gets `FINAL_MARK_RADIUS_M = 75m`
+    via `radii_for_course(1)`, so the span was widened to ±150m: well
+    outside the 75m zone at the endpoints, on the mark at the middle.
+    Still works for the 50m intermediate-mark radius (it just enters
+    sooner).
+    """
     base = datetime(2026, 5, 14, 18, 0, tzinfo=timezone.utc)
+    span = 0.0018  # ~150m at 42° lat — clears the 75m final-mark radius
+    step = (2 * span) / (n - 1)
     return [
         DetectorPoint(
             lat=mark_lat,
-            lon=mark_lon - 0.0009 + i * 0.000225,
+            lon=mark_lon - span + i * step,
             ts=base + timedelta(seconds=i * 5),
         )
         for i in range(n)
@@ -58,7 +68,12 @@ async def test_load_race_for_ingest_returns_parsed_jsonb(conn):
     marks = [{"name": "M", "lat": 42.3, "lon": -87.8}]
     passes = [{"mark_index": 0, "ts": "2026-05-14T17:55:00+00:00",
                "lat": 42.3, "lon": -87.8}]
-    conn.fetchrow.return_value = {"marks": marks, "mark_passes": passes}
+    conn.fetchrow.return_value = {
+        "marks": marks,
+        "mark_passes": passes,
+        "started_at": None,
+        "start_at": None,
+    }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
@@ -73,6 +88,8 @@ async def test_load_race_for_ingest_parses_string_jsonb(conn):
     conn.fetchrow.return_value = {
         "marks": json.dumps(marks),
         "mark_passes": json.dumps([]),
+        "started_at": None,
+        "start_at": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -84,7 +101,12 @@ async def test_load_race_for_ingest_parses_string_jsonb(conn):
 async def test_load_race_for_ingest_handles_null_jsonb(conn):
     """A pre-Alembic race row with NULL marks/mark_passes must not
     crash. Returns empty lists."""
-    conn.fetchrow.return_value = {"marks": None, "mark_passes": None}
+    conn.fetchrow.return_value = {
+        "marks": None,
+        "mark_passes": None,
+        "started_at": None,
+        "start_at": None,
+    }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
@@ -105,7 +127,12 @@ async def test_load_race_for_ingest_404_when_not_writeable(conn):
 async def test_load_race_for_ingest_uses_write_predicate(conn):
     """The loader must hit ``race_write_predicate`` shape, not the
     pre-D3 owner-only check. Asserts on the SQL we issue."""
-    conn.fetchrow.return_value = {"marks": [], "mark_passes": []}
+    conn.fetchrow.return_value = {
+        "marks": [],
+        "mark_passes": [],
+        "started_at": None,
+        "start_at": None,
+    }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
