@@ -2,7 +2,7 @@
   "expo": {
     "name": "SailLine",
     "slug": "sailline",
-    "owner": "GraysonLee08",
+    "owner": "graysonlee08",
     "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -24,6 +24,11 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "7a15f0b0-f2b9-4e68-8283-57f04840349e"
+      }
     }
   }
 }

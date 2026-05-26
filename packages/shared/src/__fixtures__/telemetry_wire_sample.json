@@ -1,0 +1,8 @@
+{
+  "_comment": "Canonical /telemetry GPS wire sample. Produced by gpsPointToWire and asserted by both packages/shared/src/telemetry.test.js (output match) and backend/tests/test_telemetry_wire_contract.py (validates against the TelemetryBatch/GpsSample Pydantic models). Edit both sides if this changes.",
+  "gps": [
+    { "t": "2026-05-25T15:00:00.000Z", "lat": 41.935, "lon": -87.677, "sog_kts": 5.4, "cog_deg": 210.5, "gps_acc_m": 4.0 },
+    { "t": "2026-05-25T15:00:01.000Z", "lat": 41.9351, "lon": -87.6771, "sog_kts": null, "cog_deg": null, "gps_acc_m": 6.5 },
+    { "t": "2026-05-25T15:00:02.000Z", "lat": 41.9352, "lon": -87.6772, "sog_kts": 0, "cog_deg": null, "gps_acc_m": 8.0 }
+  ]
+}

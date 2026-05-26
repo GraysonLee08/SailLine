@@ -49,6 +49,27 @@ npm run deploy       # build + firebase deploy --only hosting
 
 `npm test` runs vitest (one-shot) and is gated in CI via `infra/cloudbuild.frontend.yaml` — a failing test blocks deploy. No `lint` script is configured.
 
+### Mobile (run from `mobile/`) — Expo RN app
+
+```bash
+npx expo install            # reconcile deps to the SDK (authoritative versioner)
+npx expo start --dev-client # Metro for the custom dev client (NOT Expo Go)
+
+# Custom dev client is required — Transistorsoft background-geolocation is a
+# native module Expo Go can't load. Build it via EAS (runs under your account):
+eas build --profile development --platform android   # installable .apk
+eas build --profile development --platform ios       # cloud macOS, no Mac needed
+
+# Background-location license lives in an EAS secret, never committed:
+eas secret:create --name TRANSISTOR_LICENSE --value <key>
+```
+
+Local backend from a phone: set `EXPO_PUBLIC_API_URL=http://<LAN-ip>:8080`; it
+defaults to the production Cloud Run origin. Native fetch sends no `Origin`
+header, so backend CORS does not gate mobile requests. `app.config.js` extends
+the static `app.json` with the dev-client + Transistorsoft plugins and the
+iOS/Android background-location config.
+
 ### Deploy
 
 Cloud Build auto-deploys on push to `main` — `infra/cloudbuild.yaml` (backend → Cloud Run) and `infra/cloudbuild.frontend.yaml` (frontend → Firebase Hosting). Both pipelines run tests before deploy (`pytest -m "not slow"` for backend, `npm test` for frontend) — a failing test blocks deploy. **Migrations are intentionally manual**; see `docs/migrations.md` for the runbook (short version: apply additive migrations *before* pushing; split destructive ones across two commits).

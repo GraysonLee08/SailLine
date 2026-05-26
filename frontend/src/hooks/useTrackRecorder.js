@@ -67,6 +67,7 @@ import { createWatcher } from "../lib/geolocation";
 import {
   DEFAULT_PHONE_AXIS,
   createAxisDetector,
+  gpsPointToWire,
   remapEulerToBoat,
 } from "@sailline/shared";
 import {
@@ -129,25 +130,8 @@ function clearKey(key) {
   }
 }
 
-/**
- * Translate the recorder's local point shape (used by the breadcrumb +
- * offline queue) into the `/telemetry` GPS wire shape. We keep the two
- * shapes separate so the breadcrumb logic stays decoupled from the API
- * contract (per the Session E plan).
- */
-function gpsPointToWire(point) {
-  return {
-    t: point.recorded_at,
-    lat: point.lat,
-    lon: point.lon,
-    sog_kts: Number.isFinite(point.speed_kts) ? point.speed_kts : null,
-    cog_deg:
-      Number.isFinite(point.heading_deg) && point.heading_deg >= 0
-        ? point.heading_deg
-        : null,
-    gps_acc_m: Number.isFinite(point.gps_acc_m) ? point.gps_acc_m : null,
-  };
-}
+// gpsPointToWire now lives in @sailline/shared (imported above) so the
+// web and mobile recorders serialize the GPS wire shape identically.
 
 /**
  * @param {string|null} raceId  the race to record into. Null disables.

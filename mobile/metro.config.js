@@ -11,7 +11,12 @@ const workspaceRoot = path.resolve(projectRoot, "..");
 const config = getDefaultConfig(projectRoot);
 
 // 1. Watch all files in the monorepo (so changes to packages/shared hot-reload).
-config.watchFolders = [workspaceRoot];
+//    Preserve Expo's default watchFolders and ADD the workspace root, rather
+//    than replacing them (expo-doctor flags a bare replacement).
+config.watchFolders = [
+  ...(config.watchFolders ?? []),
+  workspaceRoot,
+];
 
 // 2. Resolve modules from this app first, then the hoisted root node_modules.
 //    Hierarchical lookup is intentionally LEFT ENABLED (Metro's default): npm
