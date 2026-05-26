@@ -1,22 +1,22 @@
-// App.tsx — Phase 1 test harness.
+// App.tsx — root component.
 //
-// Minimal, intentionally ugly: just enough UI to run the 15-minute
-// screen-locked acceptance test on a real device before the real
-// management/auth UI lands (Phase 2). It lets you sign in (with Google,
-// matching the web app's auth flow), point at a race_id, and Start/Stop
-// the background recorder while watching the queue drain.
+// Three responsibilities, layered top to bottom:
+//   1. Configure Google Sign-In (module load).
+//   2. AuthGate: wait for Firebase auth state, render sign-in or the
+//      authed shell.
+//   3. AuthedShell: own the screen state machine (RacePicker → Recorder)
+//      and the long-lived useTrackRecorder hook whose lifetime is the
+//      signed-in session — not a particular screen.
 //
-// Flow: sign in with Google → paste a race_id you own → Start → lock the
-// screen and move for 15 min → Stop → verify the track in track_points
-// (see the Phase 1 plan §5 for the SQL gap check).
+// Why the recorder lives in AuthedShell and not RecorderScreen: if the
+// user navigates back to the picker mid-recording (UI prevents this,
+// but defensive), unmounting RecorderScreen would tear down the GPS
+// watcher. Hoisting the hook keeps the recorder alive across screen
+// changes; RecorderScreen is purely presentational.
 //
-// Auth: uses @react-native-google-signin/google-signin (native Play
-// Services), then exchanges the Google ID token for a Firebase credential
-// via signInWithCredential. Same Firebase user as the web app (same uid),
-// so races already created with your Google account are accessible from
-// the phone. The native SDK matches the app to its Google OAuth Android
-// client via package name + signing-key SHA-1 — no redirect URIs to
-// configure. The Web Client ID is passed only as the Firebase audience.
+// Sign-in flow is unchanged from the Phase 1 harness — same native
+// Google sign-in + Firebase credential exchange that's been proven on
+// device.
 
 import { useEffect, useState } from "react";
 import {
@@ -25,7 +25,6 @@ import {
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
@@ -47,25 +46,21 @@ import { auth } from "./src/firebase";
 import { GOOGLE_WEB_CLIENT_ID } from "./src/googleAuthConfig";
 import { requestBatteryOptimizationExemption } from "./src/recorder/backgroundGeolocation";
 import { useTrackRecorder } from "./src/recorder/useTrackRecorder";
+import RacePickerScreen from "./src/screens/RacePickerScreen";
+import RecorderScreen from "./src/screens/RecorderScreen";
+import type { Race } from "./src/types";
 
-// Configure the Google Sign-In SDK once at module load. webClientId is
-// what Firebase requires as the ID token audience — even though Android
-// chooses the Android OAuth client based on package + SHA-1, the resulting
-// id_token is signed with the Web Client ID as `aud` so Firebase trusts it.
 GoogleSignin.configure({
   webClientId: GOOGLE_WEB_CLIENT_ID,
   offlineAccess: false,
 });
 
+// ── Auth gate ──────────────────────────────────────────────────────────
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
-
-  const [raceId, setRaceId] = useState("");
-
-  const recorder = useTrackRecorder(raceId.trim() || null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
@@ -79,13 +74,12 @@ export default function App() {
     setSigningIn(true);
     setAuthError(null);
     try {
-      // Verify Google Play Services is available + up to date. Throws on
-      // unsupported devices.
-      await GoogleSignin.hasPlayServices({ showPlayServicesUpdateDialog: true });
+      await GoogleSignin.hasPlayServices({
+        showPlayServicesUpdateDialog: true,
+      });
 
       const response = await GoogleSignin.signIn();
       if (!isSuccessResponse(response)) {
-        // User dismissed the account picker.
         setSigningIn(false);
         return;
       }
@@ -99,20 +93,16 @@ export default function App() {
 
       const credential = GoogleAuthProvider.credential(idToken);
       await signInWithCredential(auth, credential);
-      // onAuthStateChanged picks up the result above.
     } catch (e) {
       if (isErrorWithCode(e)) {
         switch (e.code) {
           case statusCodes.SIGN_IN_CANCELLED:
-            // User cancelled — no error UI needed.
             break;
           case statusCodes.IN_PROGRESS:
             setAuthError("Sign-in already in progress.");
             break;
           case statusCodes.PLAY_SERVICES_NOT_AVAILABLE:
-            setAuthError(
-              "Google Play Services not available on this device.",
-            );
+            setAuthError("Google Play Services not available on this device.");
             break;
           default:
             setAuthError(`Sign-in failed (${e.code}): ${e.message}`);
@@ -126,19 +116,12 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    // Sign out of Google so the next sign-in shows the account picker.
     try {
       await GoogleSignin.signOut();
     } catch {
-      // best effort
+      /* best effort */
     }
     await signOut(auth);
-  };
-
-  const handleStart = async () => {
-    // Nudge the OEM battery exemption before the first locked run.
-    await requestBatteryOptimizationExemption();
-    await recorder.start();
   };
 
   if (!authReady) {
@@ -153,7 +136,7 @@ export default function App() {
   if (!user) {
     return (
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>SailLine — Phase 1 harness</Text>
+        <Text style={styles.title}>SailLine</Text>
         <Text style={styles.subtitle}>
           Sign in with Google to record telemetry
         </Text>
@@ -176,71 +159,62 @@ export default function App() {
   }
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
-      <Text style={styles.title}>SailLine — Phase 1 harness</Text>
-      <Text style={styles.subtitle}>{user.email}</Text>
-
-      <View style={styles.row}>
-        <Text style={styles.label}>race_id</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="paste a race UUID you own"
-          placeholderTextColor="#5e7d8c"
-          autoCapitalize="none"
-          autoCorrect={false}
-          editable={!recorder.recording}
-          value={raceId}
-          onChangeText={setRaceId}
-        />
-      </View>
-
-      <View style={styles.controls}>
-        {recorder.recording ? (
-          <Button title="Stop recording" color="#c0392b" onPress={recorder.stop} />
-        ) : (
-          <Button title="Start recording" onPress={handleStart} />
-        )}
-      </View>
-
-      <View style={styles.row}>
-        <Text style={styles.label}>Status</Text>
-        <Text style={styles.value}>
-          {recorder.recording ? "RECORDING" : "stopped"}
-        </Text>
-      </View>
-      <View style={styles.row}>
-        <Text style={styles.label}>Captured (this session)</Text>
-        <Text style={styles.value}>{recorder.points.length}</Text>
-      </View>
-      <View style={styles.row}>
-        <Text style={styles.label}>Unflushed queue</Text>
-        <Text style={styles.value}>{recorder.queueLength}</Text>
-      </View>
-      <View style={styles.row}>
-        <Text style={styles.label}>Last fix</Text>
-        <Text style={styles.value}>
-          {recorder.lastPoint
-            ? `${recorder.lastPoint.lat.toFixed(5)}, ${recorder.lastPoint.lon.toFixed(5)}`
-            : "—"}
-        </Text>
-      </View>
-      {recorder.error ? (
-        <View style={styles.row}>
-          <Text style={styles.label}>Error</Text>
-          <Text style={styles.error}>{recorder.error}</Text>
-        </View>
-      ) : null}
-
-      <View style={styles.signOut}>
-        <Button title="Sign out" color="#5e7d8c" onPress={handleSignOut} />
-      </View>
-
-      <Text style={styles.note}>
-        Test: Start → lock screen → move 15 min → Stop. Then check
-        track_points for gap continuity (Phase 1 plan §5).
-      </Text>
+    <>
+      <AuthedShell user={user} onSignOut={handleSignOut} />
       <StatusBar style="light" />
-    </ScrollView>
+    </>
+  );
+}
+
+// ── Authed shell: screen state machine + recorder lifetime ─────────────
+function AuthedShell({
+  user,
+  onSignOut,
+}: {
+  user: User;
+  onSignOut: () => void;
+}) {
+  const [selectedRace, setSelectedRace] = useState<Race | null>(null);
+
+  // Recorder lives at this level — its lifetime spans the signed-in
+  // session, not a particular screen. raceId is sourced from the
+  // selected race; when no race is selected it's null and the hook
+  // refuses to start (see useTrackRecorder.start).
+  const recorder = useTrackRecorder(selectedRace?.id ?? null);
+
+  const handleStart = async () => {
+    await requestBatteryOptimizationExemption();
+    await recorder.start();
+  };
+
+  // Defensive: if the recorder is mid-recording and the user somehow
+  // ends up back at the picker (UI prevents this via disabled Back
+  // button, but belt-and-braces), the recorder keeps running and the
+  // raceId stays valid via raceIdRef inside the hook. We block clearing
+  // the selection while recording so the user can't strand the recorder
+  // on a null raceId.
+  const handleBackToPicker = () => {
+    if (recorder.recording) return; // no-op
+    setSelectedRace(null);
+  };
+
+  if (!selectedRace) {
+    return (
+      <RacePickerScreen
+        userEmail={user.email}
+        onSelect={setSelectedRace}
+        onSignOut={onSignOut}
+      />
+    );
+  }
+
+  return (
+    <RecorderScreen
+      race={selectedRace}
+      recorder={recorder}
+      onBack={handleBackToPicker}
+      onStart={handleStart}
+    />
   );
 }
 
@@ -255,18 +229,6 @@ const styles = StyleSheet.create({
   centered: { alignItems: "center", justifyContent: "center" },
   title: { color: "#f5f7fa", fontSize: 26, fontWeight: "700" },
   subtitle: { color: "#8fb4c7", fontSize: 14, marginBottom: 12 },
-  row: { backgroundColor: "#13303f", borderRadius: 10, padding: 14 },
-  controls: { marginVertical: 8 },
-  signOut: { marginTop: 20 },
-  label: { color: "#8fb4c7", fontSize: 12, marginBottom: 4 },
-  value: { color: "#f5f7fa", fontSize: 16, fontWeight: "600" },
-  input: {
-    backgroundColor: "#13303f",
-    borderRadius: 10,
-    padding: 14,
-    color: "#f5f7fa",
-    fontSize: 16,
-  },
   error: { color: "#e08a8a", fontSize: 13 },
   note: { color: "#5e7d8c", fontSize: 12, marginTop: 20 },
 });

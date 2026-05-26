@@ -4,13 +4,62 @@
 //
 // Hands navigation back to AppView via callbacks rather than owning
 // routing itself, which keeps this component dumb and reusable.
+//
+// 2026-05-26: added a client-side filter/sort bar above the list (name
+// search, boat-class filter, raced/planned filter, sort). All filtering
+// happens locally on the loaded `races` array — no API change. The card
+// now also surfaces the race's start_at and a "Raced" pill when stats
+// are available.
+
+import { useMemo, useState } from "react";
 
 import { useRaces } from "./hooks/useRaces";
+import { formatRaceDate } from "./lib/formatRaceDate";
 
 export default function RacesListView({
   onBack, onOpen, onEdit, onCreate, onViewStats, currentUid,
 }) {
   const { races, error, remove } = useRaces();
+
+  // ── Filter / sort state ────────────────────────────────────────────
+  // All client-side. Defaults preserve the previous behaviour (server
+  // returns races ORDER BY created_at DESC, so "Newest first" is a
+  // no-op against the loaded list).
+  const [search, setSearch] = useState("");
+  const [classFilter, setClassFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all"); // all | raced | planned
+  const [sortBy, setSortBy] = useState("newest"); // newest | start_at
+
+  // Distinct boat classes from the loaded list, for the dropdown.
+  const availableClasses = useMemo(() => {
+    if (!races) return [];
+    const set = new Set(races.map((r) => r.boat_class).filter(Boolean));
+    return Array.from(set).sort();
+  }, [races]);
+
+  const filteredSorted = useMemo(() => {
+    if (!races) return null;
+    const q = search.trim().toLowerCase();
+    const filtered = races.filter((r) => {
+      if (q && !(r.name || "").toLowerCase().includes(q)) return false;
+      if (classFilter !== "all" && r.boat_class !== classFilter) return false;
+      const raced = isRaced(r);
+      if (statusFilter === "raced" && !raced) return false;
+      if (statusFilter === "planned" && raced) return false;
+      return true;
+    });
+    if (sortBy === "start_at") {
+      // Sort by start_at ascending; races without a start_at sink to
+      // the bottom (their key becomes +Infinity).
+      return [...filtered].sort((a, b) => {
+        const ta = a.start_at ? new Date(a.start_at).getTime() : Infinity;
+        const tb = b.start_at ? new Date(b.start_at).getTime() : Infinity;
+        return ta - tb;
+      });
+    }
+    // "newest" — preserve API order (created_at DESC). No re-sort.
+    return filtered;
+  }, [races, search, classFilter, statusFilter, sortBy]);
 
   return (
     <div style={styles.shell}>
@@ -43,36 +92,114 @@ export default function RacesListView({
         )}
 
         {races && races.length > 0 && (
-          <ul style={styles.list}>
-            {races.map((r) => (
-              <RaceCard
-                key={r.id}
-                race={r}
-                isShared={!!currentUid && r.user_id && r.user_id !== currentUid}
-                onOpen={() => onOpen(r)}
-                onEdit={() => onEdit(r.id)}
-                onViewStats={
-                  // Show the Stats button when the race has at least
-                  // one mark rounding recorded — i.e. it was raced.
-                  // Races that were planned but never tracked don't
-                  // get the entry (nothing to show).
-                  (r.mark_passes && r.mark_passes.length > 0) || r.stats_available
-                    ? () => onViewStats?.(r.id)
-                    : null
-                }
-                onDelete={async () => {
-                  if (!confirm(`Delete "${r.name}"? This can't be undone.`)) return;
-                  try {
-                    await remove(r.id);
-                  } catch (e) {
-                    alert(`Couldn't delete: ${e.message || e}`);
-                  }
-                }}
-              />
-            ))}
-          </ul>
+          <>
+            <FilterBar
+              search={search}
+              onSearch={setSearch}
+              classFilter={classFilter}
+              onClassFilter={setClassFilter}
+              statusFilter={statusFilter}
+              onStatusFilter={setStatusFilter}
+              sortBy={sortBy}
+              onSortBy={setSortBy}
+              availableClasses={availableClasses}
+            />
+
+            {filteredSorted && filteredSorted.length === 0 ? (
+              <p style={styles.muted}>No races match the current filters.</p>
+            ) : (
+              <ul style={styles.list}>
+                {filteredSorted.map((r) => (
+                  <RaceCard
+                    key={r.id}
+                    race={r}
+                    isShared={!!currentUid && r.user_id && r.user_id !== currentUid}
+                    onOpen={() => onOpen(r)}
+                    onEdit={() => onEdit(r.id)}
+                    onViewStats={
+                      // Show the Stats button when the race has at least
+                      // one mark rounding recorded — i.e. it was raced.
+                      // Races that were planned but never tracked don't
+                      // get the entry (nothing to show).
+                      isRaced(r) ? () => onViewStats?.(r.id) : null
+                    }
+                    onDelete={async () => {
+                      if (!confirm(`Delete "${r.name}"? This can't be undone.`)) return;
+                      try {
+                        await remove(r.id);
+                      } catch (e) {
+                        alert(`Couldn't delete: ${e.message || e}`);
+                      }
+                    }}
+                  />
+                ))}
+              </ul>
+            )}
+          </>
         )}
       </main>
+    </div>
+  );
+}
+
+// True when the race has been sailed (has stats or at least one mark
+// passage). Used by both the Raced-pill decision and the Stats-button
+// gating so they can never disagree.
+function isRaced(race) {
+  return Boolean(
+    race.stats_available ||
+      (race.mark_passes && race.mark_passes.length > 0),
+  );
+}
+
+// ── Filter / sort bar ─────────────────────────────────────────────────
+function FilterBar({
+  search, onSearch,
+  classFilter, onClassFilter,
+  statusFilter, onStatusFilter,
+  sortBy, onSortBy,
+  availableClasses,
+}) {
+  return (
+    <div style={styles.filterBar}>
+      <input
+        type="search"
+        placeholder="Search races…"
+        value={search}
+        onChange={(e) => onSearch(e.target.value)}
+        style={styles.filterInput}
+        aria-label="Search races by name"
+      />
+      <select
+        value={classFilter}
+        onChange={(e) => onClassFilter(e.target.value)}
+        style={styles.filterSelect}
+        aria-label="Filter by boat class"
+      >
+        <option value="all">All boats</option>
+        {availableClasses.map((c) => (
+          <option key={c} value={c}>{c}</option>
+        ))}
+      </select>
+      <select
+        value={statusFilter}
+        onChange={(e) => onStatusFilter(e.target.value)}
+        style={styles.filterSelect}
+        aria-label="Filter by raced status"
+      >
+        <option value="all">All races</option>
+        <option value="raced">Raced only</option>
+        <option value="planned">Planned only</option>
+      </select>
+      <select
+        value={sortBy}
+        onChange={(e) => onSortBy(e.target.value)}
+        style={styles.filterSelect}
+        aria-label="Sort"
+      >
+        <option value="newest">Newest first</option>
+        <option value="start_at">Start date</option>
+      </select>
     </div>
   );
 }
@@ -87,6 +214,7 @@ function RaceCard({ race, isShared, onOpen, onEdit, onViewStats, onDelete }) {
       onOpen();
     }
   };
+  const raced = isRaced(race);
   return (
     <li style={styles.card}>
       <div
@@ -114,7 +242,13 @@ function RaceCard({ race, isShared, onOpen, onEdit, onViewStats, onDelete }) {
               Shared
             </span>
           )}
+          {raced && (
+            <span style={styles.racedPill}>Raced</span>
+          )}
         </h3>
+        {race.start_at && (
+          <div style={styles.cardDate}>{formatRaceDate(race.start_at)}</div>
+        )}
         <div style={styles.cardMeta}>
           <span style={styles.badge}>{race.mode}</span>
           <span style={styles.metaSep}>·</span>
@@ -307,5 +441,55 @@ const styles = {
     fontSize: 13,
     color: "var(--error)",
     cursor: "pointer",
+  },
+
+  // ── Added 2026-05-26 ──────────────────────────────────────────────
+  filterBar: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 16,
+    padding: 12,
+    border: "1px solid var(--rule)",
+    borderRadius: "var(--r-md)",
+    background: "var(--paper)",
+  },
+  filterInput: {
+    flex: "1 1 220px",
+    minWidth: 180,
+    padding: "8px 12px",
+    fontSize: 13,
+    border: "1px solid var(--rule)",
+    borderRadius: "var(--r-sm)",
+    background: "var(--paper)",
+    color: "var(--ink)",
+    fontFamily: "inherit",
+  },
+  filterSelect: {
+    padding: "8px 12px",
+    fontSize: 13,
+    border: "1px solid var(--rule)",
+    borderRadius: "var(--r-sm)",
+    background: "var(--paper)",
+    color: "var(--ink)",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  },
+  cardDate: {
+    fontSize: 13,
+    color: "var(--ink-3)",
+    margin: "0 0 4px",
+  },
+  racedPill: {
+    marginLeft: 8,
+    fontSize: 10,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase",
+    color: "#0f6e56",
+    background: "#E1F5EE",
+    borderRadius: 999,
+    padding: "2px 10px",
+    fontWeight: 600,
+    verticalAlign: "middle",
   },
 };
