@@ -35,12 +35,8 @@ export function useRouting(raceId: string | null) {
     setLoading(true);
     setError(null);
     setPending(null);
-    // eslint-disable-next-line no-console
-    console.log("[useRouting] compute start raceId=", raceId);
     try {
       const result = await computeRoute(raceId);
-      // eslint-disable-next-line no-console
-      console.log("[useRouting] compute result kind=", result.kind, result.kind === "pending" ? result : { metaKeys: Object.keys(result.meta ?? {}) });
       if (result.kind === "pending") {
         setPending({
           detail: result.detail,

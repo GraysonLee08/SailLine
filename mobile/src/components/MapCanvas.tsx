@@ -10,6 +10,10 @@
 //     so the user sees the whole course immediately. This is the
 //     Google-Maps "destination already in the search bar" pattern —
 //     the user shouldn't have to pan.
+//   - On first load WITHOUT marks (the user is browsing the race list),
+//     try the OS last-known location and center there at zoom 11 so the
+//     first-paint barbs reflect "where the user actually is." Falls back
+//     to the hardcoded Chicago lakeshore default if no fix is available.
 //   - "Locate me" recenters on the user with a 15s flight and zoom 14.
 //     Imperative method exposed via ref so the parent FAB can call it.
 //   - User pans/zooms → leave them alone. Don't auto-follow during a
@@ -93,6 +97,12 @@ type Props = {
 
 const DEFAULT_CENTER: [number, number] = [-87.6, 41.9]; // Chicago lake-shore
 const DEFAULT_ZOOM = 11;
+// Retry schedule for the cold-start last-known-location lookup. The OS
+// usually has a recent fix on hand but Mapbox's locationManager needs a
+// beat to surface it — these three attempts cover the ~3s warmup window
+// without spamming the API. Cancelled the moment `marks` arrive or the
+// camera has otherwise been moved.
+const INITIAL_LOCATION_RETRY_MS = [200, 1000, 2500];
 
 const MARK_FEATURE_ID = "marks-src";
 const ROUTE_FEATURE_ID = "route-src";
@@ -116,6 +126,13 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   // "heading" = camera follows the device compass so up-on-screen is
   // ahead-of-the-boat. The FAB cycles between the two each tap.
   const [compassMode, setCompassMode] = useState<"off" | "heading">("off");
+
+  // Single-shot guard: once we've placed the camera (via the marks-fit
+  // effect OR the user-location effect), don't move it again on our own.
+  // Imperative actions (locate-me, fitToRace, compass) and user gestures
+  // are still free to pan/zoom; this just stops the two mount-time
+  // effects from clobbering each other.
+  const didInitialCenter = useRef(false);
 
   // Monochromatic-leaning styles so the overlay data (wind barbs, route
   // polyline, marks) reads clearly without competing with vibrant
@@ -147,7 +164,8 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   );
 
   // Initial camera bounds — fit to marks once on mount. If no marks, the
-  // default Chicago view is good enough for the empty state.
+  // user-location effect below tries to give a more useful default than
+  // the Chicago fallback.
   const initialBounds = useMemo(() => {
     if (marks.length === 0) return null;
     let minLon = Infinity, maxLon = -Infinity;
@@ -174,7 +192,52 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
       [120, 60, 320, 60], // top, right, bottom (sheet peek), left
       900,
     );
+    didInitialCenter.current = true;
   }, [initialBounds]);
+
+  // First-paint nudge: if we're mounted without any marks (browsing the
+  // race list), bring the camera to the user's last-known location at a
+  // useful wind-barb zoom. Mapbox's locationManager often returns null
+  // on the very first call (it surfaces the OS cache after the puck
+  // mounts), so retry a handful of times over ~3s. Cancelled if marks
+  // arrive or another camera action runs in the meantime.
+  useEffect(() => {
+    if (marks.length > 0 || didInitialCenter.current) return;
+    let cancelled = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+
+    const tryLocate = async () => {
+      if (cancelled || didInitialCenter.current) return;
+      try {
+        const loc = await Mapbox.locationManager.getLastKnownLocation();
+        if (cancelled || didInitialCenter.current) return;
+        if (loc && typeof loc.coords?.latitude === "number") {
+          camRef.current?.setCamera({
+            centerCoordinate: [loc.coords.longitude, loc.coords.latitude],
+            zoomLevel: DEFAULT_ZOOM,
+            animationDuration: 700,
+            animationMode: "flyTo",
+          });
+          didInitialCenter.current = true;
+        }
+      } catch {
+        /* No fix — leave the Chicago default in place. */
+      }
+    };
+
+    for (const ms of INITIAL_LOCATION_RETRY_MS) {
+      timers.push(setTimeout(() => void tryLocate(), ms));
+    }
+
+    return () => {
+      cancelled = true;
+      for (const t of timers) clearTimeout(t);
+    };
+    // Only run on mount — `marks.length > 0` early return guards the
+    // marks-arriving case, and the marks-fit effect above takes over
+    // when that happens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useImperativeHandle(
     ref,
@@ -197,6 +260,7 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
               animationDuration: 900,
               animationMode: "flyTo",
             });
+            didInitialCenter.current = true;
             return;
           }
         } catch {
@@ -206,6 +270,7 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
         // declarative follow is the only path that works in that case.
         setFollowingUser(true);
         setTimeout(() => setFollowingUser(false), 2000);
+        didInitialCenter.current = true;
       },
       fitToRace: (race) => {
         if (race.marks.length === 0 || !camRef.current) return;
@@ -223,6 +288,7 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
           [120, 60, 320, 60],
           900,
         );
+        didInitialCenter.current = true;
       },
       toggleCompass: () => {
         // Cycle: off → heading → off. When entering "off", snap heading
