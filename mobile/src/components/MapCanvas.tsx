@@ -26,6 +26,7 @@ import {
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
 } from "react";
 import { StyleSheet, View } from "react-native";
 import Mapbox, {
@@ -55,6 +56,16 @@ export type MapCanvasHandle = {
   locateMe: () => void;
   /** Fly to bounds containing all marks of the active race. */
   fitToRace: (race: Race) => void;
+  /**
+   * Two-mode toggle, Google-Maps-compass-style:
+   *   First call (or after any user-initiated rotation): snap heading to 0
+   *     (north up).
+   *   Second consecutive call: start following the device's compass heading
+   *     so the map rotates as the user turns. Pleasant for racing —
+   *     "up" on screen = "ahead of the boat".
+   *   Third consecutive call: back to north. And so on.
+   */
+  toggleCompass: () => void;
 };
 
 type Props = {
@@ -68,13 +79,15 @@ type Props = {
   children?: React.ReactNode;
   /**
    * Called every time the camera changes. Lets the parent recompute
-   * wind-barb features against the new viewport.
+   * wind-barb features against the new viewport and drive the compass
+   * icon's rotation.
    */
   onCameraChanged?: (vp: {
     zoom: number;
     bounds: { south: number; north: number; west: number; east: number };
     centerLat: number;
     centerLon: number;
+    headingDeg: number;
   }) => void;
 };
 
@@ -90,13 +103,34 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
 ) {
   const { colors, mode } = useTheme();
   const camRef = useRef<Camera>(null);
+  // Follow-user state is driven through the <Camera> prop, not via the
+  // imperative setCamera({ followUserLocation }) call which silently
+  // no-ops in @rnmapbox/maps v10 when the Camera was mounted without
+  // following. Toggling this state is what actually re-binds the
+  // camera to the puck position. We set it to true on FAB tap, then
+  // immediately back to false so the user can pan/zoom freely
+  // afterward without being yanked back to centre.
+  const [followingUser, setFollowingUser] = useState(false);
 
-  // Pick a map style by theme. The "navigation-day" / "navigation-night"
-  // styles give a low-clutter base appropriate for an over-the-water UI
-  // and let the wind + route layers pop.
+  // Compass toggle mode. "off" = static (north OR a user-set heading);
+  // "heading" = camera follows the device compass so up-on-screen is
+  // ahead-of-the-boat. The FAB cycles between the two each tap.
+  const [compassMode, setCompassMode] = useState<"off" | "heading">("off");
+
+  // Monochromatic-leaning styles so the overlay data (wind barbs, route
+  // polyline, marks) reads clearly without competing with vibrant
+  // basemap colours. Light = whites/greys with muted land + water;
+  // Dark = near-black with the same muted treatment. Both are far
+  // less visually busy than the Outdoors/Streets palette we started
+  // with, and the racing-instrument feel of the overlays comes through.
+  //
+  // For a true single-hue monochrome (no green parks, no blue water),
+  // we'd need a custom style published from Mapbox Studio and reference
+  // it here by its `mapbox://styles/<account>/<style-id>` URL. Easy
+  // next-session change.
   const styleURL = mode === "dark"
     ? Mapbox.StyleURL.Dark
-    : Mapbox.StyleURL.Outdoors;
+    : Mapbox.StyleURL.Light;
 
   // GeoJSON for marks: Point features with `name` + sequence index. Index
   // drives a number label so sailors see "1, 2, 3..." per mark.
@@ -145,13 +179,33 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   useImperativeHandle(
     ref,
     () => ({
-      locateMe: () => {
-        camRef.current?.setCamera({
-          followUserLocation: true,
-          followUserMode: UserTrackingMode.Follow,
-          followZoomLevel: 14,
-          animationDuration: 800,
-        });
+      locateMe: async () => {
+        // Read the puck's current location and fly there explicitly.
+        // Previously we ALSO flipped followUserLocation=true for ~1.5s
+        // after the setCamera call, expecting it to catch up to any
+        // fresh GPS fix mid-animation. In practice that flip ended the
+        // setCamera animation early, which is why "moves more, faster
+        // but doesn't get all the way there" was the user-observed
+        // behaviour. Drop the follow toggle; if the user has moved by
+        // the time the animation completes, they tap locate-me again.
+        try {
+          const loc = await Mapbox.locationManager.getLastKnownLocation();
+          if (loc && typeof loc.coords?.latitude === "number") {
+            camRef.current?.setCamera({
+              centerCoordinate: [loc.coords.longitude, loc.coords.latitude],
+              zoomLevel: 14,
+              animationDuration: 900,
+              animationMode: "flyTo",
+            });
+            return;
+          }
+        } catch {
+          /* fall through to declarative follow */
+        }
+        // No last-known fix yet (cold-start location subscription) —
+        // declarative follow is the only path that works in that case.
+        setFollowingUser(true);
+        setTimeout(() => setFollowingUser(false), 2000);
       },
       fitToRace: (race) => {
         if (race.marks.length === 0 || !camRef.current) return;
@@ -170,6 +224,33 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
           900,
         );
       },
+      toggleCompass: () => {
+        // Cycle: off → heading → off. When entering "off", snap heading
+        // back to 0 (north up).
+        //
+        // Subtle: the imperative `setCamera({ heading: 0 })` MUST run
+        // AFTER React has flushed the compassMode state change to the
+        // <Camera> component, otherwise `followUserLocation = true` is
+        // still bound and the declarative follow-camera silently
+        // clobbers our imperative reset. Deferring with setTimeout(0)
+        // pushes the setCamera call to the next event-loop tick, by
+        // which time the prop has flipped to false and the imperative
+        // call sticks. Tried `useEffect on compassMode` first — it
+        // fires too early because Reanimated batches the layout pass
+        // ahead of effect cleanup.
+        setCompassMode((prev) => {
+          const next = prev === "off" ? "heading" : "off";
+          if (next === "off") {
+            setTimeout(() => {
+              camRef.current?.setCamera({
+                heading: 0,
+                animationDuration: 500,
+              });
+            }, 50);
+          }
+          return next;
+        });
+      },
     }),
     [],
   );
@@ -179,10 +260,11 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
       zoom: number;
       center: [number, number];
       bounds: { ne: [number, number]; sw: [number, number] };
+      heading?: number;
     };
   }) => {
     if (!onCameraChanged) return;
-    const { zoom, center, bounds } = state.properties;
+    const { zoom, center, bounds, heading } = state.properties;
     onCameraChanged({
       zoom,
       bounds: {
@@ -193,6 +275,7 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
       },
       centerLat: center[1],
       centerLon: center[0],
+      headingDeg: heading ?? 0,
     });
   };
 
@@ -202,8 +285,10 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
         style={styles.map}
         styleURL={styleURL}
         scaleBarEnabled={false}
-        compassEnabled
-        compassPosition={{ top: 18, right: 16 }}
+        // Hide the built-in compass — it's display-only (no tap handler).
+        // We render our own rotate-to-north FAB in MapFabs that calls
+        // the imperative resetNorth() handle. Same visual position.
+        compassEnabled={false}
         attributionPosition={{ bottom: 8, left: 8 }}
         logoPosition={{ bottom: 8, left: 8 }}
         onCameraChanged={handleCameraChanged}
@@ -215,6 +300,17 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
             zoomLevel: DEFAULT_ZOOM,
           }}
           animationMode="flyTo"
+          // Declarative follow — flips true momentarily when the user
+          // taps locate-me, anchoring the camera to the location puck.
+          // ALSO true when compassMode is "heading" so the camera tracks
+          // the device's compass heading (FollowWithHeading mode).
+          followUserLocation={followingUser || compassMode === "heading"}
+          followUserMode={
+            compassMode === "heading"
+              ? UserTrackingMode.FollowWithHeading
+              : UserTrackingMode.Follow
+          }
+          followZoomLevel={14}
         />
 
         {showUser ? (

@@ -95,12 +95,35 @@ export default function MapHomeScreen() {
     bounds: { south: number; north: number; west: number; east: number };
     centerLat: number;
     centerLon: number;
+    headingDeg: number;
   } | null>(null);
   const [windOn, setWindOn] = useState(true);
 
   const barbFeatures = useMemo(() => {
-    if (!windGrid || !viewport || !windOn) return [];
-    return computeBarbFeatures(viewport, windGrid, null);
+    if (!windGrid || !viewport || !windOn) {
+      // eslint-disable-next-line no-console
+      console.log("[barbs] empty —", {
+        hasGrid: !!windGrid,
+        hasViewport: !!viewport,
+        windOn,
+      });
+      return [];
+    }
+    const feats = computeBarbFeatures(viewport, windGrid, null);
+    // eslint-disable-next-line no-console
+    console.log("[barbs] computed:", {
+      count: feats.length,
+      sample: feats[0]
+        ? {
+            lon: feats[0].geometry.coordinates[0],
+            lat: feats[0].geometry.coordinates[1],
+            bucket: feats[0].properties.bucket,
+            dir: Math.round(feats[0].properties.dir),
+          }
+        : null,
+      vp: { z: viewport.zoom.toFixed(2), centerLat: viewport.centerLat.toFixed(3) },
+    });
+    return feats;
   }, [windGrid, viewport, windOn]);
 
   // Routing.
@@ -166,7 +189,9 @@ export default function MapHomeScreen() {
       <MapFabs
         onLocateMe={() => mapRef.current?.locateMe()}
         onToggleWind={() => setWindOn((v) => !v)}
+        onToggleCompass={() => mapRef.current?.toggleCompass()}
         windOn={windOn}
+        headingDeg={viewport?.headingDeg ?? 0}
       />
 
       {selectedRace ? (

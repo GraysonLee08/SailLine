@@ -26,14 +26,28 @@ export function useWeather(region: string | null) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    // eslint-disable-next-line no-console
+    console.log("[useWeather] fetching region:", region);
     (async () => {
       try {
         const data = await getWeather(region);
         if (cancelled) return;
+        // eslint-disable-next-line no-console
+        console.log("[useWeather] grid loaded:", {
+          source: data?.source,
+          valid_time: data?.valid_time,
+          lats: data?.lats?.length,
+          lons: data?.lons?.length,
+          u_rows: data?.u?.length,
+          u_cols: data?.u?.[0]?.length,
+        });
         setGrid(data);
       } catch (e) {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        const msg = e instanceof Error ? e.message : String(e);
+        // eslint-disable-next-line no-console
+        console.error("[useWeather] fetch failed:", msg);
+        setError(msg);
         setGrid(null);
       } finally {
         if (!cancelled) setLoading(false);

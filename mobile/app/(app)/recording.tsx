@@ -54,6 +54,7 @@ export default function RecordingScreen() {
     bounds: { south: number; north: number; west: number; east: number };
     centerLat: number;
     centerLon: number;
+    headingDeg: number;
   } | null>(null);
 
   const barbFeatures = useMemo(() => {

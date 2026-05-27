@@ -71,6 +71,17 @@ export function RaceDetailSheet({
     sheetRef.current?.snapToIndex(0);
   }, [race.id]);
 
+  // If routing surfaces a pending (forecast-not-out) or hard error, the
+  // explanatory text lives in the route block lower in the sheet body.
+  // At the default 32% peek snap it's clipped — auto-expand to 75% so
+  // the user actually sees "Forecast available in 2.3h" or the error
+  // string. Re-collapses on the next race change.
+  useEffect(() => {
+    if (routePending || routeError) {
+      sheetRef.current?.snapToIndex(1);
+    }
+  }, [routePending, routeError]);
+
   const handleIndicator = useMemo(
     () => ({ backgroundColor: colors.scrim.handle }),
     [colors.scrim.handle],

@@ -14,19 +14,49 @@
 
 import { Pressable, StyleSheet, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { useTheme } from "../theme/ThemeProvider";
 
 type Props = {
   onLocateMe: () => void;
   onToggleWind: () => void;
+  onToggleCompass: () => void;
   windOn: boolean;
+  /** Current map heading in degrees (0 = north). Rotates the compass icon. */
+  headingDeg: number;
 };
 
-export function MapFabs({ onLocateMe, onToggleWind, windOn }: Props) {
+export function MapFabs({
+  onLocateMe,
+  onToggleWind,
+  onToggleCompass,
+  windOn,
+  headingDeg,
+}: Props) {
   const { colors } = useTheme();
+  const insets = useSafeAreaInsets();
+  // 16px gap below the system status bar / notch on every device. With
+  // the static `top: 16` we were sitting UNDER the status bar on most
+  // Android phones because the MapView is full-bleed (no parent
+  // SafeAreaView).
+  const topOffset = insets.top + 16;
   return (
-    <View style={styles.cluster} pointerEvents="box-none">
+    <View style={[styles.cluster, { top: topOffset }]} pointerEvents="box-none">
+      {/* Compass FAB — replaces the built-in Mapbox compass, which is
+          display-only (no tap handler). Icon rotates with the map's
+          heading so it visually represents which way is north; tapping
+          animates back to heading=0. Matches the Google Maps compass
+          behaviour the user expected. */}
+      <Fab
+        icon={
+          <View style={{ transform: [{ rotate: `${-headingDeg}deg` }] }}>
+            <Ionicons name="compass" size={22} color={colors.accent.recording} />
+          </View>
+        }
+        onPress={onToggleCompass}
+        accessibilityLabel="Toggle compass mode (north / follow heading)"
+      />
       <Fab
         icon={
           <Ionicons
@@ -80,7 +110,8 @@ function Fab({
 const styles = StyleSheet.create({
   cluster: {
     position: "absolute",
-    top: 76, // below the compass (top: 18 + ~36 + 22 gap)
+    // `top` is set inline from useSafeAreaInsets so the cluster sits
+    // below the notch / status bar on every device.
     right: 16,
     gap: 12,
   },
