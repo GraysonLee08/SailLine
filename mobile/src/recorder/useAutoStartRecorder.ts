@@ -40,6 +40,19 @@ import {
 const ARM_OFFSET_MS = 5 * 60 * 1000; // 5 minutes
 const ARM_WINDOW_MS = 5 * 60 * 1000; // don't retro-fire if >5min past start
 
+// Module-scoped "we've already fired this auto-start" memory.
+//
+// WHY this lives outside the hook: useState `fired` resets on every mount,
+// and the hook lives in (app)/index.tsx which RE-MOUNTS whenever the user
+// navigates back from /recording → /. Without persistence, the sequence
+// "tap Stop → router.replace('/') → hook remounts → delay is still <= 0
+// because the planned start was minutes ago → setTimeout(fire, 0) → start()
+// → useEffect detects recording=true → router.replace('/recording')"
+// becomes an inescapable loop. Module scope survives navigation; the only
+// thing that should clear an entry is the user editing the race's start_at
+// (handled in the effect below — different key → cleared).
+const firedKeys: Set<string> = new Set();
+
 type Args = {
   raceId: string | null;
   startAtIso: string | null;
@@ -90,7 +103,10 @@ export function useAutoStartRecorder({
       } catch {
         /* swallow */
       }
-      // Mirror the foreground path's UI state update.
+      // Mirror the foreground path's UI state update AND mark the
+      // currently-armed key as fired so a later remount doesn't re-fire.
+      const key = keyRef.current;
+      if (key) firedKeys.add(key);
       setFired(true);
       setArmed(false);
       setMsUntilFire(null);
@@ -113,6 +129,10 @@ export function useAutoStartRecorder({
     const key =
       enabled && raceId && startAtIso ? `${raceId}|${startAtIso}` : null;
     if (key !== keyRef.current) {
+      // Key change = different race OR user edited start_at. Either way
+      // the prior "we already fired" memory no longer applies — clear it
+      // so the new (race, time) pair can arm and fire fresh.
+      if (keyRef.current) firedKeys.delete(keyRef.current);
       keyRef.current = key;
       setFired(false);
     }
@@ -125,6 +145,14 @@ export function useAutoStartRecorder({
       // the previous race is cleared (otherwise switching races would
       // leak a stale T-5 task).
       if (raceId) void cancelAutoStart(raceId);
+      return;
+    }
+
+    // Module-scope guard: if this exact (race, startAt) pair already
+    // triggered in this app session, don't re-arm. Survives the
+    // navigation-driven remount that follows a user-initiated Stop.
+    if (firedKeys.has(key)) {
+      setFired(true);
       return;
     }
 
@@ -156,6 +184,7 @@ export function useAutoStartRecorder({
             /* recorder may throw if no raceId — silently swallow */
           }
         }
+        firedKeys.add(key);
         setFired(true);
         setArmed(false);
         setMsUntilFire(null);
@@ -175,6 +204,7 @@ export function useAutoStartRecorder({
           /* swallow */
         }
       }
+      firedKeys.add(key);
       setFired(true);
       setArmed(false);
       setMsUntilFire(null);

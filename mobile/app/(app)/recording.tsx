@@ -2,23 +2,28 @@
 //
 // Replaces the legacy RecorderScreen. Layout:
 //   * Full-bleed map (marks + computed route + user position).
+//   * Top-left: back chip + LIVE pill on the same row (left-aligned so they
+//     sit below the clock, never under the status-bar battery icons).
+//   * Top-right: the same FAB cluster home shows — compass (orientation),
+//     layers (wind), and centre (locate-me). Same handlers, same component.
 //   * GuidanceCard pinned above the bottom of the screen — the single
 //     most-used surface during a race ("next mark / distance / on line").
 //   * Stop button below the guidance card, big and red.
-//   * Top-left back button — DISABLED while recording, as before.
+//   * Back chip — DISABLED while recording, as before.
 //
 // No bottom sheet here intentionally: a draggable sheet competes with the
 // guidance card for the same screen real estate, and during a race the
 // user wants every pixel showing the map + guidance. The sheet returns
 // when recording stops.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, SafeAreaView, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
-import { MapCanvas } from "../../src/components/MapCanvas";
+import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
+import { MapFabs } from "../../src/components/MapFabs";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useNextMarkGuidance } from "../../src/hooks/useNextMarkGuidance";
 import { useWeather } from "../../src/hooks/useWeather";
@@ -57,6 +62,18 @@ export default function RecordingScreen() {
     headingDeg: number;
   } | null>(null);
 
+  // Layers FAB state — defaults ON during a race so wind context is visible
+  // immediately. Home screen owns its own copy of this state independently.
+  const [windOn, setWindOn] = useState(true);
+
+  // MapCanvas imperative handle, used by:
+  //   1. The mount effect below to fit the camera to the course on entry
+  //      (avoids the ref-timing race in MapCanvas's internal fit effect,
+  //      which fires before @rnmapbox/maps attaches its Camera ref on
+  //      screens where `marks` are present from the very first render).
+  //   2. The FAB cluster (locate-me, compass toggle).
+  const mapRef = useRef<MapCanvasHandle>(null);
+
   const barbFeatures = useMemo(() => {
     if (!windGrid || !viewport) return [];
     return computeBarbFeatures(viewport, windGrid, null);
@@ -81,6 +98,23 @@ export default function RecordingScreen() {
     if (!selectedRace) router.replace("/");
   }, [selectedRace]);
 
+  // Fit-to-course on mount. Mirrors home's behaviour when a race is
+  // selected. Done via the imperative handle (not the declarative
+  // initialBounds path in MapCanvas) because on /recording, marks are
+  // present from the very first render — MapCanvas's internal fit effect
+  // fires once before the Camera ref attaches, then never re-runs because
+  // `initialBounds` reference doesn't change. Calling fitToRace from a
+  // mount effect here runs AFTER the Camera mount, so the ref is live.
+  useEffect(() => {
+    if (!selectedRace) return;
+    // setTimeout(0) defers past the first render commit, by which time the
+    // Camera ref is reliably attached on both iOS and Android.
+    const t = setTimeout(() => {
+      mapRef.current?.fitToRace(selectedRace);
+    }, 0);
+    return () => clearTimeout(t);
+  }, [selectedRace]);
+
   if (!selectedRace) return null;
 
   const handleStop = useCallback(async () => {
@@ -99,14 +133,20 @@ export default function RecordingScreen() {
   return (
     <View style={styles.root}>
       <MapCanvas
+        ref={mapRef}
         marks={selectedRace.marks}
         route={routing.route}
         onCameraChanged={setViewport}
       >
-        <WindBarbLayer features={barbFeatures} visible={true} />
+        <WindBarbLayer
+          features={barbFeatures}
+          visible={windOn}
+          zoom={viewport?.zoom}
+        />
       </MapCanvas>
 
-      {/* Top-left back chip. Disabled while recording. */}
+      {/* Top-LEFT row: back chip + LIVE pill. Both sit inside the SafeArea
+          so they never overlap the status bar / battery / signal icons. */}
       <SafeAreaView style={styles.topBar} pointerEvents="box-none">
         <Pressable
           onPress={handleBack}
@@ -168,6 +208,17 @@ export default function RecordingScreen() {
           </View>
         ) : null}
       </SafeAreaView>
+
+      {/* Top-RIGHT: same FAB cluster the home screen uses. Compass toggles
+          orientation (north / follow-heading), layers toggles wind barbs,
+          centre re-centres on the user's position. */}
+      <MapFabs
+        onLocateMe={() => mapRef.current?.locateMe()}
+        onToggleWind={() => setWindOn((v) => !v)}
+        onToggleCompass={() => mapRef.current?.toggleCompass()}
+        windOn={windOn}
+        headingDeg={viewport?.headingDeg ?? 0}
+      />
 
       {/* Bottom action stack: guidance card + Stop button */}
       <SafeAreaView style={styles.bottomStack} pointerEvents="box-none">
@@ -252,11 +303,13 @@ const styles = StyleSheet.create({
     position: "absolute",
     top: 8,
     left: 12,
-    right: 12,
+    // Don't pin to `right` — the FAB cluster lives on the top-right edge
+    // independently. Keeping the top bar left-anchored + flexShrink lets
+    // long race names truncate cleanly without colliding with the FABs.
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
+    gap: 8,
+    maxWidth: "70%",
   },
   backChip: {
     flexDirection: "row",
@@ -267,7 +320,7 @@ const styles = StyleSheet.create({
     height: 38,
     borderRadius: 19,
     borderWidth: StyleSheet.hairlineWidth,
-    maxWidth: "70%",
+    flexShrink: 1,
     shadowOffset: { width: 0, height: 3 },
     shadowOpacity: 1,
     shadowRadius: 8,
