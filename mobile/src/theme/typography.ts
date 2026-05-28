@@ -13,6 +13,7 @@
 // non-stat copy in proportional digits.
 
 import { Platform } from "react-native";
+import type { TextStyle } from "react-native";
 
 export const FONT_FAMILIES = {
   /** Body copy, labels, sentence-case UI text. */
@@ -54,7 +55,7 @@ export const LINE_HEIGHTS = {
  * `tabular` family so values still line up perfectly when the Google
  * font hasn't finished loading and we fall back to the system face.
  */
-export const TABULAR_FONT_VARIANT =
+export const TABULAR_FONT_VARIANT: TextStyle =
   Platform.OS === "ios"
-    ? ({ fontVariant: ["tabular-nums"] as const } as const)
-    : ({} as const);
+    ? { fontVariant: ["tabular-nums"] }
+    : {};

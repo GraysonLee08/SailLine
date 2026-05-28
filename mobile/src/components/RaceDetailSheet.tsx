@@ -22,6 +22,8 @@ import { Ionicons } from "@expo/vector-icons";
 
 import { formatRaceDate } from "../lib/formatRaceDate";
 import { useTheme } from "../theme/ThemeProvider";
+import { OrientationControls } from "./OrientationControls";
+import type { Calibration, PhoneAxis } from "../hooks/useHeelGauge";
 import type { Race } from "../types";
 import type { RouteMeta } from "../api/routing";
 
@@ -47,9 +49,23 @@ type Props = {
   };
   /** Better-route SSE banner — optional, rendered above the actions. */
   betterRouteBanner?: React.ReactNode;
+  /** Orientation calibration controls — persists per-race in AsyncStorage. */
+  orientation?: {
+    phoneAxis: PhoneAxis;
+    onPhoneAxisChange: (axis: PhoneAxis) => void;
+    calibration: Calibration | null;
+    onCaptureCalibration: (cal: Calibration | null) => void;
+    /** Whether the gauge listener should be running (sheet visible + alive). */
+    enabled: boolean;
+  };
+  /** Auto-recompute on wind shift — countdown auto-accepts unless declined. */
+  autoRoute?: {
+    enabled: boolean;
+    onToggle: (next: boolean) => void;
+  };
 };
 
-const SNAP_POINTS = ["32%", "75%"] as const;
+const SNAP_POINTS = ["32%", "75%"];
 
 export function RaceDetailSheet({
   race,
@@ -62,6 +78,8 @@ export function RaceDetailSheet({
   routePending,
   autoStart,
   betterRouteBanner,
+  orientation,
+  autoRoute,
 }: Props) {
   const { colors, font, size, tabularVariant } = useTheme();
   const sheetRef = useRef<BottomSheet>(null);
@@ -296,7 +314,92 @@ export function RaceDetailSheet({
               />
             </View>
           ) : null}
+
+          {/* Auto-route toggle — when on, better-route alerts auto-accept
+              after the banner's countdown unless the user declines. */}
+          {autoRoute ? (
+            <Pressable
+              onPress={() => autoRoute.onToggle(!autoRoute.enabled)}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: autoRoute.enabled }}
+              style={({ pressed }) => [
+                styles.toggleRow,
+                {
+                  borderColor: colors.border.divider,
+                  backgroundColor: pressed
+                    ? colors.surface.elevated
+                    : "transparent",
+                },
+              ]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text
+                  style={{
+                    color: colors.text.primary,
+                    fontFamily: font.bodySemibold,
+                    fontSize: size.body,
+                  }}
+                >
+                  Auto-route on wind shift
+                </Text>
+                <Text
+                  style={{
+                    color: colors.text.muted,
+                    fontFamily: font.body,
+                    fontSize: size.caption,
+                    marginTop: 2,
+                  }}
+                >
+                  Faster routes apply automatically after a 10s countdown.
+                  Tap Decline to keep your current route.
+                </Text>
+              </View>
+              <View
+                style={[
+                  styles.toggleTrack,
+                  {
+                    backgroundColor: autoRoute.enabled
+                      ? colors.accent.primary
+                      : colors.border.divider,
+                  },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.toggleThumb,
+                    {
+                      backgroundColor: colors.surface.sheet,
+                      transform: [{ translateX: autoRoute.enabled ? 18 : 2 }],
+                    },
+                  ]}
+                />
+              </View>
+            </Pressable>
+          ) : null}
         </View>
+
+        {/* Orientation calibration — Fore-aft / Port-stbd / Zero. */}
+        {orientation ? (
+          <View style={styles.orientationBlock}>
+            <Text
+              style={{
+                color: colors.text.primary,
+                fontFamily: font.displaySemibold,
+                fontSize: size.subtitle,
+              }}
+            >
+              Orientation
+            </Text>
+            <OrientationControls
+              enabled={orientation.enabled}
+              phoneAxis={orientation.phoneAxis}
+              onPhoneAxisChange={orientation.onPhoneAxisChange}
+              calibration={orientation.calibration}
+              onCaptureCalibration={orientation.onCaptureCalibration}
+              showLiveReadout
+            />
+          </View>
+        ) : null}
       </BottomSheetScrollView>
     </BottomSheet>
   );
@@ -403,4 +506,28 @@ const styles = StyleSheet.create({
     paddingTop: 6,
   },
   metric: { flex: 1 },
+  toggleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    marginTop: 6,
+  },
+  toggleTrack: {
+    width: 38,
+    height: 22,
+    borderRadius: 999,
+    justifyContent: "center",
+  },
+  toggleThumb: {
+    width: 18,
+    height: 18,
+    borderRadius: 999,
+  },
+  orientationBlock: {
+    gap: 6,
+  },
 });

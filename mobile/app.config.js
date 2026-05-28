@@ -79,6 +79,12 @@ module.exports = ({ config }) => ({
       "expo-gradle-ext-vars",
       {
         googlePlayServicesLocationVersion: "21.3.0",
+        // The wrapper jumping JS major (v4→v5) does NOT drag the native
+        // SDK to v5 — latest tslocationmanager on Maven is 4.1.6 as of
+        // 2026-05-27 and the v5 wrapper Setup docs still call out
+        // "4.0.+" for this var. Initial v5 upgrade attempt bumped this
+        // to "5.0.+" and the gradle dependency resolver couldn't find
+        // a matching artifact (it doesn't exist).
         tslocationmanagerVersion: "4.0.+",
       },
     ],

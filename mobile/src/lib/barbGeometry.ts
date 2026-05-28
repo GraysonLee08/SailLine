@@ -17,23 +17,56 @@
 // alternative — one icon per speed bucket via SymbolLayer — fails on
 // Android because the native bitmap loader can't decode SVG data URLs.
 //
-// Coordinates are in lat/lon (WGS84). For the small barb size (~20m
-// per flag at typical zoom), we can treat lat/lon as locally Euclidean
-// without measurable distortion. Sub-pixel error at any practical
-// barb size.
+// Coordinates are in lat/lon (WGS84). For the small barb size (~few
+// dozen metres per flag at typical zoom), we can treat lat/lon as
+// locally Euclidean without measurable distortion. Sub-pixel error at
+// any practical barb size.
+//
+// SIZING: barbs are sized in SCREEN PIXELS, then converted to metres
+// using the current zoom + latitude. This keeps barbs visually constant
+// regardless of zoom level — at z11 a barb is ~14 px shaft, at z14 it
+// is still ~14 px (whereas a fixed-metres barb would be 8× larger at
+// z14). See `metersPerPixel` for the conversion.
 
 const METRES_PER_DEG_LAT = 111_320; // constant enough
 
-// Flag/shaft sizes in METRES. Tuned so a barb is ~legible at zoom 11+
-// (~50 m/px). At higher zoom they look proportionally larger; at lower
-// zoom they shrink, which is fine — barbs aren't useful when so zoomed
-// out that you can't see the marks anyway.
-const SHAFT_LEN_M = 800;
-const FULL_FLAG_LEN_M = 320;
-const HALF_FLAG_LEN_M = 160;
-const FLAG_OFFSET_M = 80;   // gap between successive flags along the shaft
-const PENNANT_LEN_M = 320;
-const PENNANT_WIDTH_M = 200;
+// Target screen sizes in PIXELS. Calibrated so a barb at z11 looks
+// roughly identical to the previous fixed-metres barb (~14 px shaft @
+// 800 m / 57 m-per-px at lat 42°). Tweak here if barbs ever look too
+// small/large at the default racing zoom.
+const TARGET_SHAFT_PX = 14;
+const TARGET_FULL_FLAG_PX = 6;
+const TARGET_HALF_FLAG_PX = 3;
+const TARGET_FLAG_OFFSET_PX = 1.5;
+const TARGET_PENNANT_LEN_PX = 6;
+const TARGET_PENNANT_WIDTH_PX = 3.5;
+
+// Default zoom used when the caller hasn't wired a zoom value through
+// (e.g., during unit tests or first render before onCameraChanged
+// fires). At z11 the barbs match the pre-pixel-scaling sizes.
+const DEFAULT_ZOOM = 11;
+
+/**
+ * Mapbox / Web Mercator metres-per-pixel at a given zoom and latitude.
+ * Equator base resolution at zoom 0 is 156543.03 m/px; halves each zoom
+ * level. cos(lat) shrinks the longitudinal span as latitude rises.
+ */
+function metersPerPixel(zoom: number, lat: number): number {
+  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+}
+
+/** Resolve per-feature sizes (in metres) for a given station + zoom. */
+function sizesFor(zoom: number, lat: number) {
+  const mpp = metersPerPixel(zoom, lat);
+  return {
+    shaftM: TARGET_SHAFT_PX * mpp,
+    fullFlagM: TARGET_FULL_FLAG_PX * mpp,
+    halfFlagM: TARGET_HALF_FLAG_PX * mpp,
+    flagOffsetM: TARGET_FLAG_OFFSET_PX * mpp,
+    pennantLenM: TARGET_PENNANT_LEN_PX * mpp,
+    pennantWidthM: TARGET_PENNANT_WIDTH_PX * mpp,
+  };
+}
 
 type BarbInput = {
   /** Station coordinates (where the barb originates). */
@@ -85,10 +118,19 @@ function offsetMetres(
  * Flags branch off the LEFT side of the shaft (Northern Hemisphere
  * convention), which in our coordinate system means rotating the
  * shaft vector 90° COUNTERCLOCKWISE to get the flag direction.
+ *
+ * @param zoom Current map zoom level. Drives the per-feature metre
+ *   sizing so barbs stay screen-constant across zoom. Default = 11.
  */
-export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
+export function buildBarbFeatures(
+  input: BarbInput,
+  zoom: number = DEFAULT_ZOOM,
+): BarbFeature[] {
   const speedKt = Math.max(0, Math.floor(input.speedKt));
   if (!Number.isFinite(speedKt) || speedKt < 5) return [];
+
+  const { shaftM, fullFlagM, halfFlagM, flagOffsetM, pennantLenM, pennantWidthM } =
+    sizesFor(zoom, input.lat);
 
   // Decompose speed into pennants (50), full flags (10), half flag (5).
   let remaining = speedKt;
@@ -114,9 +156,9 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
   const features: BarbFeature[] = [];
 
   // 1) Shaft. From station out to (shaftLen) along dirVec.
-  const shaftTipLon = input.lon + (dxUnit * SHAFT_LEN_M) /
+  const shaftTipLon = input.lon + (dxUnit * shaftM) /
     (METRES_PER_DEG_LAT * Math.cos((input.lat * Math.PI) / 180));
-  const shaftTipLat = input.lat + (dyUnit * SHAFT_LEN_M) / METRES_PER_DEG_LAT;
+  const shaftTipLat = input.lat + (dyUnit * shaftM) / METRES_PER_DEG_LAT;
   features.push({
     type: "Feature",
     geometry: {
@@ -130,23 +172,23 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
   // flags. Pennants first (largest, at the tip end), then full flags,
   // then half flags. This matches the conventional barb layout.
   // Position is parameterised by distance from station along shaft.
-  let posM = SHAFT_LEN_M;
+  let posM = shaftM;
 
   // 2) Pennants — filled triangles. We emit them as closed 4-point
   //    LineStrings; the LineLayer renders them as outlined triangles
   //    which read as filled at our line widths.
   for (let i = 0; i < pennants; i++) {
     const baseM = posM;
-    const tipM = posM - PENNANT_LEN_M;
-    posM -= PENNANT_LEN_M + FLAG_OFFSET_M;
+    const tipM = posM - pennantLenM;
+    posM -= pennantLenM + flagOffsetM;
 
     const baseShaft = offsetMetres(input.lat, input.lon, dxUnit * baseM, dyUnit * baseM);
     const tipShaft = offsetMetres(input.lat, input.lon, dxUnit * tipM, dyUnit * tipM);
     // Flag flares to the LEFT perpendicular.
     const baseFlag = offsetMetres(
       input.lat, input.lon,
-      dxUnit * baseM + lxUnit * PENNANT_WIDTH_M,
-      dyUnit * baseM + lyUnit * PENNANT_WIDTH_M,
+      dxUnit * baseM + lxUnit * pennantWidthM,
+      dyUnit * baseM + lyUnit * pennantWidthM,
     );
     features.push({
       type: "Feature",
@@ -161,7 +203,7 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
   // 3) Full flags — diagonal lines from shaft to the LEFT.
   for (let i = 0; i < fullFlags; i++) {
     const baseM = posM;
-    posM -= FLAG_OFFSET_M;
+    posM -= flagOffsetM;
 
     const baseShaft = offsetMetres(input.lat, input.lon, dxUnit * baseM, dyUnit * baseM);
     const tipFlag = offsetMetres(
@@ -169,8 +211,8 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
       // Flag angles slightly back toward the station (downwind end)
       // to mimic the meteorological convention — offset by 0.3 * flag
       // length along the shaft, plus full perpendicular offset.
-      dxUnit * (baseM - FULL_FLAG_LEN_M * 0.3) + lxUnit * FULL_FLAG_LEN_M,
-      dyUnit * (baseM - FULL_FLAG_LEN_M * 0.3) + lyUnit * FULL_FLAG_LEN_M,
+      dxUnit * (baseM - fullFlagM * 0.3) + lxUnit * fullFlagM,
+      dyUnit * (baseM - fullFlagM * 0.3) + lyUnit * fullFlagM,
     );
     features.push({
       type: "Feature",
@@ -183,14 +225,14 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
   //    no full flags/pennants preceded it (visual convention).
   if (halfFlags > 0) {
     if (fullFlags === 0 && pennants === 0) {
-      posM -= FLAG_OFFSET_M;
+      posM -= flagOffsetM;
     }
     const baseM = posM;
     const baseShaft = offsetMetres(input.lat, input.lon, dxUnit * baseM, dyUnit * baseM);
     const tipFlag = offsetMetres(
       input.lat, input.lon,
-      dxUnit * (baseM - HALF_FLAG_LEN_M * 0.3) + lxUnit * HALF_FLAG_LEN_M,
-      dyUnit * (baseM - HALF_FLAG_LEN_M * 0.3) + lyUnit * HALF_FLAG_LEN_M,
+      dxUnit * (baseM - halfFlagM * 0.3) + lxUnit * halfFlagM,
+      dyUnit * (baseM - halfFlagM * 0.3) + lyUnit * halfFlagM,
     );
     features.push({
       type: "Feature",
@@ -205,22 +247,29 @@ export function buildBarbFeatures(input: BarbInput): BarbFeature[] {
 /**
  * Convert the viewport-sampled wind features (Point + bucket + dir) into
  * a flat array of barb LineString features. Used by WindBarbLayer.
+ *
+ * @param zoom Current map zoom level — passed through to each barb so
+ *   barbs are sized in screen pixels rather than metres. Default = 11.
  */
 export function buildAllBarbFeatures(
   points: Array<{
     geometry: { coordinates: [number, number] };
     properties: { bucket: number; dir: number };
   }>,
+  zoom: number = DEFAULT_ZOOM,
 ): BarbFeature[] {
   const out: BarbFeature[] = [];
   for (const p of points) {
     const [lon, lat] = p.geometry.coordinates;
-    const features = buildBarbFeatures({
-      lat,
-      lon,
-      speedKt: p.properties.bucket,
-      dirDeg: p.properties.dir,
-    });
+    const features = buildBarbFeatures(
+      {
+        lat,
+        lon,
+        speedKt: p.properties.bucket,
+        dirDeg: p.properties.dir,
+      },
+      zoom,
+    );
     out.push(...features);
   }
   return out;

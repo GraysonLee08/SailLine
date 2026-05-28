@@ -42,7 +42,7 @@ type Props = {
   onSignOut: () => void;
 };
 
-const SNAP_POINTS = ["15%", "45%", "90%"] as const;
+const SNAP_POINTS = ["15%", "45%", "90%"];
 
 export function RaceListSheet({
   races,

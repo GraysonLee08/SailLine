@@ -29,6 +29,8 @@ import { useRouteNotifications } from "../../src/hooks/useRouteNotifications";
 import { useRouting } from "../../src/hooks/useRouting";
 import { useAutoStartRecorder } from "../../src/recorder/useAutoStartRecorder";
 import { useWeather } from "../../src/hooks/useWeather";
+import { useOrientationSettings } from "../../src/hooks/useOrientationSettings";
+import { useAutoRouteSetting } from "../../src/hooks/useAutoRouteSetting";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
 import { listRaces } from "../../src/api/races";
 import {
@@ -110,6 +112,10 @@ export default function MapHomeScreen() {
   // SSE notifications — only active when a race is selected.
   const notifications = useRouteNotifications(selectedRace?.id ?? null);
 
+  // Per-race orientation calibration + auto-route preference.
+  const orientation = useOrientationSettings(selectedRace?.id ?? null);
+  const autoRoute = useAutoRouteSetting(selectedRace?.id ?? null);
+
   // Auto-start arming (mirrors what the legacy RecorderScreen did). When
   // the race has a scheduled start, arms the foreground timer + the
   // OS-level T-6/T-5 fallbacks. The useEffect below detects the recorder
@@ -161,7 +167,11 @@ export default function MapHomeScreen() {
         route={routing.route}
         onCameraChanged={setViewport}
       >
-        <WindBarbLayer features={barbFeatures} visible={windOn} />
+        <WindBarbLayer
+          features={barbFeatures}
+          visible={windOn}
+          zoom={viewport?.zoom}
+        />
       </MapCanvas>
 
       <MapFabs
@@ -192,8 +202,20 @@ export default function MapHomeScreen() {
                 )
               }
               onDismiss={notifications.dismiss}
+              autoAcceptSeconds={autoRoute.enabled ? 10 : 0}
             />
           }
+          orientation={{
+            phoneAxis: orientation.phoneAxis,
+            onPhoneAxisChange: orientation.setPhoneAxis,
+            calibration: orientation.calibration,
+            onCaptureCalibration: orientation.setCalibration,
+            enabled: true,
+          }}
+          autoRoute={{
+            enabled: autoRoute.enabled,
+            onToggle: autoRoute.setEnabled,
+          }}
         />
       ) : (
         <RaceListSheet

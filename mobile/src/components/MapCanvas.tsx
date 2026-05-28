@@ -324,8 +324,11 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   const handleCameraChanged = (state: {
     properties: {
       zoom: number;
-      center: [number, number];
-      bounds: { ne: [number, number]; sw: [number, number] };
+      // Mapbox v11 types `center` and `bounds.{ne,sw}` as Position (number[]),
+      // not a strict 2-tuple. Runtime code uses [0]/[1] indexing, which works
+      // identically for either width.
+      center: number[];
+      bounds: { ne: number[]; sw: number[] };
       heading?: number;
     };
   }) => {

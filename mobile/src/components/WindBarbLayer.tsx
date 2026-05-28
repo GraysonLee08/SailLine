@@ -19,6 +19,11 @@
 // Pairs with a small CircleLayer for "calm" stations (<5kt), which
 // have no barb shaft — just a tiny dot so the user sees that wind
 // data is present where there's no breeze.
+//
+// ZOOM HANDLING: barb sizes are pixel-targeted (not metre-targeted),
+// so we re-build the geometry on every zoom change. `zoom` is passed
+// in from the parent (which gets it from MapCanvas's onCameraChanged).
+// `useMemo` keeps the rebuild work small and gated by viewport change.
 
 import {
   CircleLayer,
@@ -41,16 +46,26 @@ type WindFeature = {
 type Props = {
   features: WindFeature[];
   visible: boolean;
+  /**
+   * Current map zoom level. Passed through to barb-geometry so barb
+   * sizing stays constant in screen pixels rather than world metres.
+   * Optional — defaults to z11 when not yet known (first paint).
+   */
+  zoom?: number;
 };
 
 const BARB_SOURCE = "wind-barbs-src";
 const CALM_SOURCE = "wind-calm-src";
 
-export function WindBarbLayer({ features, visible }: Props) {
+export function WindBarbLayer({ features, visible, zoom }: Props) {
   // Pre-compute barb geometry every render — cheap (linear in feature
   // count, typically 10-100 points per viewport). Memoised so identical
-  // viewports skip the rebuild.
-  const barbFeatures = useMemo(() => buildAllBarbFeatures(features), [features]);
+  // viewports skip the rebuild. Zoom is part of the dep set: zoom in
+  // → smaller metre lengths → smaller-but-equivalently-pixel-sized barbs.
+  const barbFeatures = useMemo(
+    () => buildAllBarbFeatures(features, zoom),
+    [features, zoom],
+  );
   const calmFeatures = useMemo(() => calmStationFeatures(features), [features]);
 
   // Don't early-return on empty features: returning null unmounts the
@@ -110,7 +125,10 @@ export function WindBarbLayer({ features, visible }: Props) {
         <LineLayer
           id="wind-barbs"
           style={{
-            lineColor: colorRamp,
+            // Mapbox v11's `lineColor` is typed as a precise Expression
+            // tuple union that's painful to satisfy from a plain array.
+            // colorRamp IS a valid `step` expression at runtime; cast.
+            lineColor: colorRamp as any,
             lineWidth: 3,
             lineCap: "round",
             lineJoin: "round",

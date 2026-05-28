@@ -10,7 +10,15 @@
     "scheme": "sailline",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.sailline.app"
+      "bundleIdentifier": "com.sailline.app",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "location",
+          "fetch"
+        ],
+        "NSLocationWhenInUseUsageDescription": "SailLine records your boat's track during a race.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "SailLine records your boat's track during a race, including while your screen is off, so your route and performance are captured continuously."
+      }
     },
     "android": {
       "package": "com.sailline.app",
@@ -20,7 +28,15 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "WAKE_LOCK"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -29,6 +45,12 @@
       "eas": {
         "projectId": "7a15f0b0-f2b9-4e68-8283-57f04840349e"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/7a15f0b0-f2b9-4e68-8283-57f04840349e"
     }
   }
 }

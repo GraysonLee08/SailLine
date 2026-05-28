@@ -12,11 +12,28 @@
 // the native HTTP layer is fragile. So Transistorsoft is the CAPTURE
 // ENGINE ONLY; the recorder hook owns queueing, batching, flushing, and
 // drop-on-ack (the proven web pattern). See the Phase 1 plan, §2.
+//
+// v5 upgrade (2026-05-27): Transistorsoft's react-native-background-geolocation
+// shipped v5 with a fully restructured Config API. Every flat option from v4
+// is now nested under a typed sub-config (geolocation / app / logger / etc.).
+// The runtime behavior we want is unchanged; only the shape of the object
+// passed to ready() changed. Removed v4-only options: `autoStart` (we always
+// called .start() explicitly anyway) and `foregroundService` (implicit in v5).
 
-import BackgroundGeolocation, {
+// IMPORTANT: react-native-background-geolocation v5 only ships a default
+// export. The package's index.d.ts re-exports the enum types from
+// `@transistorsoft/background-geolocation-types`, which makes named imports
+// like `import { DesiredAccuracy } from "react-native-background-geolocation"`
+// TYPE-CHECK fine but RESOLVE to `undefined` at runtime — crashing the
+// recorder with "Cannot read property 'High' of undefined" the moment
+// startWatcher() runs. Always reach the enums through the default export
+// (BackgroundGeolocation.DesiredAccuracy.High) so the value and the type
+// come from the same place.
+import BackgroundGeolocation from "react-native-background-geolocation";
+import type {
   Location,
   Subscription,
-} from "react-native-background-geolocation";
+} from "@transistorsoft/background-geolocation-types";
 
 const MS_TO_KTS = 1.943844;
 
@@ -39,10 +56,16 @@ export type WatcherCallbacks = {
 /**
  * Normalise a Transistorsoft Location into the canonical local point.
  *
- * Transistorsoft reports speed/heading as -1 (and accuracy can be a large
- * sentinel) when a value isn't available; we map those to null so the
- * wire layer emits null rather than a bogus number. speed is m/s,
- * heading is degrees true, accuracy is meters, timestamp is ISO 8601.
+ * v5 type notes:
+ *   - `speed`, `heading`, `accuracy` are typed `number | undefined`
+ *     instead of v4's sentinel `-1` for "unavailable". Runtime semantics
+ *     are the same (missing/invalid → drop), but TypeScript needs an
+ *     explicit `!= null` to narrow `undefined` out — `Number.isFinite()`
+ *     doesn't narrow as a type guard.
+ *   - `location.timestamp` is typed `string | number`. React Native has
+ *     historically returned ISO 8601 strings, but the type allows
+ *     milliseconds too. Coerce through `Date` to land on a single
+ *     canonical ISO 8601 string regardless of which the SDK gave us.
  *
  * Exported for unit testing.
  */
@@ -52,14 +75,21 @@ export function normalizeLocation(location: Location): LocalPoint {
   const heading = coords.heading;
   const accuracy = coords.accuracy;
   return {
-    recorded_at: location.timestamp,
+    recorded_at: new Date(location.timestamp).toISOString(),
     lat: coords.latitude,
     lon: coords.longitude,
     speed_kts:
-      Number.isFinite(speed) && speed >= 0 ? speed * MS_TO_KTS : null,
+      speed != null && Number.isFinite(speed) && speed >= 0
+        ? speed * MS_TO_KTS
+        : null,
     heading_deg:
-      Number.isFinite(heading) && heading >= 0 ? heading : null,
-    gps_acc_m: Number.isFinite(accuracy) && accuracy >= 0 ? accuracy : null,
+      heading != null && Number.isFinite(heading) && heading >= 0
+        ? heading
+        : null,
+    gps_acc_m:
+      accuracy != null && Number.isFinite(accuracy) && accuracy >= 0
+        ? accuracy
+        : null,
   };
 }
 
@@ -73,6 +103,12 @@ export function normalizeLocation(location: Location): LocalPoint {
  *   - distanceFilter: 0          → don't gate on movement
  *   - locationUpdateInterval     → ~1 s cadence (Android)
  *   - disableElasticity: true    → keep cadence steady (no auto back-off)
+ *
+ * Note on desiredAccuracy: v4's DESIRED_ACCURACY_NAVIGATION was
+ * cross-platform but accepted as an alias for HIGH on Android. In v5,
+ * DesiredAccuracy.Navigation is documented as iOS-only, so we use
+ * DesiredAccuracy.High — same providers (GPS + Wifi + Cellular), same
+ * accuracy class on Android.
  */
 export async function startWatcher({
   onPosition,
@@ -93,50 +129,52 @@ export async function startWatcher({
   );
 
   await BackgroundGeolocation.ready({
-    // ── Accuracy & cadence ───────────────────────────────────────────
-    desiredAccuracy: BackgroundGeolocation.DESIRED_ACCURACY_NAVIGATION,
-    distanceFilter: 0,
-    locationUpdateInterval: 1000,
-    fastestLocationUpdateInterval: 1000,
-    disableElasticity: true,
+    // Top-level: factory-reset before applying so dev iterations always
+    // pick up our latest config (not a stale persisted one).
+    reset: true,
 
-    // ── Lifecycle ────────────────────────────────────────────────────
+    // ── Accuracy & cadence (was flat in v4) ──────────────────────────
+    geolocation: {
+      desiredAccuracy: BackgroundGeolocation.DesiredAccuracy.High,
+      distanceFilter: 0,
+      locationUpdateInterval: 1000,
+      fastestLocationUpdateInterval: 1000,
+      disableElasticity: true,
+      locationAuthorizationRequest: "Always",
+      pausesLocationUpdatesAutomatically: false,
+      showsBackgroundLocationIndicator: true,
+    },
+
+    // ── App lifecycle + Android foreground service ───────────────────
     // We start/stop explicitly around a race; don't auto-resume on boot
     // or keep running after the app is terminated in Phase 1.
-    stopOnTerminate: true,
-    startOnBoot: false,
-    // We control start() ourselves below, so don't auto-start on ready.
-    autoStart: false,
-
-    // ── Android foreground service + notification (Phase 1 plan §3) ──
-    foregroundService: true,
-    backgroundPermissionRationale: {
-      title:
-        "Allow SailLine to record your track while the screen is off?",
-      message:
-        "SailLine needs background location so your race track keeps " +
-        "recording with the phone locked in your pocket.",
-      positiveAction: "Allow",
-      negativeAction: "Cancel",
+    app: {
+      stopOnTerminate: true,
+      startOnBoot: false,
+      backgroundPermissionRationale: {
+        title:
+          "Allow SailLine to record your track while the screen is off?",
+        message:
+          "SailLine needs background location so your race track keeps " +
+          "recording with the phone locked in your pocket.",
+        positiveAction: "Allow",
+        negativeAction: "Cancel",
+      },
+      notification: {
+        title: "SailLine — recording your race",
+        text: "Capturing GPS while the screen is off.",
+        channelName: "Race tracking",
+        priority: BackgroundGeolocation.NotificationPriority.Low,
+        sticky: true,
+      },
     },
-    notification: {
-      title: "SailLine — recording your race",
-      text: "Capturing GPS while the screen is off.",
-      channelName: "Race tracking",
-      priority: BackgroundGeolocation.NOTIFICATION_PRIORITY_LOW,
-      sticky: true,
-    },
-
-    // ── iOS (build-time modes are set by the config plugin) ──────────
-    locationAuthorizationRequest: "Always",
-    pausesLocationUpdatesAutomatically: false,
-    showsBackgroundLocationIndicator: true,
 
     // ── Logging ──────────────────────────────────────────────────────
-    // Keep the on-device log small; raise to VERBOSE while debugging a
-    // failed screen-locked run.
-    logLevel: BackgroundGeolocation.LOG_LEVEL_WARNING,
-    reset: true,
+    // Keep the on-device log small; raise to LogLevel.Verbose while
+    // debugging a failed screen-locked run.
+    logger: {
+      logLevel: BackgroundGeolocation.LogLevel.Warning,
+    },
   });
 
   await BackgroundGeolocation.start();
