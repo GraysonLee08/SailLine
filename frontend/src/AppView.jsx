@@ -38,6 +38,7 @@ import { signOut } from "firebase/auth";
 import { auth } from "./firebase";
 import { apiFetch } from "./api";
 import { MapView } from "./components/MapView.jsx";
+import { RECORDING_ENABLED } from "./lib/featureFlags";
 
 const RacesListView = lazy(() => import("./RacesListView.jsx"));
 const RaceEditor = lazy(() => import("./RaceEditor.jsx"));
@@ -67,13 +68,17 @@ function isOngoing(race) {
 }
 
 export default function AppView({ user }) {
-  // Hidden diagnostic page — reachable only via ?debug=sensors. No UI
-  // entry point. Short-circuits before any hooks fire so it doesn't
-  // pull in profile fetching, active-race restoration, or the map.
-  // Safe re: hook-order rules because the URL doesn't change during a
-  // single mount, so the early return is either always-taken or never-
-  // taken for any given instance of this component.
+  // Hidden diagnostic page — reachable only via ?debug=sensors AND the
+  // RECORDING_ENABLED feature flag. No UI entry point. Short-circuits
+  // before any hooks fire so it doesn't pull in profile fetching,
+  // active-race restoration, or the map. Safe re: hook-order rules
+  // because the URL doesn't change during a single mount, so the early
+  // return is either always-taken or never-taken for any given instance
+  // of this component. Flag gate added 2026-05-29 — the sensor debug
+  // surface is part of the recording UI being moved to mobile (see
+  // sailline -docs/2026-05-29_mobile-ui-google-maps-mapping.md §2).
   if (
+    RECORDING_ENABLED &&
     typeof window !== "undefined" &&
     new URLSearchParams(window.location.search).get("debug") === "sensors"
   ) {

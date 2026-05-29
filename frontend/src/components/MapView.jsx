@@ -46,6 +46,12 @@ import { useHeelGauge } from "../hooks/useHeelGauge";
 import { ComputeRouteButton, RouteStatus } from "./RouteControls.jsx";
 import { BetterRouteBanner } from "./BetterRouteBanner.jsx";
 import { PermissionBanner } from "./PermissionBanner.jsx";
+// Recording / calibration UI is hidden in production as of 2026-05-29
+// (platform split — mobile owns on-water; webapp keeps setup + stats).
+// Hook calls below stay mounted (Rules of Hooks); only the visible
+// surfaces are gated. See sailline -docs/2026-05-29_mobile-ui-google-
+// maps-mapping.md §2 and §5 for the deletion criteria.
+import { RECORDING_ENABLED } from "../lib/featureFlags";
 import { usePermissionStatus } from "../hooks/usePermissionStatus";
 import { AnimatedDigit, splitSecondsFromCountdown } from "./AnimatedDigit.jsx";
 import { regionCenter, venueForPoint, VENUE_ZOOM_THRESHOLD } from "@sailline/shared";
@@ -604,10 +610,12 @@ export function MapView({
         onDismiss={notif.dismiss}
       />
 
-      <PermissionBanner
-        status={permissionStatus}
-        recording={recorder.recording}
-      />
+      {RECORDING_ENABLED && (
+        <PermissionBanner
+          status={permissionStatus}
+          recording={recorder.recording}
+        />
+      )}
 
       {activeRace && (
         <RaceOverlay
@@ -747,7 +755,7 @@ function RaceOverlay({
                   );
                 })()}
         </div>
-        {showArmed && (
+        {RECORDING_ENABLED && showArmed && (
           <div style={styles.armedHint}>
             ● Auto-recording armed · mount your phone in a fixed location
           </div>
@@ -770,24 +778,28 @@ function RaceOverlay({
             </button>
           </div>
         )}
-        {recording && autoStop?.armed && (
+        {RECORDING_ENABLED && recording && autoStop?.armed && (
           <div style={styles.armedHint}>
             ● Course complete · auto-stop in {formatMmSs(autoStop.msUntilStop)}
           </div>
         )}
-        {recording && queueLength > 0 && (
+        {RECORDING_ENABLED && recording && queueLength > 0 && (
           <div style={styles.queueHint}>
             {queueLength} pt{queueLength === 1 ? "" : "s"} pending
             {recorderError ? " · offline" : ""}
           </div>
         )}
-        {!recording && recorderError && (
+        {RECORDING_ENABLED && !recording && recorderError && (
           <div style={styles.recordError}>{recorderError}</div>
         )}
 
         {/* Phone-axis toggle + Zero calibration. Visible whenever an
             active race is set; the Zero button hides once the gun goes
-            off. */}
+            off. Gated behind RECORDING_ENABLED — mobile owns this UI
+            as of 2026-05-29. Fragment wraps the calibration row +
+            status + denied banner + live heel readout. */}
+        {RECORDING_ENABLED && (
+        <>
         <div style={styles.calibrationRow}>
           <span style={styles.calibrationLabel}>Phone:</span>
           <button
@@ -853,6 +865,9 @@ function RaceOverlay({
             </span>
           </div>
         )}
+        </>
+        )}
+        {/* End RECORDING_ENABLED gate for calibration / heel readout. */}
 
         {routing && (
           <RouteStatus meta={routing.meta} error={routing.error} />
@@ -866,6 +881,7 @@ function RaceOverlay({
             onClick={routing.compute}
           />
         )}
+        {RECORDING_ENABLED && (
         <button
           onClick={onToggleRecord}
           className={recording ? "" : "glass-button--dark"}
@@ -882,6 +898,7 @@ function RaceOverlay({
             {recording ? "Rec" : "Record"}
           </span>
         </button>
+        )}
         <button
           onClick={onEdit}
           className="glass-button--dark"

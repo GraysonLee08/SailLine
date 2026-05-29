@@ -22,7 +22,11 @@ import {
   type MapCanvasHandle,
 } from "../../src/components/MapCanvas";
 import { MapFabs } from "../../src/components/MapFabs";
-import { RaceDetailSheet } from "../../src/components/RaceDetailSheet";
+import { MapActionFabs } from "../../src/components/MapActionFabs";
+import {
+  RaceDetailSheet,
+  type RaceDetailSheetHandle,
+} from "../../src/components/RaceDetailSheet";
 import { RaceListSheet } from "../../src/components/RaceListSheet";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useRouteNotifications } from "../../src/hooks/useRouteNotifications";
@@ -76,6 +80,12 @@ export default function MapHomeScreen() {
 
   // Map ref for FAB-driven actions.
   const mapRef = useRef<MapCanvasHandle>(null);
+
+  // Race detail sheet ref + expand state — fed to MapActionFabs so the
+  // Minimize FAB can collapse the sheet and only render when expanded.
+  // Phase 1 spec: 2026-05-29_mobile-ui-google-maps-mapping.md §4.
+  const detailSheetRef = useRef<RaceDetailSheetHandle>(null);
+  const [sheetExpanded, setSheetExpanded] = useState(false);
 
   // Resolve the wind region from the selected race's marks. Falls back to
   // CONUS so the user sees barbs immediately while browsing.
@@ -183,7 +193,19 @@ export default function MapHomeScreen() {
       />
 
       {selectedRace ? (
+        <MapActionFabs
+          onCompute={routing.compute}
+          onStart={handleStartRecording}
+          onMinimize={() => detailSheetRef.current?.snapToPeek()}
+          routeLoading={routing.loading}
+          recording={recorder.recording}
+          sheetExpanded={sheetExpanded}
+        />
+      ) : null}
+
+      {selectedRace ? (
         <RaceDetailSheet
+          ref={detailSheetRef}
           race={selectedRace}
           onClose={handleCloseDetail}
           onStart={handleStartRecording}
@@ -216,6 +238,7 @@ export default function MapHomeScreen() {
             enabled: autoRoute.enabled,
             onToggle: autoRoute.setEnabled,
           }}
+          onExpandedChange={setSheetExpanded}
         />
       ) : (
         <RaceListSheet

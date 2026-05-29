@@ -9,7 +9,7 @@
 // recording") lives in the peek strip — the user shouldn't have to
 // pull up the sheet to find it.
 
-import { useEffect, useMemo, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -26,6 +26,12 @@ import { OrientationControls } from "./OrientationControls";
 import type { Calibration, PhoneAxis } from "../hooks/useHeelGauge";
 import type { Race } from "../types";
 import type { RouteMeta } from "../api/routing";
+
+/** Imperative API exposed to the parent so map FABs can collapse the
+    sheet to peek (Minimize FAB). */
+export type RaceDetailSheetHandle = {
+  snapToPeek: () => void;
+};
 
 type Props = {
   race: Race;
@@ -63,11 +69,15 @@ type Props = {
     enabled: boolean;
     onToggle: (next: boolean) => void;
   };
+  /** Called when the sheet's snap index changes. `true` means expanded
+      (75% snap), `false` means peeked (32%). Used by the parent to show
+      the Minimize FAB only while expanded. */
+  onExpandedChange?: (expanded: boolean) => void;
 };
 
 const SNAP_POINTS = ["32%", "75%"];
 
-export function RaceDetailSheet({
+export const RaceDetailSheet = forwardRef<RaceDetailSheetHandle, Props>(function RaceDetailSheet({
   race,
   onClose,
   onStart,
@@ -80,14 +90,22 @@ export function RaceDetailSheet({
   betterRouteBanner,
   orientation,
   autoRoute,
-}: Props) {
+  onExpandedChange,
+}, ref) {
   const { colors, font, size, tabularVariant } = useTheme();
   const sheetRef = useRef<BottomSheet>(null);
+
+  // Imperative API: parent FABs can snap us back to peek.
+  useImperativeHandle(ref, () => ({
+    snapToPeek: () => sheetRef.current?.snapToIndex(0),
+  }), []);
 
   useEffect(() => {
     // Open to peek (showing the Start button) whenever the race changes.
     sheetRef.current?.snapToIndex(0);
-  }, [race.id]);
+    // Reset parent's expanded tracking — a new race always starts peeked.
+    onExpandedChange?.(false);
+  }, [race.id, onExpandedChange]);
 
   // If routing surfaces a pending (forecast-not-out) or hard error, the
   // explanatory text lives in the route block lower in the sheet body.
@@ -118,6 +136,7 @@ export function RaceDetailSheet({
       backgroundStyle={sheetBg}
       enableDynamicSizing={false}
       enableOverDrag={false}
+      onChange={(index) => onExpandedChange?.(index > 0)}
     >
       <BottomSheetScrollView contentContainerStyle={styles.body}>
         {betterRouteBanner}
@@ -156,6 +175,34 @@ export function RaceDetailSheet({
               {race.mode} · {race.boat_class} · {race.marks.length}{" "}
               {race.marks.length === 1 ? "mark" : "marks"}
             </Text>
+            {/* ETA chip — Google-Maps-style "sailboat icon + duration"
+                under the metadata. Always rendered; shows "—" until the
+                user computes a route. Phase 1 spec §3 #4. */}
+            <View style={styles.etaChip}>
+              <Ionicons name="boat" size={14} color={colors.accent.primary} />
+              <Text
+                style={[
+                  {
+                    color: colors.text.primary,
+                    fontFamily: font.tabularBold,
+                    fontSize: size.small,
+                  },
+                  tabularVariant,
+                ]}
+              >
+                {routeMeta ? formatMinutes(routeMeta.total_minutes) : "—"}
+              </Text>
+              <Text
+                style={{
+                  color: colors.text.muted,
+                  fontFamily: font.body,
+                  fontSize: size.caption,
+                  marginLeft: 2,
+                }}
+              >
+                est. race time
+              </Text>
+            </View>
           </View>
           <Pressable
             onPress={onClose}
@@ -403,7 +450,7 @@ export function RaceDetailSheet({
       </BottomSheetScrollView>
     </BottomSheet>
   );
-}
+});
 
 function Metric({ label, value }: { label: string; value: string }) {
   const { colors, font, size, tabularVariant } = useTheme();
@@ -529,5 +576,11 @@ const styles = StyleSheet.create({
   },
   orientationBlock: {
     gap: 6,
+  },
+  etaChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 6,
   },
 });

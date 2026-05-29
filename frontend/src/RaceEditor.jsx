@@ -30,6 +30,7 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import { apiFetch } from "./api";
 import { BOAT_CLASSES } from "@sailline/shared";
 import { COURSE_FAMILIES, buildCourseMarks } from "@sailline/shared";
+import { RECORDING_ENABLED } from "./lib/featureFlags";
 import {
   formatLat,
   formatLon,
@@ -682,17 +683,25 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
                   aria-label="Class start time"
                 />
               </div>
-              <label style={styles.autoStartRow}>
-                <input
-                  type="checkbox"
-                  checked={autoStartEnabled}
-                  onChange={(e) => setAutoStartEnabled(e.target.checked)}
-                  style={styles.autoStartCheckbox}
-                />
-                <span style={styles.autoStartLabel}>
-                  Auto-start recording 5 min before gun
-                </span>
-              </label>
+              {/* Auto-start recording toggle. Gated behind
+                  RECORDING_ENABLED as of 2026-05-29 — recording moves
+                  to mobile. The autoStartEnabled state still posts to
+                  the API so existing race rows preserve their value;
+                  only the visible checkbox is hidden. See sailline
+                  -docs/2026-05-29_mobile-ui-google-maps-mapping.md §2. */}
+              {RECORDING_ENABLED && (
+                <label style={styles.autoStartRow}>
+                  <input
+                    type="checkbox"
+                    checked={autoStartEnabled}
+                    onChange={(e) => setAutoStartEnabled(e.target.checked)}
+                    style={styles.autoStartCheckbox}
+                  />
+                  <span style={styles.autoStartLabel}>
+                    Auto-start recording 5 min before gun
+                  </span>
+                </label>
+              )}
             </Section>
 
             <Section label="MORF course preset">
