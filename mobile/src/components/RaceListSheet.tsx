@@ -9,9 +9,10 @@
 // to the race's bounds and surface "Plan route" / "Start recording"
 // actions in a follow-up sheet state (see app/(app)/index.tsx).
 //
-// Empty state pushes the user to the web app — race creation on mobile
-// is Phase 2b. No filter/sort/search for now; if the user accumulates
-// 20+ races we'll add it.
+// Header has a "+ New" button that pushes /race-edit so the user can
+// plan a course from the boat — added 2026-05-29 alongside the mobile
+// race-editor screen (see src/screens/RaceEditScreen.tsx). Empty state
+// also surfaces the same action.
 
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
@@ -27,6 +28,7 @@ import BottomSheet, {
   BottomSheetView,
 } from "@gorhom/bottom-sheet";
 import { Ionicons } from "@expo/vector-icons";
+import { router } from "expo-router";
 
 import { formatRaceDate } from "../lib/formatRaceDate";
 import { useTheme } from "../theme/ThemeProvider";
@@ -121,9 +123,34 @@ export function RaceListSheet({
           ) : null}
         </View>
         <Pressable
+          onPress={() => router.push("/race-edit")}
+          accessibilityLabel="New race"
+          hitSlop={10}
+          style={({ pressed }) => [
+            styles.newBtn,
+            {
+              backgroundColor: pressed
+                ? colors.accent.primaryPressed
+                : colors.accent.primary,
+            },
+          ]}
+        >
+          <Ionicons name="add" size={16} color={colors.text.onAccent} />
+          <Text
+            style={{
+              color: colors.text.onAccent,
+              fontFamily: font.bodySemibold,
+              fontSize: size.small,
+            }}
+          >
+            New
+          </Text>
+        </Pressable>
+        <Pressable
           onPress={onSignOut}
           accessibilityLabel="Sign out"
           hitSlop={10}
+          style={{ marginLeft: 14 }}
         >
           <Ionicons name="log-out-outline" size={22} color={colors.text.muted} />
         </Pressable>
@@ -171,11 +198,36 @@ export function RaceListSheet({
               fontSize: size.body,
               lineHeight: 20,
               textAlign: "center",
+              marginBottom: 20,
             }}
           >
-            Plan a race on the web app (sailline.app), then it'll show up
-            here ready to record.
+            Plan your first race — pick a MORF preset or tap on the map to
+            place marks.
           </Text>
+          <Pressable
+            onPress={() => router.push("/race-edit")}
+            style={({ pressed }) => [
+              styles.emptyCta,
+              {
+                backgroundColor: pressed
+                  ? colors.accent.primaryPressed
+                  : colors.accent.primary,
+              },
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel="New race"
+          >
+            <Ionicons name="add" size={18} color={colors.text.onAccent} />
+            <Text
+              style={{
+                color: colors.text.onAccent,
+                fontFamily: font.bodySemibold,
+                fontSize: size.body,
+              }}
+            >
+              New race
+            </Text>
+          </Pressable>
         </View>
       ) : (
         <BottomSheetFlatList
@@ -326,6 +378,22 @@ const styles = StyleSheet.create({
   racedPill: {
     paddingHorizontal: 7,
     paddingVertical: 2,
+    borderRadius: 999,
+  },
+  newBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  emptyCta: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     borderRadius: 999,
   },
 });

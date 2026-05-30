@@ -93,6 +93,13 @@ type Props = {
     centerLon: number;
     headingDeg: number;
   }) => void;
+  /**
+   * Tap-to-place handler. When provided, single taps on the map fire
+   * this with the tapped (lat, lon). The race editor uses this to drop
+   * a mark exactly where the user pointed, matching the webapp
+   * RaceEditor.jsx click-to-add-mark behaviour.
+   */
+  onMapPress?: (lat: number, lon: number) => void;
 };
 
 const DEFAULT_CENTER: [number, number] = [-87.6, 41.9]; // Chicago lake-shore
@@ -108,7 +115,7 @@ const MARK_FEATURE_ID = "marks-src";
 const ROUTE_FEATURE_ID = "route-src";
 
 export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
-  { marks, route, showUser = true, children, onCameraChanged },
+  { marks, route, showUser = true, children, onCameraChanged, onMapPress },
   ref,
 ) {
   const { colors, mode } = useTheme();
@@ -126,6 +133,14 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   // "heading" = camera follows the device compass so up-on-screen is
   // ahead-of-the-boat. The FAB cycles between the two each tap.
   const [compassMode, setCompassMode] = useState<"off" | "heading">("off");
+  // Mirror compassMode into a ref so the imperative handle (created
+  // once with deps=[]) can read the latest value at call time. Without
+  // this, locateMe() closes over the initial "off" and never enters
+  // the heading-up re-bind path.
+  const compassModeRef = useRef(compassMode);
+  useEffect(() => {
+    compassModeRef.current = compassMode;
+  }, [compassMode]);
 
   // Single-shot guard: once we've placed the camera (via the marks-fit
   // effect OR the user-location effect), don't move it again on our own.
@@ -243,14 +258,28 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
     ref,
     () => ({
       locateMe: async () => {
-        // Read the puck's current location and fly there explicitly.
-        // Previously we ALSO flipped followUserLocation=true for ~1.5s
-        // after the setCamera call, expecting it to catch up to any
-        // fresh GPS fix mid-animation. In practice that flip ended the
-        // setCamera animation early, which is why "moves more, faster
-        // but doesn't get all the way there" was the user-observed
-        // behaviour. Drop the follow toggle; if the user has moved by
-        // the time the animation completes, they tap locate-me again.
+        // In heading-up mode the <Camera>'s `followUserLocation` prop is
+        // pinned true. When the user pans, Mapbox silently unbinds its
+        // internal follow but the React prop stays true — any imperative
+        // setCamera() call we make next gets clobbered by the stale-but-
+        // still-bound declarative follow on the next layout pass. Cycle
+        // compassMode off → on to force the <Camera> to re-mount the
+        // follow binding with FollowWithHeading, which re-centers on the
+        // puck. Mirrors the setTimeout dance in toggleCompass below.
+        if (compassModeRef.current === "heading") {
+          setCompassMode("off");
+          setTimeout(() => setCompassMode("heading"), 50);
+          didInitialCenter.current = true;
+          return;
+        }
+        // North-up path: read the puck's current location and fly there
+        // explicitly. Previously we ALSO flipped followUserLocation=true
+        // for ~1.5s after the setCamera call, expecting it to catch up
+        // to any fresh GPS fix mid-animation. In practice that flip
+        // ended the setCamera animation early, which is why "moves more,
+        // faster but doesn't get all the way there" was the user-
+        // observed behaviour. Drop the follow toggle; if the user has
+        // moved by the time the animation completes, they tap again.
         try {
           const loc = await Mapbox.locationManager.getLastKnownLocation();
           if (loc && typeof loc.coords?.latitude === "number") {
@@ -361,6 +390,24 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
         attributionPosition={{ bottom: 8, left: 8 }}
         logoPosition={{ bottom: 8, left: 8 }}
         onCameraChanged={handleCameraChanged}
+        onPress={
+          onMapPress
+            ? (feature) => {
+                // rnmapbox passes a GeoJSON Point feature; coordinates
+                // are [lon, lat]. Defensive null-check covers the rare
+                // case where the SDK fires onPress without geometry
+                // (seen on Android during view teardown).
+                const coords = feature?.geometry?.coordinates;
+                if (
+                  Array.isArray(coords) &&
+                  typeof coords[0] === "number" &&
+                  typeof coords[1] === "number"
+                ) {
+                  onMapPress(coords[1], coords[0]);
+                }
+              }
+            : undefined
+        }
       >
         <Camera
           ref={camRef}

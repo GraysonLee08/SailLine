@@ -214,6 +214,12 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   const mapRef = useRef(null);
   const markersRef = useRef([]);
   const fittedRef = useRef(false);
+  // Tracks the last placed-mark count we fit to, so we can refit when
+  // the count grows (user added another mark) without refitting on
+  // drags or coord edits that don't change the count. Without this the
+  // map fits ONCE on the first placed mark and subsequent additions
+  // can land off-screen, which feels like "the map ignored my mark."
+  const lastFitCountRef = useRef(0);
   const [styleLoaded, setStyleLoaded] = useState(false);
 
   // Latest weather grid, read inside the (stable) moveend handler so the
@@ -390,12 +396,21 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
       });
     }
 
-    if (!fittedRef.current && placedCoords.length > 0) {
+    // Refit when the placed-mark count grows (or on the first placement
+    // for a freshly-opened editor). Editing an existing mark's coords
+    // or dragging a marker keeps the count constant and therefore
+    // doesn't refit — that would be jarring mid-edit. Course-preset
+    // load resets fittedRef + lastFitCountRef so it fits the new set.
+    if (
+      placedCoords.length > 0 &&
+      (!fittedRef.current || placedCoords.length > lastFitCountRef.current)
+    ) {
       fitToMarks(
         map,
         marks.filter(isPlaced),
       );
       fittedRef.current = true;
+      lastFitCountRef.current = placedCoords.length;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncKey, styleLoaded]);
@@ -466,6 +481,7 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
     setMarks(next.map((m) => ({ ...m, _animKey: newAnimKey() })));
     setJustAddedMarkKey("__all__");
     fittedRef.current = false;
+    lastFitCountRef.current = 0;
   };
 
   const clearStart = () => {

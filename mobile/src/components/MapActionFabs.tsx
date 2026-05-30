@@ -4,39 +4,39 @@
 // controls (compass / wind layer / locate-me). This cluster holds
 // race-action FABs and is only rendered when a race is selected:
 //
-//   - Directions FAB (top of cluster)  → Compute / Recompute route.
-//                                         Shows spinner when routeLoading.
-//   - Start FAB (middle)              → Start recording.
-//                                         Hidden once `recording === true`
-//                                         (mirrors the in-sheet primary
-//                                         CTA which also disappears).
-//   - Minimize FAB (bottom)           → Collapses the race detail sheet
-//                                         to the peek snap point.
-//                                         Only visible when the sheet is
-//                                         expanded — matches Google Maps
-//                                         where the X only appears when
-//                                         the place sheet is open.
+//   - Start FAB (top)        → Start recording.
+//                              Hidden once `recording === true`
+//                              (mirrors the in-sheet primary CTA which
+//                              also disappears).
+//   - Minimize FAB (bottom)  → Collapses the race detail sheet to the
+//                              peek snap point. Only visible when the
+//                              sheet is expanded — matches Google Maps
+//                              where the X only appears when the place
+//                              sheet is open.
+//
+// History — 2026-05-29 the cluster also had a Directions (Compute /
+// Recompute) FAB at the top, mirroring Google Maps' Directions button.
+// Removed 2026-05-29 (evening) because it duplicated the Recompute
+// button already inside the race detail sheet header. The Recompute
+// button in the sheet is the single entry point for route compute now.
 //
 // Phase 1 spec: 2026-05-29_mobile-ui-google-maps-mapping.md §4.
 //
-// The cluster intentionally duplicates entry points that already exist
-// inside the RaceDetailSheet (Compute button, Start CTA). This is the
-// Google Maps pattern: the bottom sheet holds detail; the map holds
-// the always-reachable action surface. The handlers are the same — we
-// share a callback rather than duplicating state.
+// The cluster intentionally duplicates the Start CTA already inside the
+// RaceDetailSheet. This is the Google Maps pattern: the bottom sheet
+// holds detail; the map holds the always-reachable action surface. The
+// handlers are the same — we share a callback rather than duplicating
+// state.
 
-import { Pressable, StyleSheet, View, ActivityIndicator } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { useTheme } from "../theme/ThemeProvider";
 
 type Props = {
-  onCompute: () => void;
   onStart: () => void;
   onMinimize: () => void;
-  /** Disables the Directions FAB and renders a spinner in its place. */
-  routeLoading: boolean;
   /** Hides the Start FAB once recording is live. */
   recording: boolean;
   /** Whether the race detail sheet is currently expanded (not at peek).
@@ -45,10 +45,8 @@ type Props = {
 };
 
 export function MapActionFabs({
-  onCompute,
   onStart,
   onMinimize,
-  routeLoading,
   recording,
   sheetExpanded,
 }: Props) {
@@ -65,22 +63,6 @@ export function MapActionFabs({
       style={[styles.cluster, { bottom: bottomOffset }]}
       pointerEvents="box-none"
     >
-      <Fab
-        icon={
-          routeLoading ? (
-            <ActivityIndicator size="small" color={colors.accent.primary} />
-          ) : (
-            <Ionicons
-              name="navigate-circle"
-              size={24}
-              color={colors.accent.primary}
-            />
-          )
-        }
-        onPress={onCompute}
-        disabled={routeLoading}
-        accessibilityLabel="Compute route"
-      />
       {!recording ? (
         <Fab
           icon={

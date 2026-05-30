@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { router } from "expo-router";
+import { router, useFocusEffect } from "expo-router";
 
 import { useAuth } from "../../src/auth/AuthContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
@@ -68,6 +68,15 @@ export default function MapHomeScreen() {
   useEffect(() => {
     void loadRaces();
   }, [loadRaces]);
+
+  // Re-fetch on focus so newly-created or edited races show up when the
+  // user pops back from /race-edit. Otherwise the screen keeps showing
+  // its mount-time snapshot of the list.
+  useFocusEffect(
+    useCallback(() => {
+      void loadRaces();
+    }, [loadRaces]),
+  );
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -194,10 +203,8 @@ export default function MapHomeScreen() {
 
       {selectedRace ? (
         <MapActionFabs
-          onCompute={routing.compute}
           onStart={handleStartRecording}
           onMinimize={() => detailSheetRef.current?.snapToPeek()}
-          routeLoading={routing.loading}
           recording={recorder.recording}
           sheetExpanded={sheetExpanded}
         />

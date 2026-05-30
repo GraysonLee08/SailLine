@@ -26,7 +26,14 @@ export function parseCoord(input) {
 
   // Optional leading hemisphere letter / sign, then degrees, then optional
   // minutes, then optional trailing hemisphere letter.
-  const re = /^([+-NSEW])?\s*(\d+(?:\.\d+)?)(?:\s*[°\s]\s*(\d+(?:\.\d+)?))?\s*'?\s*([NSEW])?$/i;
+  //
+  // The dash is placed FIRST inside the character class — `[+-NSEW]` is
+  // a stealth range from `+` (ASCII 43) to `N` (ASCII 78) and silently
+  // matches every digit, the first one of which then gets consumed as a
+  // bogus "lead" group. Symptom: `41 52.80 N` parsed to 1.88 instead of
+  // 41.88 because `4` was captured as the lead. Adding a parseCoord
+  // test guards this regression.
+  const re = /^([-+NSEW])?\s*(\d+(?:\.\d+)?)(?:\s*[°\s]\s*(\d+(?:\.\d+)?))?\s*'?\s*([NSEW])?$/i;
   const m = s.match(re);
   if (!m) return NaN;
   const [, lead, degStr, minStr, trail] = m;
