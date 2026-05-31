@@ -52,7 +52,13 @@ FAKE_USER = {
 }
 
 
-def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
+def _race_row(
+    marks=None,
+    mark_passes=None,
+    started_at=None,
+    start_at=None,
+    mode="distance",
+):
     """Build the row shape that ``load_race_for_ingest`` expects.
 
     Defaults to a single mark deliberately far away from the test GPS
@@ -65,6 +71,10 @@ def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
     freshly-created race with no scheduled gun time and no first
     telemetry POST yet. Tests that exercise the backfill path override
     them explicitly.
+
+    ``mode`` was added in v3 (2026-05-30) so the detector picks the
+    right per-mark thresholds. Defaults to "distance" — the wider
+    tolerance, mirroring the production safer-default.
     """
     if marks is None:
         marks = [{"name": "Far", "lat": 0.0, "lon": 0.0}]
@@ -75,6 +85,7 @@ def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
         "mark_passes": json.dumps(mark_passes),
         "started_at": started_at,
         "start_at": start_at,
+        "mode": mode,
     }
 
 

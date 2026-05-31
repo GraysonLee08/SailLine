@@ -100,6 +100,50 @@ class RaceOut(BaseModel):
     updated_at: datetime
 
 
+class ManualMarkPassIn(BaseModel):
+    """Body for ``POST /api/races/{race_id}/mark-passes`` — record one
+    or more passes manually from the in-race UI.
+
+    The UI shows every mark with a "Pass" button so the user can
+    confirm any mark they've rounded that the auto-detector missed.
+    Tapping mark N implies "I'm at mark N now," so the backend also
+    backfills any unpassed marks before N with the same timestamp (the
+    boat must have passed them too to be at N now).
+
+    ``passed_at`` defaults to server-now when omitted. ``lat/lon`` are
+    optional — the mobile UI sends them when GPS is available so the
+    pass record carries the boat's actual position; without them we
+    fall back to the mark's nominal position so downstream consumers
+    always have a coordinate.
+    """
+    mark_index: int = Field(ge=0)
+    passed_at: Optional[datetime] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+
+class MarkPassOut(BaseModel):
+    """A persisted mark-rounding event. Matches the shape stored in
+    ``race_sessions.mark_passes`` JSONB and the one returned by the
+    track-ingest endpoints. ``source`` was added with manual passes —
+    older rows lack it and the frontend treats absent as "auto".
+    """
+    mark_index: int
+    ts: datetime
+    lat: float
+    lon: float
+    source: Optional[Literal["auto", "manual"]] = None
+
+
+class MarkPassesOut(BaseModel):
+    """Response body for the manual pass endpoint — full updated list
+    plus the subset that this call added (so the client can highlight
+    them without diffing)."""
+    mark_passes: list[MarkPassOut] = Field(default_factory=list)
+    new_mark_passes: list[MarkPassOut] = Field(default_factory=list)
+    ended_at: Optional[datetime] = None
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 _SELECT_COLS = """
@@ -317,3 +361,157 @@ async def delete_race(
             "DELETE FROM race_sessions WHERE id = $1", race_id,
         )
     return None
+
+
+@router.post(
+    "/{race_id}/mark-passes",
+    response_model=MarkPassesOut,
+    status_code=status.HTTP_200_OK,
+)
+async def record_manual_mark_pass(
+    race_id: UUID,
+    payload: ManualMarkPassIn,
+    user: dict = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool),
+):
+    """Record a manual mark pass — fallback for when the auto-detector
+    missed (or the user wants to confirm a pass live without waiting
+    for the depart-confirm samples to roll in).
+
+    UX contract (mobile in-race view):
+      * Every mark is shown with a "Pass" button.
+      * Tapping mark N implies "I'm at mark N now," so the server
+        backfills every unpassed mark in (last_existing..N] with the
+        same ``passed_at`` timestamp and ``source="manual"``.
+      * Idempotent on N <= existing_max — taps on already-passed marks
+        are a no-op (the response just echoes current state).
+      * When the backfill includes the final mark, ``ended_at`` is set
+        (COALESCEd so a prior end isn't overwritten) and the
+        race-postprocess job is fired in the background.
+
+    Authorisation uses ``race_write_predicate`` — owners and crew can
+    record manual passes; viewers cannot. Returns 404 (not 403) when
+    the caller can't write, matching the rest of the race routes.
+    """
+    # Imports here keep them out of the module load path for callers
+    # that don't exercise the manual-pass endpoint (test isolation).
+    from app.services.job_trigger import trigger_race_postprocess
+
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT r.marks, r.mark_passes
+            FROM race_sessions r
+            WHERE r.id = $1 AND {pred}
+            """,
+            race_id, user["uid"],
+        )
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+
+        marks_list = _decode_marks(row["marks"])
+        if not marks_list:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "race has no marks; nothing to pass",
+            )
+        if payload.mark_index >= len(marks_list):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"mark_index {payload.mark_index} out of range "
+                f"(course has {len(marks_list)} marks)",
+            )
+
+        existing_raw = row["mark_passes"]
+        if isinstance(existing_raw, (bytes, str)):
+            existing = json.loads(existing_raw) if existing_raw else []
+        else:
+            existing = list(existing_raw or [])
+
+        # Highest pass index already recorded. Backfill starts AT
+        # next_idx (one past the highest) so we don't duplicate.
+        existing_indices = {p.get("mark_index") for p in existing}
+        next_idx = (
+            max(existing_indices) + 1
+            if existing_indices and None not in existing_indices
+            else 0
+        )
+
+        if payload.mark_index < next_idx:
+            # Idempotent: target already passed. Echo state, no UPDATE.
+            return MarkPassesOut(
+                mark_passes=[MarkPassOut(**p) for p in existing],
+                new_mark_passes=[],
+                ended_at=None,
+            )
+
+        passed_at = payload.passed_at or datetime.now(tz=_utc())
+        # Iso-format for JSONB storage to match the existing wire shape
+        # written by track_ingest.
+        passed_at_iso = passed_at.isoformat()
+
+        new_passes: list[dict] = []
+        for idx in range(next_idx, payload.mark_index + 1):
+            mark = marks_list[idx]
+            # Use the user's GPS coordinates only on the explicitly-
+            # tapped mark; backfilled marks use the nominal mark
+            # position (we don't know where the boat actually was).
+            if idx == payload.mark_index and payload.lat is not None and payload.lon is not None:
+                lat, lon = float(payload.lat), float(payload.lon)
+            else:
+                lat = float(mark.get("lat", 0.0))
+                lon = float(mark.get("lon", 0.0))
+            new_passes.append({
+                "mark_index": idx,
+                "ts": passed_at_iso,
+                "lat": lat,
+                "lon": lon,
+                "source": "manual",
+            })
+
+        all_passes = existing + new_passes
+        course_complete = len(all_passes) >= len(marks_list)
+        ended_at_value: Optional[datetime] = None
+
+        set_parts = ["mark_passes = $1::jsonb", "updated_at = NOW()"]
+        args: list = [json.dumps(all_passes)]
+        if course_complete:
+            ended_at_value = passed_at
+            args.append(passed_at)
+            set_parts.append(f"ended_at = COALESCE(ended_at, ${len(args)})")
+        args.append(race_id)
+        race_id_idx = len(args)
+
+        await conn.execute(
+            f"""
+            UPDATE race_sessions
+            SET {", ".join(set_parts)}
+            WHERE id = ${race_id_idx}
+            """,
+            *args,
+        )
+
+    # Fire post-process outside the connection block — same pattern as
+    # the auto-detect path in track_ingest. Always swallowed; we never
+    # let job trigger failures rollback the manual pass write.
+    if course_complete:
+        try:
+            await trigger_race_postprocess(race_id)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "manual mark-pass: trigger_race_postprocess failed for %s",
+                race_id,
+            )
+
+    return MarkPassesOut(
+        mark_passes=[MarkPassOut(**p) for p in all_passes],
+        new_mark_passes=[MarkPassOut(**p) for p in new_passes],
+        ended_at=ended_at_value,
+    )
+
+
+def _utc():
+    """Lazy import of timezone — keeps the module load path lean."""
+    from datetime import timezone
+    return timezone.utc

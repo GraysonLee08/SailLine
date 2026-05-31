@@ -70,7 +70,13 @@ def client(app):
     return TestClient(app)
 
 
-def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
+def _race_row(
+    marks=None,
+    mark_passes=None,
+    started_at=None,
+    start_at=None,
+    mode="distance",
+):
     if marks is None:
         marks = [{"name": "M", "lat": 42.30, "lon": -87.80}]
     if mark_passes is None:
@@ -80,6 +86,7 @@ def _race_row(marks=None, mark_passes=None, started_at=None, start_at=None):
         "mark_passes": json.dumps(mark_passes),
         "started_at": started_at,
         "start_at": start_at,
+        "mode": mode,
     }
 
 

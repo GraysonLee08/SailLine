@@ -24,7 +24,10 @@ import { Ionicons } from "@expo/vector-icons";
 import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
+import { MarkPassControls } from "../../src/components/MarkPassControls";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
+import { useMarkPasses } from "../../src/hooks/useMarkPasses";
+import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
 import { useNextMarkGuidance } from "../../src/hooks/useNextMarkGuidance";
 import { useWeather } from "../../src/hooks/useWeather";
 import { useRouting } from "../../src/hooks/useRouting";
@@ -90,6 +93,36 @@ export default function RecordingScreen() {
     race: selectedRace,
     points: recorder.points,
     lastPoint: recorder.lastPoint,
+  });
+
+  // Mark-pass list — both auto-detected (server) and manual.
+  // Always shown during recording per 2026-05-30 spec: each mark has a
+  // "Pass" button so the sailor can confirm anything the detector misses.
+  const markPasses = useMarkPasses({
+    raceId: selectedRace?.id ?? null,
+    recording: recorder.recording,
+  });
+
+  // Reuse the recorder's last GPS fix as the boat-position-at-tap.
+  // Returns null if no fix yet so the API call omits lat/lon (server
+  // falls back to the mark's nominal position).
+  const getCurrentPosition = useCallback(() => {
+    const p = recorder.lastPoint;
+    if (!p) return null;
+    return { lat: p.lat, lon: p.lon };
+  }, [recorder.lastPoint]);
+
+  // Fire a watch-actionable notification if the boat plausibly passed a
+  // mark that the v3 detector missed (wide pass outside threshold).
+  // Background hook — no UI; the notification owns the user surface.
+  useMissedMarkNotifier({
+    raceId: selectedRace?.id ?? null,
+    recording: recorder.recording,
+    marks: selectedRace?.marks ?? [],
+    passes: markPasses.passes,
+    lastPoint: recorder.lastPoint
+      ? { lat: recorder.lastPoint.lat, lon: recorder.lastPoint.lon }
+      : null,
   });
 
   // Bounce out if the user navigated here without a race. Use replace,
@@ -220,8 +253,19 @@ export default function RecordingScreen() {
         headingDeg={viewport?.headingDeg ?? 0}
       />
 
-      {/* Bottom action stack: guidance card + Stop button */}
+      {/* Bottom action stack: marks row + guidance card + Stop button.
+          MarkPassControls sits above the GuidanceCard so the "what's
+          confirmed" picture is immediately visible without obscuring
+          the next-mark guidance. */}
       <SafeAreaView style={styles.bottomStack} pointerEvents="box-none">
+        <MarkPassControls
+          marks={selectedRace.marks}
+          passes={markPasses.passes}
+          disabled={!recorder.recording}
+          getCurrentPosition={getCurrentPosition}
+          onMarkPass={markPasses.markManualPass}
+          pending={markPasses.loading && markPasses.passes.length === 0}
+        />
         <GuidanceCard
           guidance={guidance}
           totalMarks={selectedRace.marks.length}

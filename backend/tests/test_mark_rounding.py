@@ -3,26 +3,49 @@
 No DB, no network, no router — just the detector. Track points are
 synthesised geometrically: we pick a mark and walk a straight line
 through it, varying the closest-approach distance to drive the
-inside/outside transitions deterministically.
+algorithm deterministically.
 
 We use latitudes around the Cook County Sailing area (Lake Michigan,
 ~42.0°N, -87.7°E) so the haversine math behaves the same as production.
+
+Test scope — v3 streaming sequential CPA (2026-05-30):
+  * Tight pass detected.
+  * Wide pass at distance threshold detected (the v2-failure case that
+    motivated v3 — see ``sailline-docs/2026-05-30_session.md``).
+  * Wide pass at inshore threshold NOT detected.
+  * Sequential ordering enforced (later marks ignored until earlier ones
+    are passed).
+  * Multi-lap via repeated marks.
+  * DNF (no emit, detector stays not-done).
+  * Resume from persisted next_mark_index.
+  * GPS jitter near CPA doesn't double-emit.
+  * Per-mark threshold list honored; length mismatch and non-positive
+    values rejected.
+  * Integration: today's Colors (Bravo) GPX track produces 7/7 passes
+    in distance mode (the canonical real-world fixture for v3).
 """
 from __future__ import annotations
 
 import math
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from app.services.mark_rounding import (
+    DEFAULT_DISTANCE_THRESHOLD_M,
+    DEFAULT_INSHORE_THRESHOLD_M,
     DEFAULT_RADIUS_M,
+    DEPART_CONFIRM_SAMPLES,
+    FINAL_MARK_BONUS_M,
     FINAL_MARK_RADIUS_M,
     Mark,
     MarkRoundingDetector,
     Point,
     compute_passes,
     radii_for_course,
+    thresholds_for_course,
 )
 
 
@@ -60,8 +83,8 @@ def pt(lat: float, lon: float, t_offset_s: float, speed: float = 5.0) -> Point:
 def line_through(
     mark: Mark,
     closest_m: float,
-    span_m: float = 200.0,
-    n: int = 21,
+    span_m: float = 600.0,
+    n: int = 31,
     bearing_deg: float = 90.0,
     t0: float = 0.0,
     dt_s: float = 1.0,
@@ -70,16 +93,17 @@ def line_through(
     mark at its midpoint.
 
     Bearing is the direction of travel relative to true north (90° = due
-    east). The track is evenly spaced in metres along that bearing,
-    centred on the closest-approach point.
+    east). Track is evenly spaced along that bearing, centred on the
+    closest-approach point.
+
+    Defaults give 600 m of travel, 21 m per step — plenty of room for
+    the v3 detector to see at least DEPART_CONFIRM_SAMPLES strictly-
+    increasing distances after CPA, even with the wide (200 m+) passes
+    we test for distance-racing scenarios.
     """
-    # Closest-approach point is offset from the mark perpendicular to
-    # the travel bearing, at distance ``closest_m``.
     perp_bearing = (bearing_deg + 90.0) % 360.0
     cap_lat, cap_lon = _offset(mark.lat, mark.lon, perp_bearing, closest_m)
 
-    # Points span ±span_m/2 along the travel bearing from the closest-
-    # approach point.
     half = span_m / 2.0
     step = span_m / (n - 1) if n > 1 else 0.0
     points: list[Point] = []
@@ -98,48 +122,76 @@ def _offset(lat: float, lon: float, bearing_deg: float, dist_m: float):
     return lat + dlat, lon + dlon
 
 
-# ─── Tests ─────────────────────────────────────────────────────────────
+# ─── Core v3 algorithm tests ───────────────────────────────────────────
 
 
-def test_straight_pass_through_radius_emits_one_pass():
+def test_tight_pass_detected_in_inshore_mode():
+    """Inside the inshore 100 m threshold — pass detected at CPA."""
     mark = Mark(REF_LAT, REF_LON)
-    # Pass within 10 m of the mark — well inside the 50 m radius.
     track = line_through(mark, closest_m=10.0)
 
-    passes = compute_passes([mark], track)
+    passes = compute_passes([mark], track, threshold_m=DEFAULT_INSHORE_THRESHOLD_M)
 
     assert len(passes) == 1
     assert passes[0].mark_index == 0
-    # Pass time should fall AT the midpoint (closest approach) for a
-    # symmetric line_through track — that's the v2 behaviour (emit the
-    # closest-approach point's timestamp, not the exit point's).
-    midpoint_ts = track[len(track) // 2].ts
-    assert passes[0].ts == midpoint_ts
+    midpoint = track[len(track) // 2]
+    assert passes[0].ts == midpoint.ts
+    assert passes[0].lat == midpoint.lat
 
 
-def test_fly_by_outside_radius_emits_nothing():
+def test_wide_pass_detected_in_distance_mode():
+    """The v3 win: 200 m pass detected with the distance-mode 250 m
+    threshold. This is the failure mode that motivated v3 — see
+    ``sailline-docs/2026-05-30_session.md`` (Harrison-Dever Crib was
+    passed at 208 m and the old detector missed it entirely)."""
     mark = Mark(REF_LAT, REF_LON)
-    # Closest approach is 75 m — outside the 50 m default radius.
-    track = line_through(mark, closest_m=75.0)
+    track = line_through(mark, closest_m=200.0)
 
-    passes = compute_passes([mark], track)
+    passes = compute_passes(
+        [mark], track, threshold_m=DEFAULT_DISTANCE_THRESHOLD_M,
+    )
+
+    assert len(passes) == 1
+    midpoint = track[len(track) // 2]
+    assert passes[0].ts == midpoint.ts
+
+
+def test_wide_pass_not_detected_in_inshore_mode():
+    """Same 200 m pass at the inshore 100 m threshold — does NOT emit.
+    Sequential ordering then keeps subsequent marks gated, preserving
+    "did the race actually round all marks" as a meaningful signal."""
+    mark = Mark(REF_LAT, REF_LON)
+    track = line_through(mark, closest_m=200.0)
+
+    passes = compute_passes(
+        [mark], track, threshold_m=DEFAULT_INSHORE_THRESHOLD_M,
+    )
+
+    assert passes == []
+
+
+def test_very_wide_pass_never_detected():
+    """800 m pass with a 250 m distance threshold — well outside. No emit."""
+    mark = Mark(REF_LAT, REF_LON)
+    track = line_through(mark, closest_m=800.0)
+
+    passes = compute_passes(
+        [mark], track, threshold_m=DEFAULT_DISTANCE_THRESHOLD_M,
+    )
 
     assert passes == []
 
 
 def test_two_mark_course_in_order():
-    """W-L style: round mark A then mark B. Detector should emit in
-    order, with timestamps reflecting actual passage time."""
+    """Round mark A then mark B. Detector should emit in order, with
+    timestamps reflecting actual passage time."""
     a = Mark(REF_LAT, REF_LON)
-    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=2000.0)
     b = Mark(b_lat, b_lon)
 
-    # Pass A close, then traverse to B close.
-    track_a = line_through(a, closest_m=8.0, t0=0.0)
-    # Start the second leg's clock after the first leg ends, with a
-    # plausible boat-speed delta.
+    track_a = line_through(a, closest_m=20.0, t0=0.0)
     t_after_a = track_a[-1].ts.timestamp() - track_a[0].ts.timestamp() + 60.0
-    track_b = line_through(b, closest_m=8.0, t0=t_after_a)
+    track_b = line_through(b, closest_m=20.0, t0=t_after_a)
 
     passes = compute_passes([a, b], track_a + track_b)
 
@@ -150,19 +202,17 @@ def test_two_mark_course_in_order():
 def test_passes_through_later_mark_first_are_ignored():
     """Sail past mark B before rounding A → must NOT count B yet.
 
-    Common on W-L courses: the boat sails through the leeward gate area
-    on its way to the windward mark. B should fire only AFTER A's
-    rounding has been recorded.
-    """
-    a_lat, a_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    With v3's removal of the radius gate, this property leans entirely
+    on sequential ordering — the detector is only ever watching the
+    next-expected mark, so an incidental close pass to a later mark is
+    invisible to it."""
+    a_lat, a_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=2000.0)
     a = Mark(a_lat, a_lon)
-    b = Mark(REF_LAT, REF_LON)  # B is BACK toward the start
+    b = Mark(REF_LAT, REF_LON)
 
-    # Walk THROUGH B's radius first, then proceed to A's, then back
-    # through B's. Only A's rounding then B's should fire.
-    leg1 = line_through(b, closest_m=8.0, t0=0.0)             # passes B (ignored)
-    leg2 = line_through(a, closest_m=8.0, t0=100.0)           # rounds A
-    leg3 = line_through(b, closest_m=8.0, t0=200.0)           # rounds B
+    leg1 = line_through(b, closest_m=20.0, t0=0.0)
+    leg2 = line_through(a, closest_m=20.0, t0=200.0)
+    leg3 = line_through(b, closest_m=20.0, t0=500.0)
 
     passes = compute_passes([a, b], leg1 + leg2 + leg3)
 
@@ -170,23 +220,21 @@ def test_passes_through_later_mark_first_are_ignored():
 
 
 def test_multilap_via_repeated_marks():
-    """Beer-can: start = finish, two laps. Course list repeats the start
-    mark for each lap so the detector treats them as distinct entries
-    in sequence — exactly what the router should provide."""
+    """Beer-can: start = finish, two laps. Course list repeats the
+    start mark for each lap so the detector treats them as distinct
+    entries in sequence — exactly what the router should provide."""
     s = Mark(REF_LAT, REF_LON)
-    w_lat, w_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    w_lat, w_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=2000.0)
     w = Mark(w_lat, w_lon)
 
-    # Course: Start, Windward, Start (lap 2 marker), Windward, Finish.
     course = [s, w, s, w, s]
 
-    # Track: two laps of S→W→S, ending with one more S.
     legs = [
-        line_through(s, closest_m=8.0, t0=0.0),
-        line_through(w, closest_m=8.0, t0=120.0),
-        line_through(s, closest_m=8.0, t0=240.0),
-        line_through(w, closest_m=8.0, t0=360.0),
-        line_through(s, closest_m=8.0, t0=480.0),
+        line_through(s, closest_m=20.0, t0=0.0),
+        line_through(w, closest_m=20.0, t0=300.0),
+        line_through(s, closest_m=20.0, t0=600.0),
+        line_through(w, closest_m=20.0, t0=900.0),
+        line_through(s, closest_m=20.0, t0=1200.0),
     ]
     track = [p for leg in legs for p in leg]
 
@@ -200,11 +248,10 @@ def test_dnf_track_never_completes():
     and the detector reports done=False — what auto-stop relies on to
     NOT trigger."""
     a = Mark(REF_LAT, REF_LON)
-    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=2000.0)
     b = Mark(b_lat, b_lon)
 
-    # Round A then drift in random direction, never reaching B.
-    track = line_through(a, closest_m=8.0)
+    track = line_through(a, closest_m=20.0)
 
     det = MarkRoundingDetector([a, b])
     passes = det.feed_batch(track)
@@ -218,15 +265,13 @@ def test_resume_from_persisted_state():
     """Simulates the router pattern: previous batches already detected
     pass 0; new batch only contains points around mark 1. Detector is
     constructed with ``next_mark_index=1`` and should NOT re-emit pass
-    0 just because the new batch happens to skim near mark 0 again."""
+    0 just because the new batch skims near mark 0 again."""
     a = Mark(REF_LAT, REF_LON)
-    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
+    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=2000.0)
     b = Mark(b_lat, b_lon)
 
-    # New batch: passes near A again (boat doubles back briefly), then
-    # rounds B properly. Since we resume at next=1, A is invisible.
-    near_a_again = line_through(a, closest_m=8.0, t0=100.0)
-    near_b = line_through(b, closest_m=8.0, t0=200.0)
+    near_a_again = line_through(a, closest_m=20.0, t0=100.0)
+    near_b = line_through(b, closest_m=20.0, t0=300.0)
 
     det = MarkRoundingDetector([a, b], next_mark_index=1)
     passes = det.feed_batch(near_a_again + near_b)
@@ -234,145 +279,213 @@ def test_resume_from_persisted_state():
     assert [p.mark_index for p in passes] == [1]
 
 
-def test_gps_jitter_inside_radius_does_not_double_count():
-    """The boat enters the radius, GPS produces several samples inside
-    (jitter), then exits. We should emit exactly one pass at the exit
-    point, not one per inside sample."""
+def test_gps_jitter_near_cpa_does_not_double_count():
+    """Dense sampling through CPA with mild jitter — exactly one pass.
+    The running-minimum reset on each new closer sample plus the
+    departing-count guard handle this without special-casing."""
     mark = Mark(REF_LAT, REF_LON)
-    # Dense sampling: 41 points across a 200 m line at 5 m spacing —
-    # the middle 21 points fall well inside a 50 m radius.
-    track = line_through(mark, closest_m=5.0, span_m=200.0, n=41)
+    track = line_through(mark, closest_m=5.0, span_m=400.0, n=81)
 
-    passes = compute_passes([mark], track)
+    passes = compute_passes([mark], track, threshold_m=DEFAULT_INSHORE_THRESHOLD_M)
 
     assert len(passes) == 1
 
 
-def test_radius_must_be_positive():
-    with pytest.raises(ValueError):
-        MarkRoundingDetector([Mark(REF_LAT, REF_LON)], radius_m=0)
-
-
-def test_compute_passes_default_radius_matches_constant():
-    """Sanity check that the convenience wrapper uses the documented
-    default. If someone bumps DEFAULT_RADIUS_M without thinking, this
-    test will surface it loudly."""
-    assert DEFAULT_RADIUS_M == 50.0
-
-
-# ─── v2 (2026-05-26): closest-approach timestamps + per-mark radii ─────
-
-
-def test_closest_approach_emits_min_distance_timestamp_not_exit():
-    """Pass timestamp must be the closest-approach point inside the
-    radius, NOT the exit point. Closer to "when you actually crossed
-    the line through the mark," which is what ``ended_at`` consumes."""
+def test_asymmetric_cpa_emits_at_min_distance_point():
+    """Asymmetric track: walks closer-then-farther so CPA is clearly not
+    a midpoint. Pass timestamp must be the CPA sample."""
     mark = Mark(REF_LAT, REF_LON)
-    # Asymmetric track: walks closer-then-farther across the radius so
-    # the closest approach is clearly NOT the exit point.
-    #   index:  0   1   2   3   4   5   6   7   8
-    #   dist:  60  40  20  10   5  10  20  40  60   (metres from mark)
-    # Index 4 (t = 4s) is the closest approach. Index 5 is the exit.
     base = pt(REF_LAT, REF_LON, 0).ts
-    distances = [60, 40, 20, 10, 5, 10, 20, 40, 60]
+    distances = [60, 40, 20, 10, 5, 10, 20, 40, 60, 80, 100]
     track = [
         Point(
             lat=REF_LAT,
-            lon=REF_LON + m_to_dlon(d),  # offset east by d metres
+            lon=REF_LON + m_to_dlon(d),
             ts=base.replace(microsecond=0) + timedelta(seconds=i),
         )
         for i, d in enumerate(distances)
     ]
 
-    passes = compute_passes([mark], track)
+    passes = compute_passes([mark], track, threshold_m=DEFAULT_INSHORE_THRESHOLD_M)
 
     assert len(passes) == 1
-    # Closest-approach sample is at index 4 (5m from mark).
-    assert passes[0].ts == track[4].ts
-    # And the emitted lat/lon reflects that sample, not the exit.
+    assert passes[0].ts == track[4].ts  # the 5-metre sample
     assert passes[0].lon == track[4].lon
 
 
-def test_per_mark_radii_are_honored():
-    """A two-mark course with [30, 100] radii: the boat passes 50m
-    from mark 0 (outside its 30m zone — no fire) and 80m from mark 1
-    (inside its 100m zone — fires).
+# ─── Parameter validation ─────────────────────────────────────────────
 
-    This is the basis for ``radii_for_course`` giving the final mark
-    a wider zone."""
+
+def test_threshold_must_be_positive():
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([Mark(REF_LAT, REF_LON)], threshold_m=0)
+
+
+def test_radius_kw_back_compat():
+    """Old ``radius_m`` keyword still accepted (maps to threshold_m)."""
+    mark = Mark(REF_LAT, REF_LON)
+    track = line_through(mark, closest_m=20.0)
+    passes = compute_passes([mark], track, radius_m=100.0)
+    assert len(passes) == 1
+
+
+def test_per_mark_threshold_length_mismatch_rejects():
     a = Mark(REF_LAT, REF_LON)
-    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
-    b = Mark(b_lat, b_lon)
-
-    # 50m closest approach to A — outside its 30m radius.
-    leg1 = line_through(a, closest_m=50.0, t0=0.0)
-    # 80m closest approach to B — outside default 50m but INSIDE its
-    # custom 100m radius.
-    leg2 = line_through(b, closest_m=80.0, t0=200.0)
-
-    det = MarkRoundingDetector([a, b], radius_m=[30.0, 100.0])
-    passes = det.feed_batch(leg1 + leg2)
-
-    # A never fires (closest approach was outside its radius), but
-    # because A is the gate, B can't fire either — strict-order rule.
-    assert passes == []
-    assert det.next_mark_index == 0
+    b = Mark(REF_LAT + 0.01, REF_LON)
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], threshold_m=[100.0])
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], threshold_m=[100.0, 100.0, 100.0])
 
 
-def test_per_mark_radii_widen_final_only():
-    """The router pattern: intermediate marks 50m, final mark 75m.
-
-    A boat that nicks the final mark at 70m (outside 50m, inside 75m)
-    should fire only when the per-mark radii list is used."""
+def test_per_mark_thresholds_must_all_be_positive():
     a = Mark(REF_LAT, REF_LON)
-    b_lat, b_lon = _offset(REF_LAT, REF_LON, bearing_deg=0.0, dist_m=500.0)
-    b = Mark(b_lat, b_lon)
-
-    # Round A cleanly so the detector advances to B.
-    leg1 = line_through(a, closest_m=10.0, t0=0.0)
-    # Then a 70m pass at the final mark — between 50m and 75m.
-    leg2 = line_through(b, closest_m=70.0, t0=200.0)
-
-    # With the scalar default 50m, B is missed.
-    scalar_passes = compute_passes([a, b], leg1 + leg2)
-    assert [p.mark_index for p in scalar_passes] == [0]
-
-    # With the per-mark radii from radii_for_course (50, 75), B fires.
-    radii_passes = compute_passes([a, b], leg1 + leg2, radius_m=radii_for_course(2))
-    assert [p.mark_index for p in radii_passes] == [0, 1]
+    b = Mark(REF_LAT + 0.01, REF_LON)
+    with pytest.raises(ValueError):
+        MarkRoundingDetector([a, b], threshold_m=[100.0, 0.0])
 
 
-def test_radii_for_course_shape():
-    """Single-mark course: just the FINAL_MARK_RADIUS_M.
-    Multi-mark course: DEFAULT for all but the last, FINAL for the last."""
-    assert radii_for_course(0) == []
-    assert radii_for_course(1) == [FINAL_MARK_RADIUS_M]
-    assert radii_for_course(3) == [
-        DEFAULT_RADIUS_M,
-        DEFAULT_RADIUS_M,
-        FINAL_MARK_RADIUS_M,
+def test_depart_confirm_samples_must_be_positive():
+    with pytest.raises(ValueError):
+        MarkRoundingDetector(
+            [Mark(REF_LAT, REF_LON)], depart_confirm_samples=0,
+        )
+
+
+# ─── thresholds_for_course / back-compat aliases ──────────────────────
+
+
+def test_thresholds_for_course_distance_mode():
+    """Multi-mark distance course: DEFAULT_DISTANCE for intermediate
+    marks, +FINAL_MARK_BONUS_M for the final."""
+    out = thresholds_for_course(4, mode="distance")
+    assert out == [
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M + FINAL_MARK_BONUS_M,
     ]
 
 
-def test_per_mark_radii_length_mismatch_rejects():
-    """Mismatched per-mark radii length should fail loudly at
-    construction, not silently drop a mark."""
-    a = Mark(REF_LAT, REF_LON)
-    b = Mark(REF_LAT + 0.01, REF_LON)
-    with pytest.raises(ValueError):
-        MarkRoundingDetector([a, b], radius_m=[50.0])
-    with pytest.raises(ValueError):
-        MarkRoundingDetector([a, b], radius_m=[50.0, 50.0, 50.0])
+def test_thresholds_for_course_inshore_mode():
+    out = thresholds_for_course(3, mode="inshore")
+    assert out == [
+        DEFAULT_INSHORE_THRESHOLD_M,
+        DEFAULT_INSHORE_THRESHOLD_M,
+        DEFAULT_INSHORE_THRESHOLD_M + FINAL_MARK_BONUS_M,
+    ]
 
 
-def test_per_mark_radii_must_all_be_positive():
-    a = Mark(REF_LAT, REF_LON)
-    b = Mark(REF_LAT + 0.01, REF_LON)
-    with pytest.raises(ValueError):
-        MarkRoundingDetector([a, b], radius_m=[50.0, 0.0])
+def test_thresholds_for_course_unknown_mode_defaults_to_distance():
+    out = thresholds_for_course(2, mode="nonsense")
+    assert out == [
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M + FINAL_MARK_BONUS_M,
+    ]
 
 
-def test_final_mark_radius_constant():
-    """Tripwire on the documented final-mark radius. If someone bumps
-    it without updating the docs, this test surfaces it loudly."""
-    assert FINAL_MARK_RADIUS_M == 75.0
+def test_thresholds_for_course_edge_cases():
+    assert thresholds_for_course(0) == []
+    assert thresholds_for_course(1) == [
+        DEFAULT_DISTANCE_THRESHOLD_M + FINAL_MARK_BONUS_M,
+    ]
+
+
+def test_radii_for_course_back_compat_returns_distance_thresholds():
+    """``radii_for_course`` is a legacy alias — defaults to distance-mode
+    thresholds for safety (missing a mark is worse than tripping early
+    on a tight inshore course, and sequential ordering protects
+    against the false-positive case in practice)."""
+    out = radii_for_course(3)
+    assert out == [
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M,
+        DEFAULT_DISTANCE_THRESHOLD_M + FINAL_MARK_BONUS_M,
+    ]
+
+
+def test_threshold_constants_tripwire():
+    """Surfaces accidental constant changes. Bump these only with a
+    matching docstring / migration plan."""
+    assert DEFAULT_DISTANCE_THRESHOLD_M == 250.0
+    assert DEFAULT_INSHORE_THRESHOLD_M == 100.0
+    assert FINAL_MARK_BONUS_M == 50.0
+    assert DEPART_CONFIRM_SAMPLES == 3
+    # Legacy aliases must keep mapping to the inshore numbers so anyone
+    # still importing the old names gets the same threshold they had
+    # under v2's "intermediate=50, final=75" policy upgraded to "100/150".
+    # (v2 50/75 was too tight for ANY real racing; v3 100/150 is the
+    # right inshore default.)
+    assert DEFAULT_RADIUS_M == DEFAULT_INSHORE_THRESHOLD_M
+    assert FINAL_MARK_RADIUS_M == DEFAULT_INSHORE_THRESHOLD_M + FINAL_MARK_BONUS_M
+
+
+# ─── Real-world fixture: 2026-05-30 Colors (Bravo) ───────────────────
+
+
+def _load_garmin_gpx(path: Path) -> list[Point]:
+    """Parse a Garmin Connect GPX track into detector Points."""
+    ns = {"g": "http://www.topografix.com/GPX/1/1"}
+    tree = ET.parse(path)
+    out: list[Point] = []
+    for tp in tree.iter("{http://www.topografix.com/GPX/1/1}trkpt"):
+        lat = float(tp.get("lat"))
+        lon = float(tp.get("lon"))
+        t_el = tp.find("g:time", ns)
+        ts = datetime.fromisoformat(t_el.text.replace("Z", "+00:00"))
+        out.append(Point(lat=lat, lon=lon, ts=ts))
+    return out
+
+
+# Marks from the 2026-05-30 Colors (Bravo) race row, in order.
+_BRAVO_MARKS = [
+    Mark(41.880000, -87.574333),   # Start
+    Mark(41.962333, -87.540000),   # CCYC E2
+    Mark(42.002000, -87.551167),   # CCYC T
+    Mark(41.966667, -87.591667),   # Wilson Crib
+    Mark(41.916667, -87.571667),   # Harrison-Dever Crib
+    Mark(41.892500, -87.563000),   # Purdue Met Buoy 1A
+    Mark(41.880000, -87.574330),   # Finish
+]
+
+
+def _bravo_fixture_path() -> Path:
+    """The 2026-05-30 Garmin track lives under backend/tests/fixtures.
+    Test is skipped if not present (the fixture lives outside CI for
+    privacy until a redacted version is checked in)."""
+    return Path(__file__).parent / "fixtures" / "colors_bravo_20260530.gpx"
+
+
+@pytest.mark.skipif(
+    not _bravo_fixture_path().exists(),
+    reason="Bravo fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_real_world_colors_bravo_detects_all_seven_marks():
+    """Canonical real-world regression: the 2026-05-30 Colors (Bravo)
+    distance race that v2 recorded zero passes for. v3 in distance mode
+    must detect 7/7 marks in order. If this drops, something regressed
+    in either the algorithm or the threshold defaults."""
+    points = _load_garmin_gpx(_bravo_fixture_path())
+    thresholds = thresholds_for_course(len(_BRAVO_MARKS), mode="distance")
+    passes = compute_passes(_BRAVO_MARKS, points, threshold_m=thresholds)
+    assert [p.mark_index for p in passes] == list(range(len(_BRAVO_MARKS)))
+    # Each pass must come strictly after the previous.
+    for i in range(1, len(passes)):
+        assert passes[i].ts > passes[i - 1].ts
+
+
+@pytest.mark.skipif(
+    not _bravo_fixture_path().exists(),
+    reason="Bravo fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_real_world_colors_bravo_inshore_mode_misses_distance_passes():
+    """Same track in inshore (100 m) mode misses the wide passage
+    marks. Documents the difference between modes and explains why the
+    router must pass the race's mode through to the detector."""
+    points = _load_garmin_gpx(_bravo_fixture_path())
+    thresholds = thresholds_for_course(len(_BRAVO_MARKS), mode="inshore")
+    passes = compute_passes(_BRAVO_MARKS, points, threshold_m=thresholds)
+    # Inshore mode catches the near-shore marks but misses Harrison-
+    # Dever (208 m wide pass) — detection stalls at index 4 onwards.
+    detected = [p.mark_index for p in passes]
+    assert detected == [0, 1, 2, 3]

@@ -68,7 +68,7 @@ from app.services.mark_rounding import (
     Mark as DetectorMark,
     MarkRoundingDetector,
     Point as DetectorPoint,
-    radii_for_course,
+    thresholds_for_course,
 )
 
 log = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ async def load_race_for_ingest(
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
         f"""
-        SELECT r.marks, r.mark_passes, r.started_at, r.start_at
+        SELECT r.marks, r.mark_passes, r.started_at, r.start_at, r.mode
         FROM race_sessions r
         WHERE r.id = $1 AND {pred}
         """,
@@ -132,6 +132,9 @@ async def load_race_for_ingest(
         "mark_passes": passes,
         "started_at": row["started_at"],
         "start_at": row["start_at"],
+        # v3 mark-detection thresholds vary by mode. Default to "distance"
+        # (the wider tolerance) when the column is somehow NULL.
+        "mode": row["mode"] or "distance",
     }
 
 
@@ -192,6 +195,7 @@ async def detect_and_persist_new_passes(
     new_points: Iterable[DetectorPoint],
     started_at: Optional[datetime] = None,
     start_at: Optional[datetime] = None,
+    mode: str = "distance",
 ) -> tuple[list[dict], list[dict]]:
     """Run the detector over a single batch, persist new passes, return
     ``(all_passes, new_passes)`` as plain JSONB-shaped dicts.
@@ -216,11 +220,13 @@ async def detect_and_persist_new_passes(
     Auth: the caller MUST have already gone through
     :func:`load_race_for_ingest` so the UPDATE-by-id below is safe.
 
-    Per-mark radii: the detector is constructed with
-    :func:`radii_for_course`, which gives the final mark the wider
-    ``FINAL_MARK_RADIUS_M`` zone (75 m vs 50 m for intermediate
-    marks). Centralised in mark_rounding.py so changing the policy
-    doesn't require touching the router.
+    Per-mark thresholds: the detector is constructed with
+    :func:`thresholds_for_course(n, mode)`. Distance-mode races get
+    250 m (intermediate) / 300 m (final), inshore-mode races get
+    100 m / 150 m. The wider distance thresholds are required for
+    races past passage marks the boat doesn't actually round (cribs,
+    met buoys) — see ``sailline-docs/2026-05-30_session.md`` for the
+    Colors (Bravo) post-mortem that motivated v3.
     """
     detector_marks = _build_detector_marks(marks)
 
@@ -262,7 +268,7 @@ async def detect_and_persist_new_passes(
 
     det = MarkRoundingDetector(
         detector_marks,
-        radius_m=radii_for_course(len(detector_marks)),
+        threshold_m=thresholds_for_course(len(detector_marks), mode=mode),
         next_mark_index=next_idx,
     )
     new_pass_objs = det.feed_batch(new_points)

@@ -304,6 +304,7 @@ async def post_telemetry(
                     new_points=detector_points,
                     started_at=race["started_at"],
                     start_at=race["start_at"],
+                    mode=race["mode"],
                 )
             else:
                 # No GPS in this flush — preserve the existing pass list

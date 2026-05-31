@@ -19,10 +19,21 @@ export type RaceMark = {
   rounding?: "P" | "S" | null;
 };
 
-/** Recorded passage of a mark during a sailed race. */
+/** Recorded passage of a mark during a sailed race. Mirrors the
+ *  backend's `MarkPassOut` model + the JSONB shape on
+ *  `race_sessions.mark_passes`.
+ *
+ *  v3 (2026-05-30): added `source` so manual passes (via the in-race
+ *  Pass button or watch notification) can be distinguished from
+ *  auto-detected ones. Older rows lack the field; treat absent as
+ *  "auto" for back-compat.
+ */
 export type MarkPass = {
   mark_index: number;
-  passed_at: string; // ISO timestamp
+  ts: string; // ISO timestamp (closest-point-of-approach)
+  lat: number;
+  lon: number;
+  source?: "auto" | "manual";
 };
 
 /** Race row as returned by GET /api/races and /api/races/{id}. */

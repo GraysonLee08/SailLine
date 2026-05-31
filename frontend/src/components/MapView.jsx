@@ -217,6 +217,10 @@ export function MapView({
     recording: recorder.recording,
     enabled: activeRace?.auto_start_enabled !== false,
     stop: recorder.stop,
+    // v3 detector — pass mode so client thresholds match server's.
+    // Distance races: 250 m intermediate / 300 m final. Inshore:
+    // 100 m / 150 m. See packages/shared/src/markRounding.js.
+    mode: activeRace?.mode === "inshore" ? "inshore" : "distance",
     // Surface the auto-stop event so AppView can navigate to the
     // stats view as soon as recording cuts off. The Cloud Run Job
     // is already in flight by this point (final-mark trigger in
@@ -881,7 +885,17 @@ function RaceOverlay({
             onClick={routing.compute}
           />
         )}
-        {RECORDING_ENABLED && (
+        {/* Stop button must stay reachable even when RECORDING_ENABLED
+            is false. Without it, a recorder that armed via the always-
+            mounted useAutoStartRecorder hook (the pragmatic-gate design
+            from 2026-05-29) can run forever with no way for the user
+            to end it — that's exactly what happened on 2026-05-30
+            (Colors Bravo, no ended_at). Logic:
+              * If currently recording → ALWAYS show the Stop button.
+              * If not recording → only show the Start button when the
+                flag is on (so production webapp doesn't expose a
+                manual Start when mobile owns recording). */}
+        {(RECORDING_ENABLED || recording) && (
         <button
           onClick={onToggleRecord}
           className={recording ? "" : "glass-button--dark"}

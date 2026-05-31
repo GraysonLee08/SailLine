@@ -73,6 +73,7 @@ async def test_load_race_for_ingest_returns_parsed_jsonb(conn):
         "mark_passes": passes,
         "started_at": None,
         "start_at": None,
+        "mode": "distance",
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -90,6 +91,7 @@ async def test_load_race_for_ingest_parses_string_jsonb(conn):
         "mark_passes": json.dumps([]),
         "started_at": None,
         "start_at": None,
+        "mode": "distance",
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -106,6 +108,7 @@ async def test_load_race_for_ingest_handles_null_jsonb(conn):
         "mark_passes": None,
         "started_at": None,
         "start_at": None,
+        "mode": "distance",
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -132,6 +135,7 @@ async def test_load_race_for_ingest_uses_write_predicate(conn):
         "mark_passes": [],
         "started_at": None,
         "start_at": None,
+        "mode": "distance",
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")

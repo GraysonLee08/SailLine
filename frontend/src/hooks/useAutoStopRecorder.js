@@ -27,7 +27,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { computePasses, radiiForCourse } from "@sailline/shared";
+import { computePasses, thresholdsForCourse } from "@sailline/shared";
 
 const AUTO_STOP_DELAY_MS = 5 * 60 * 1000;
 
@@ -39,6 +39,7 @@ export function useAutoStopRecorder({
   stop,
   enabled = true,
   onFired = null,
+  mode = "distance",
 }) {
   // Recompute mark passes whenever points change. computePasses is
   // pure and cheap: O(points * marks). At 1 Hz over a 4-hour race
@@ -53,12 +54,18 @@ export function useAutoStopRecorder({
       )
       .map((m) => ({ lat: m.lat, lon: m.lon }));
     if (cleanMarks.length < 2) return [];
-    // Per-mark radii: intermediate marks at DEFAULT (50m), final at
-    // FINAL_MARK_RADIUS_M (75m). Matches what the server-side router
-    // uses so the client banner and the authoritative server passes
-    // agree on when the finish fired.
-    return computePasses(cleanMarks, points, radiiForCourse(cleanMarks.length));
-  }, [marks, points, recording, enabled]);
+    // Per-mark thresholds via thresholdsForCourse(n, mode). Matches
+    // what the server-side router uses so the client banner and the
+    // authoritative server passes agree on when the finish fired.
+    // Default mode is "distance" — wider tolerance, safer when the
+    // caller forgot to pass the race mode (won't trip prematurely
+    // because sequential ordering still protects us).
+    return computePasses(
+      cleanMarks,
+      points,
+      thresholdsForCourse(cleanMarks.length, mode),
+    );
+  }, [marks, points, recording, enabled, mode]);
 
   // Gate condition: both the last and second-to-last marks rounded.
   const courseLen = Array.isArray(marks) ? marks.length : 0;
