@@ -46,7 +46,35 @@ def fake_user():
 
 @pytest.fixture
 def mock_conn():
-    return AsyncMock()
+    """Mock asyncpg.Connection.
+
+    Since the 2026-06-01 idempotency rework:
+      * The GPS INSERT calls ``conn.fetch`` (not ``execute``) with
+        ``ON CONFLICT DO NOTHING RETURNING 1`` so the handler can count
+        actually-landed rows. Default fixture pretends every row landed
+        — tests that need partial-duplicate behaviour override
+        ``mock_conn.fetch.side_effect``.
+      * The handler wraps its work in ``conn.transaction()`` so the
+        ``FOR UPDATE`` row lock from ``load_race_for_ingest`` is held
+        across the read-modify-write of ``mark_passes``.
+    """
+    conn = AsyncMock()
+
+    async def _fetch_all_landed(sql: str, *args, **kwargs):
+        if "INSERT INTO track_points" in sql:
+            # The unnested recorded_at array is at args[1] (after
+            # race_id at args[0]). Default to "every row landed."
+            if len(args) >= 2 and isinstance(args[1], list):
+                return [{"?column?": 1}] * len(args[1])
+        return []
+
+    conn.fetch = AsyncMock(side_effect=_fetch_all_landed)
+
+    # `async with conn.transaction():` — transaction() is sync, returns
+    # an async context manager. AsyncMock auto-supports __aenter__ /
+    # __aexit__, so a single AsyncMock() satisfies the context.
+    conn.transaction = MagicMock(return_value=AsyncMock())
+    return conn
 
 
 @pytest.fixture
@@ -112,6 +140,13 @@ def _sample_points(n=3, start=None):
 
 
 def test_post_batch_inserts(client, mock_conn):
+    """Plain bulk INSERT path.
+
+    After 2026-06-01 the INSERT runs via ``conn.fetch`` (RETURNING 1
+    for the idempotency contract) and the handler reports the rows
+    that actually landed. Default fixture pretends every sent row
+    landed — see the ``mock_conn`` fixture docstring.
+    """
     mock_conn.fetchrow.return_value = _race_row(
         marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
     )
@@ -126,12 +161,14 @@ def test_post_batch_inserts(client, mock_conn):
     assert body["new_mark_passes"] == []
     assert body["mark_passes"] == []
     mock_conn.fetchrow.assert_awaited_once()
-    mock_conn.execute.assert_awaited_once()
-    args = mock_conn.execute.await_args.args
+    mock_conn.fetch.assert_awaited_once()
+    args = mock_conn.fetch.await_args.args
     sql = args[0]
     assert "INSERT INTO track_points" in sql
     assert "unnest" in sql.lower()
     assert "ST_SetSRID(ST_MakePoint" in sql
+    assert "ON CONFLICT (session_id, recorded_at) DO NOTHING" in sql
+    assert "RETURNING 1" in sql
     assert args[1] == race_id
     for arr in args[2:]:
         assert len(arr) == 5
@@ -169,6 +206,7 @@ def test_post_404_when_race_not_owned(client, mock_conn):
     )
 
     assert r.status_code == 404
+    mock_conn.fetch.assert_not_awaited()
     mock_conn.execute.assert_not_awaited()
 
 
@@ -201,7 +239,7 @@ def test_post_accepts_missing_speed_and_heading(client, mock_conn):
 
     assert r.status_code == 201
     assert r.json()["inserted"] == 1
-    args = mock_conn.execute.await_args.args
+    args = mock_conn.fetch.await_args.args
     speeds, headings = args[5], args[6]
     assert speeds == [None]
     assert headings == [None]
@@ -236,8 +274,11 @@ def test_post_emits_mark_pass_when_batch_rounds_a_mark(client, mock_conn):
     assert len(body["new_mark_passes"]) == 1
     assert body["new_mark_passes"][0]["mark_index"] == 0
     assert body["mark_passes"] == body["new_mark_passes"]
-    assert mock_conn.execute.await_count == 2
-    update_call = mock_conn.execute.await_args_list[1].args
+    # After 2026-06-01 idempotency change: fetch=1 (GPS INSERT
+    # RETURNING 1), execute=1 (mark-pass UPDATE only).
+    assert mock_conn.fetch.await_count == 1
+    assert mock_conn.execute.await_count == 1
+    update_call = mock_conn.execute.await_args.args
     assert "UPDATE race_sessions" in update_call[0]
     assert "mark_passes" in update_call[0]
     persisted = json.loads(update_call[1])
@@ -246,6 +287,11 @@ def test_post_emits_mark_pass_when_batch_rounds_a_mark(client, mock_conn):
 
 
 def test_post_skips_update_when_no_new_passes(client, mock_conn):
+    """No mark passes detected → no UPDATE on race_sessions.
+
+    Call topology after 2026-06-01: fetch=1 (GPS INSERT only),
+    execute=0 (no UPDATE because no passes detected).
+    """
     mock_conn.fetchrow.return_value = _race_row(
         marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}],
         mark_passes=[],
@@ -254,7 +300,8 @@ def test_post_skips_update_when_no_new_passes(client, mock_conn):
         f"/api/races/{uuid4()}/track", json={"points": _sample_points(3)}
     )
     assert r.status_code == 201
-    assert mock_conn.execute.await_count == 1
+    assert mock_conn.fetch.await_count == 1
+    assert mock_conn.execute.await_count == 0
 
 
 def test_post_resumes_from_existing_passes(client, mock_conn):
@@ -334,9 +381,11 @@ def test_post_backfills_started_at_when_null(client, mock_conn):
     points = _finish_pass_points()
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
     assert r.status_code == 201
-    # Two execs: INSERT track_points + the combined UPDATE.
-    assert mock_conn.execute.await_count == 2
-    update_call = mock_conn.execute.await_args_list[1]
+    # After 2026-06-01: fetch=1 (INSERT track_points RETURNING 1),
+    # execute=1 (the combined mark-pass + started_at UPDATE).
+    assert mock_conn.fetch.await_count == 1
+    assert mock_conn.execute.await_count == 1
+    update_call = mock_conn.execute.await_args
     sql = update_call.args[0]
     assert "started_at = " in sql
     # start_at value should be in the args list.
@@ -357,7 +406,7 @@ def test_post_does_not_overwrite_started_at_when_already_set(client, mock_conn):
     points = _finish_pass_points()
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
     assert r.status_code == 201
-    update_call = mock_conn.execute.await_args_list[1]
+    update_call = mock_conn.execute.await_args
     sql = update_call.args[0]
     assert "started_at" not in sql
 
@@ -376,7 +425,7 @@ def test_post_does_not_write_started_at_when_start_at_null(client, mock_conn):
     assert r.status_code == 201
     # Mark pass still fires, so there's still an UPDATE — just no
     # started_at column.
-    update_call = mock_conn.execute.await_args_list[1]
+    update_call = mock_conn.execute.await_args
     sql = update_call.args[0]
     assert "started_at" not in sql
 
@@ -390,7 +439,7 @@ def test_post_writes_ended_at_when_final_mark_rounded(client, mock_conn):
     points = _finish_pass_points()
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
     assert r.status_code == 201
-    update_call = mock_conn.execute.await_args_list[1]
+    update_call = mock_conn.execute.await_args
     sql = update_call.args[0]
     assert "ended_at = COALESCE(ended_at," in sql
     # The pass timestamp landed in the args.
@@ -427,7 +476,7 @@ def test_post_does_not_write_ended_at_on_intermediate_mark(client, mock_conn):
     ]
     r = client.post(f"/api/races/{uuid4()}/track", json={"points": points})
     assert r.status_code == 201
-    update_call = mock_conn.execute.await_args_list[1]
+    update_call = mock_conn.execute.await_args
     sql = update_call.args[0]
     assert "ended_at" not in sql
 
@@ -523,6 +572,9 @@ def test_get_returns_chronological_track(client, mock_conn):
         for i in range(3)
     ]
     mock_conn.fetchrow.return_value = _owned()
+    # GET replay reads track_points (not INSERT) — clear the
+    # fixture's INSERT-aware side_effect and use return_value.
+    mock_conn.fetch.side_effect = None
     mock_conn.fetch.return_value = rows
 
     r = client.get(f"/api/races/{race_id}/track")
@@ -550,9 +602,107 @@ def test_get_404_when_race_not_owned(client, mock_conn):
 
 def test_get_returns_empty_list_for_unrecorded_race(client, mock_conn):
     mock_conn.fetchrow.return_value = _owned()
+    mock_conn.fetch.side_effect = None
     mock_conn.fetch.return_value = []
 
     r = client.get(f"/api/races/{uuid4()}/track")
 
     assert r.status_code == 200
     assert r.json() == []
+
+
+# --- Idempotency + concurrency (2026-06-01, migration 0018) ----------
+
+
+def test_post_reports_actual_landed_count(client, mock_conn):
+    """ON CONFLICT skipped rows must not be counted in ``inserted``.
+
+    A re-sent batch with some-already-stored points returns 200 with
+    ``inserted`` equal to the rows that newly landed — not the rows
+    sent. The durable-queue recorder uses this to decide what to drop
+    from its local buffer.
+    """
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+
+    async def _half_landed(sql: str, *args, **kwargs):
+        if "INSERT INTO track_points" in sql:
+            return [{"?column?": 1}, {"?column?": 1}]
+        return []
+
+    mock_conn.fetch.side_effect = _half_landed
+
+    r = client.post(
+        f"/api/races/{uuid4()}/track",
+        json={"points": _sample_points(4)},
+    )
+
+    assert r.status_code == 201
+    assert r.json()["inserted"] == 2
+
+
+def test_post_reports_zero_when_full_duplicate_batch(client, mock_conn):
+    """A fully-duplicate re-send returns 200 + inserted=0. The recover-
+    from-lost-ack path: server committed but the response never reached
+    the client; the retry safely no-ops at the DB layer."""
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+
+    async def _all_duplicates(sql: str, *args, **kwargs):
+        if "INSERT INTO track_points" in sql:
+            return []
+        return []
+
+    mock_conn.fetch.side_effect = _all_duplicates
+
+    r = client.post(
+        f"/api/races/{uuid4()}/track",
+        json={"points": _sample_points(3)},
+    )
+
+    assert r.status_code == 201
+    assert r.json()["inserted"] == 0
+
+
+def test_post_load_uses_for_update(client, mock_conn):
+    """The race-row read MUST acquire ``FOR UPDATE`` so concurrent
+    batches against the same race serialize on the row lock.
+
+    Without ``FOR UPDATE`` the read-modify-write on ``mark_passes``
+    can race when the recorder's durable queue retries a batch in
+    parallel with a fresh online batch — both reads see the same
+    starting passes list, both compute new passes, and the second
+    UPDATE overwrites the first.
+    """
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+
+    r = client.post(
+        f"/api/races/{uuid4()}/track",
+        json={"points": _sample_points(1)},
+    )
+
+    assert r.status_code == 201
+    auth_sql = mock_conn.fetchrow.await_args.args[0]
+    assert "FOR UPDATE" in auth_sql
+
+
+def test_post_wraps_work_in_transaction(client, mock_conn):
+    """The handler must open ``conn.transaction()`` so the FOR UPDATE
+    lock held by ``load_race_for_ingest`` persists across the INSERT
+    and the mark-pass UPDATE."""
+    mock_conn.fetchrow.return_value = _race_row(
+        marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}]
+    )
+
+    r = client.post(
+        f"/api/races/{uuid4()}/track",
+        json={"points": _sample_points(1)},
+    )
+
+    assert r.status_code == 201
+    # transaction() must have been called exactly once.
+    assert mock_conn.transaction.call_count == 1

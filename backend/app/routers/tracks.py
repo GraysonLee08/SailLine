@@ -25,6 +25,20 @@ Bulk insert uses unnest on parallel arrays in a single statement -
 faster than executemany for the 30s/100-point batch sizes the
 recorder produces, and keeps the round trip count at 1 per flush.
 
+Idempotency (added 2026-06-01, migration 0018): the INSERT uses
+``ON CONFLICT (session_id, recorded_at) DO NOTHING`` so a re-sent
+batch from the recorder's offline queue lands the new rows and
+silently skips duplicates. ``inserted`` in the response reports the
+ACTUAL landed count via ``RETURNING 1``, not the batch size — so a
+client whose response was lost in flight can re-send and tell the
+batch was committed without creating duplicate rows.
+
+The whole batch (INSERT + race row read + mark-pass UPDATE) now runs
+inside ``conn.transaction()`` so the ``FOR UPDATE`` row lock that
+``load_race_for_ingest`` acquires holds for the read-modify-write of
+``mark_passes``. Two concurrent batches against the same race
+serialize cleanly instead of stomping each other.
+
 Mark-rounding side effects (detect, persist new passes, trigger
 post-process job at the final mark) are delegated to
 ``app.services.track_ingest`` so the same behaviour applies whether
@@ -141,49 +155,64 @@ async def append_track(
         speeds.append(p.speed_kts)
         headings.append(p.heading_deg)
 
+    inserted_count = 0
     async with pool.acquire() as conn:
-        race = await load_race_for_ingest(conn, race_id, user["uid"])
+        # Wrap the load + INSERT + detect-and-update in a single
+        # transaction so the FOR UPDATE row lock acquired inside
+        # load_race_for_ingest holds across the whole read-modify-write
+        # on race_sessions.mark_passes. Without the transaction the
+        # SELECT FOR UPDATE releases its lock at statement boundary and
+        # two concurrent batches can race on the JSONB update.
+        async with conn.transaction():
+            race = await load_race_for_ingest(conn, race_id, user["uid"])
 
-        await conn.execute(
-            """
-            INSERT INTO track_points
-                (session_id, recorded_at, position, speed_kts, heading_deg)
-            SELECT
-                $1::uuid,
-                t.recorded_at,
-                ST_SetSRID(ST_MakePoint(t.lon, t.lat), 4326)::geography,
-                t.speed_kts,
-                t.heading_deg
-            FROM unnest(
-                $2::timestamptz[],
-                $3::float8[],
-                $4::float8[],
-                $5::float8[],
-                $6::float8[]
-            ) AS t(recorded_at, lat, lon, speed_kts, heading_deg)
-            """,
-            race_id,
-            recorded_ats,
-            lats,
-            lons,
-            speeds,
-            headings,
-        )
+            inserted_rows = await conn.fetch(
+                """
+                INSERT INTO track_points
+                    (session_id, recorded_at, position, speed_kts, heading_deg)
+                SELECT
+                    $1::uuid,
+                    t.recorded_at,
+                    ST_SetSRID(ST_MakePoint(t.lon, t.lat), 4326)::geography,
+                    t.speed_kts,
+                    t.heading_deg
+                FROM unnest(
+                    $2::timestamptz[],
+                    $3::float8[],
+                    $4::float8[],
+                    $5::float8[],
+                    $6::float8[]
+                ) AS t(recorded_at, lat, lon, speed_kts, heading_deg)
+                ON CONFLICT (session_id, recorded_at) DO NOTHING
+                RETURNING 1
+                """,
+                race_id,
+                recorded_ats,
+                lats,
+                lons,
+                speeds,
+                headings,
+            )
+            inserted_count = len(inserted_rows)
 
-        detector_points = (
-            DetectorPoint(lat=p.lat, lon=p.lon, ts=p.recorded_at)
-            for p in payload.points
-        )
-        all_passes, new_passes = await detect_and_persist_new_passes(
-            conn,
-            race_id=race_id,
-            marks=race["marks"],
-            existing_passes=race["mark_passes"],
-            new_points=detector_points,
-            started_at=race["started_at"],
-            start_at=race["start_at"],
-            mode=race["mode"],
-        )
+            # Detector input is the FULL batch (see /telemetry note).
+            # Mark detection self-dedupes on next-mark-index, so a
+            # re-sent point past an already-rounded mark can't re-emit
+            # a pass — safe to feed every point through.
+            detector_points = (
+                DetectorPoint(lat=p.lat, lon=p.lon, ts=p.recorded_at)
+                for p in payload.points
+            )
+            all_passes, new_passes = await detect_and_persist_new_passes(
+                conn,
+                race_id=race_id,
+                marks=race["marks"],
+                existing_passes=race["mark_passes"],
+                new_points=detector_points,
+                started_at=race["started_at"],
+                start_at=race["start_at"],
+                mode=race["mode"],
+            )
 
     # Final-mark trigger lives outside the conn block so a job failure
     # can't rollback the pass persistence. The trigger itself is fully
@@ -193,8 +222,12 @@ async def append_track(
         race_id, race["marks"], all_passes, new_passes,
     )
 
+    # inserted reports the rows that ACTUALLY landed in track_points,
+    # not the rows the client sent. A re-sent batch returns
+    # ``inserted=0`` even though all the points were already stored —
+    # the client treats that as "batch committed, drop from queue."
     return TrackBatchAccepted(
-        inserted=n,
+        inserted=inserted_count,
         mark_passes=[MarkPassOut(**p) for p in all_passes],
         new_mark_passes=[MarkPassOut(**p) for p in new_passes],
     )

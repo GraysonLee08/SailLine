@@ -145,6 +145,30 @@ async def test_load_race_for_ingest_uses_write_predicate(conn):
     assert "bc.role IN ('owner', 'crew')" in sql
 
 
+async def test_load_race_for_ingest_acquires_for_update(conn):
+    """The loader MUST request ``FOR UPDATE`` so concurrent batches
+    against the same race serialize on the row lock.
+
+    Regression guard for the 2026-06-01 concurrency fix. Without the
+    lock, two overlapping batches (common once the recorder's durable
+    queue retries are landing in parallel with fresh online batches)
+    can read the same starting ``mark_passes`` and the second UPDATE
+    overwrites the first.
+    """
+    conn.fetchrow.return_value = {
+        "marks": [],
+        "mark_passes": [],
+        "started_at": None,
+        "start_at": None,
+        "mode": "distance",
+    }
+
+    await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
+
+    sql = conn.fetchrow.await_args.args[0]
+    assert "FOR UPDATE" in sql
+
+
 # ─── detect_and_persist_new_passes ────────────────────────────────────
 
 

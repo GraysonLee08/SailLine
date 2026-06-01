@@ -21,13 +21,18 @@ record telemetry on shared boats (matches the D3 sharing model).
 Cross-user / viewer access returns 404 (not 403, to avoid leaking
 race existence).
 
-Idempotency: the endpoint is *not* idempotent on duplicate flushes —
-a re-sent batch from the offline queue inserts duplicate rows. We
-accept this in v1 because deduping in Postgres on a high-rate hot
-path is more expensive than the storage cost of the duplicates, and
-read-side queries can dedupe on (session_id, recorded_at). v2: a
-unique index + ``ON CONFLICT DO NOTHING`` if duplicates become
-material.
+Idempotency: the endpoint IS idempotent on duplicate flushes (as of
+migration 0018, 2026-06-01). Both ``track_points`` and ``imu_samples``
+have a UNIQUE (session_id, recorded_at) constraint, and the INSERT
+statements use ``ON CONFLICT (session_id, recorded_at) DO NOTHING``.
+A re-sent batch from the durable-queue recorder lands the new rows
+and silently skips any duplicates. The ack's ``gps_inserted`` /
+``imu_inserted`` report the count of rows ACTUALLY inserted (via
+``RETURNING 1``), not the batch size — so a client whose response
+was lost in flight can re-send the same batch, see ``gps_inserted=0``
+on the second 200, and treat the batch as committed without creating
+duplicates. This is the foundation for the Phase 4 native-uploader
+rework (see ``sailline-docs/2026-06-01_durable-upload-pipeline-plan.md``).
 
 Sign conventions (apply consistently across client + server + UI):
 
@@ -256,13 +261,21 @@ async def post_telemetry(
                 # column is ``position`` (migration 0002) — NOT
                 # ``location``. PostGIS ST_MakePoint takes (lon, lat),
                 # the opposite of most APIs.
+                #
+                # ON CONFLICT (session_id, recorded_at) DO NOTHING makes
+                # the endpoint idempotent — see module docstring. We use
+                # ``fetch`` + ``RETURNING 1`` instead of ``execute`` so
+                # we can count the rows that ACTUALLY landed, not the
+                # ones the client SENT. A re-sent batch returns
+                # gps_inserted=0; a fresh batch returns the full count;
+                # a partially-duplicate batch returns the in-between.
                 gps_ts = [s.t for s in batch.gps]
                 gps_lat = [s.lat for s in batch.gps]
                 gps_lon = [s.lon for s in batch.gps]
                 gps_sog = [s.sog_kts for s in batch.gps]
                 gps_cog = [s.cog_deg for s in batch.gps]
                 gps_acc = [s.gps_acc_m for s in batch.gps]
-                await conn.execute(
+                inserted_rows = await conn.fetch(
                     """
                     INSERT INTO track_points
                         (session_id, recorded_at, position,
@@ -283,15 +296,28 @@ async def post_telemetry(
                         $7::float8[]
                     ) AS t(recorded_at, lat, lon,
                            speed_kts, heading_deg, gps_acc_m)
+                    ON CONFLICT (session_id, recorded_at) DO NOTHING
+                    RETURNING 1
                     """,
                     race_id, gps_ts, gps_lat, gps_lon,
                     gps_sog, gps_cog, gps_acc,
                 )
-                gps_inserted = len(batch.gps)
+                gps_inserted = len(inserted_rows)
 
                 # Mark rounding runs against the GPS portion of the
                 # batch only. Build detector points from the same
                 # values we just persisted.
+                #
+                # Detector input is the FULL batch, not just the rows
+                # that landed in track_points. The two semantics:
+                #   * track_points dedupes on recorded_at — a re-sent
+                #     point doesn't double-store.
+                #   * mark detection dedupes on next-mark-index — a
+                #     re-sent point past an already-rounded mark can't
+                #     re-emit the same pass (detector advances past it).
+                # So passing every point through the detector is safe
+                # and keeps the contract simple: detection sees the
+                # client's view of reality.
                 detector_points = (
                     DetectorPoint(lat=s.lat, lon=s.lon, ts=s.t)
                     for s in batch.gps
@@ -313,24 +339,38 @@ async def post_telemetry(
 
             imu_inserted = 0
             if batch.imu:
-                # IMU stays on executemany — schema and rates are
-                # different enough that mirroring the unnest pattern
-                # isn't worth the diff. Bounded at 1000 rows per batch
-                # so this is fine.
-                imu_rows = [
-                    (race_id, s.t, s.heel_deg, s.pitch_deg, s.yaw_deg)
-                    for s in batch.imu
-                ]
-                await conn.executemany(
+                # IMU uses the same idempotent INSERT pattern as GPS.
+                # Switched from ``executemany`` to a single ``fetch``
+                # with unnest + ON CONFLICT so we get both the
+                # idempotency guarantee and an accurate ``imu_inserted``
+                # count without per-row round trips.
+                imu_ts = [s.t for s in batch.imu]
+                imu_heel = [s.heel_deg for s in batch.imu]
+                imu_pitch = [s.pitch_deg for s in batch.imu]
+                imu_yaw = [s.yaw_deg for s in batch.imu]
+                inserted_imu_rows = await conn.fetch(
                     """
                     INSERT INTO imu_samples
                         (session_id, recorded_at,
                          heel_deg, pitch_deg, yaw_deg)
-                    VALUES ($1, $2, $3, $4, $5)
+                    SELECT
+                        $1::uuid,
+                        t.recorded_at,
+                        t.heel_deg,
+                        t.pitch_deg,
+                        t.yaw_deg
+                    FROM unnest(
+                        $2::timestamptz[],
+                        $3::float8[],
+                        $4::float8[],
+                        $5::float8[]
+                    ) AS t(recorded_at, heel_deg, pitch_deg, yaw_deg)
+                    ON CONFLICT (session_id, recorded_at) DO NOTHING
+                    RETURNING 1
                     """,
-                    imu_rows,
+                    race_id, imu_ts, imu_heel, imu_pitch, imu_yaw,
                 )
-                imu_inserted = len(imu_rows)
+                imu_inserted = len(inserted_imu_rows)
 
             calibration_inserted = False
             if batch.calibration is not None:

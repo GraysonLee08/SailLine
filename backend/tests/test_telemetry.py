@@ -98,11 +98,39 @@ def fake_conn() -> MagicMock:
     and no mark-pass UPDATE fires. Override per-test with
     ``fake_conn.fetchrow.return_value = None`` to simulate a
     non-writeable race (404).
+
+    The GPS and IMU INSERTs use ``conn.fetch(... RETURNING 1)`` so the
+    handler can count rows that actually landed (idempotency contract,
+    migration 0018 — 2026-06-01). Default fixture pretends every row
+    landed, by returning N rows from each fetch where N matches the
+    incoming unnest array length. Tests that exercise the idempotent-
+    duplicate path override ``fake_conn.fetch.side_effect`` to return
+    fewer rows than were sent.
+
+    ``conn.execute`` remains the path for the mark-pass UPDATE only.
+    A test that asserts ``execute`` was not awaited is asserting that
+    detection didn't trigger an UPDATE (e.g., no rounding occurred),
+    independent of whether the INSERTs fired.
     """
     conn = MagicMock()
     conn.fetchrow = AsyncMock(return_value=_race_row())
     conn.executemany = AsyncMock()
     conn.execute = AsyncMock()
+
+    async def _fetch_all_landed(sql: str, *args, **kwargs):
+        """Default behaviour: every unnested row reports as inserted.
+
+        Inspects the SQL to decide which array argument represents the
+        row count. For the GPS INSERT the recorded_at array is the 2nd
+        positional arg ($2 in SQL). For IMU it's also $2. Both end up
+        at ``args[1]`` after the race_id at ``args[0]``.
+        """
+        if "INSERT INTO track_points" in sql or "INSERT INTO imu_samples" in sql:
+            if len(args) >= 2 and isinstance(args[1], list):
+                return [{"?column?": 1}] * len(args[1])
+        return []
+
+    conn.fetch = AsyncMock(side_effect=_fetch_all_landed)
 
     # `async with conn.transaction():` — transaction() is sync, returns
     # an async context manager. No `as` binding in the router so
@@ -251,6 +279,7 @@ def test_post_telemetry_cross_user_404(
     assert r.status_code == 404
     assert r.json()["detail"] == "race not found"
     fake_conn.executemany.assert_not_called()
+    fake_conn.fetch.assert_not_called()
     fake_conn.execute.assert_not_called()
     no_trigger.assert_not_awaited()
 
@@ -270,6 +299,23 @@ def test_post_telemetry_uses_race_write_predicate(
     auth_sql = fake_conn.fetchrow.await_args.args[0]
     assert "boat_crew" in auth_sql
     assert "bc.role IN ('owner', 'crew')" in auth_sql
+
+
+def test_post_telemetry_load_uses_for_update(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """The race-row read MUST acquire ``FOR UPDATE`` so concurrent
+    batches against the same race serialize on the row lock.
+
+    Regression guard for the 2026-06-01 concurrency fix: without
+    ``FOR UPDATE`` the read-modify-write on ``mark_passes`` can race
+    when the recorder's durable queue retries a batch in parallel
+    with a fresh online batch.
+    """
+    r = client.post(race_url, json={"gps": _gps(1), "imu": []})
+    assert r.status_code == 200
+    auth_sql = fake_conn.fetchrow.await_args.args[0]
+    assert "FOR UPDATE" in auth_sql
 
 
 def test_post_telemetry_invalid_lat_422(client: TestClient, race_url: str):
@@ -302,6 +348,7 @@ def test_post_telemetry_gps_over_limit_413(
     assert r.status_code == 413
     fake_conn.fetchrow.assert_not_called()
     fake_conn.executemany.assert_not_called()
+    fake_conn.fetch.assert_not_called()
     fake_conn.execute.assert_not_called()
 
 
@@ -316,6 +363,7 @@ def test_post_telemetry_imu_over_limit_413(
     assert r.status_code == 413
     fake_conn.fetchrow.assert_not_called()
     fake_conn.executemany.assert_not_called()
+    fake_conn.fetch.assert_not_called()
     fake_conn.execute.assert_not_called()
 
 
@@ -337,6 +385,7 @@ def test_post_telemetry_empty_batch_200(
     assert body["mark_passes"] == []
     assert body["new_mark_passes"] == []
     fake_conn.executemany.assert_not_called()
+    fake_conn.fetch.assert_not_called()
     fake_conn.execute.assert_not_called()
     no_trigger.assert_not_awaited()
 
@@ -344,9 +393,13 @@ def test_post_telemetry_empty_batch_200(
 def test_post_telemetry_gps_only(
     client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
 ):
-    """GPS-only batch: single ``execute`` for the INSERT, no
-    ``executemany``, no mark-pass UPDATE (default fixture has a
-    far-away mark)."""
+    """GPS-only batch: single ``fetch`` for the INSERT (RETURNING 1),
+    no ``execute`` (UPDATE) because the default fixture mark is far
+    away, no ``executemany`` because IMU is empty.
+
+    ``gps_inserted`` mirrors the row count returned by the INSERT,
+    which the fixture defaults to "every sent row landed."
+    """
     r = client.post(race_url, json={"gps": _gps(3), "imu": []})
 
     assert r.status_code == 200
@@ -357,7 +410,8 @@ def test_post_telemetry_gps_only(
     assert body["mark_passes"] == []
     assert body["new_mark_passes"] == []
     fake_conn.executemany.assert_not_called()
-    assert fake_conn.execute.await_count == 1
+    assert fake_conn.fetch.await_count == 1
+    fake_conn.execute.assert_not_called()
     no_trigger.assert_not_awaited()
 
 
@@ -368,25 +422,32 @@ def test_post_telemetry_inserts_into_position_column(
     name the ``position`` column, NOT ``location`` (which does not
     exist — migration 0002).
 
-    Without this guard, the endpoint would 500 the first time a real
+    Also a regression guard for the 2026-06-01 idempotency change —
+    the INSERT must include ``ON CONFLICT (session_id, recorded_at)
+    DO NOTHING`` and ``RETURNING 1`` so the durable-queue recorder
+    can safely re-send batches.
+
+    Without these guards, the endpoint would 500 the first time a real
     client posts against a real database, but every mocked test
     would still pass.
     """
     r = client.post(race_url, json={"gps": _gps(2), "imu": []})
     assert r.status_code == 200
-    insert_sql = fake_conn.execute.await_args.args[0]
+    insert_sql = fake_conn.fetch.await_args.args[0]
     assert "INSERT INTO track_points" in insert_sql
     assert "position" in insert_sql
     assert "location" not in insert_sql
     assert "ST_SetSRID(ST_MakePoint" in insert_sql
     assert "unnest" in insert_sql.lower()
+    assert "ON CONFLICT (session_id, recorded_at) DO NOTHING" in insert_sql
+    assert "RETURNING 1" in insert_sql
 
 
 def test_post_telemetry_imu_only(
     client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
 ):
-    """IMU-only batch uses ``executemany``; no GPS insert means no
-    ``execute`` call against the connection."""
+    """IMU-only batch uses ``fetch`` for the unnest INSERT (RETURNING
+    1); no GPS insert means no second ``fetch``, no ``execute``."""
     r = client.post(race_url, json={"gps": [], "imu": _imu(5)})
 
     assert r.status_code == 200
@@ -394,7 +455,8 @@ def test_post_telemetry_imu_only(
     assert body["gps_inserted"] == 0
     assert body["imu_inserted"] == 5
     assert body["calibration_inserted"] is False
-    assert fake_conn.executemany.call_count == 1
+    fake_conn.executemany.assert_not_called()
+    assert fake_conn.fetch.await_count == 1
     fake_conn.execute.assert_not_called()
     no_trigger.assert_not_awaited()
 
@@ -412,6 +474,7 @@ def test_post_telemetry_with_calibration(
     assert r.status_code == 200
     assert r.json()["calibration_inserted"] is True
     fake_conn.executemany.assert_not_called()
+    fake_conn.fetch.assert_not_called()
     assert fake_conn.execute.await_count == 1
     no_trigger.assert_not_awaited()
 
@@ -422,10 +485,12 @@ def test_post_telemetry_full_batch(
     """GPS + IMU + calibration — the common 'first flush after re-zero'
     shape.
 
-    Call counts after Session E:
-      * ``execute`` x2 — GPS unnest INSERT + calibration INSERT
-        (no mark-pass UPDATE: default fixture mark is far away)
-      * ``executemany`` x1 — IMU rows
+    Call counts after the 2026-06-01 idempotency change:
+      * ``fetch`` x2 — GPS unnest INSERT (RETURNING 1) + IMU unnest
+        INSERT (RETURNING 1). Both report actual landed counts.
+      * ``execute`` x1 — calibration INSERT (the mark-pass UPDATE is
+        the OTHER potential ``execute`` caller; default mark is far
+        so no UPDATE fires).
     """
     r = client.post(
         race_url,
@@ -443,8 +508,9 @@ def test_post_telemetry_full_batch(
     assert body["calibration_inserted"] is True
     assert body["mark_passes"] == []
     assert body["new_mark_passes"] == []
-    assert fake_conn.executemany.call_count == 1
-    assert fake_conn.execute.await_count == 2
+    fake_conn.executemany.assert_not_called()
+    assert fake_conn.fetch.await_count == 2
+    assert fake_conn.execute.await_count == 1
     no_trigger.assert_not_awaited()
 
 
@@ -459,6 +525,10 @@ def test_post_telemetry_emits_mark_pass(
 
     The default fixture mark is far away, so this test overrides it
     to a mark the rounding batch helper walks through.
+
+    Call topology after the 2026-06-01 idempotency change: the GPS
+    INSERT uses ``fetch`` (RETURNING 1) and the mark-pass UPDATE uses
+    ``execute``. So fetch=1, execute=1 — not the old execute=2.
     """
     mark = {"name": "M", "lat": 42.30, "lon": -87.80}
     fake_conn.fetchrow.return_value = _race_row(marks=[mark])
@@ -474,9 +544,9 @@ def test_post_telemetry_emits_mark_pass(
     assert len(body["new_mark_passes"]) == 1
     assert body["new_mark_passes"][0]["mark_index"] == 0
     assert body["mark_passes"] == body["new_mark_passes"]
-    # Two execute calls: GPS INSERT then mark-pass UPDATE.
-    assert fake_conn.execute.await_count == 2
-    update_call = fake_conn.execute.await_args_list[1].args
+    assert fake_conn.fetch.await_count == 1
+    assert fake_conn.execute.await_count == 1
+    update_call = fake_conn.execute.await_args.args
     assert "UPDATE race_sessions" in update_call[0]
     assert "mark_passes" in update_call[0]
     persisted = json.loads(update_call[1])
@@ -576,3 +646,78 @@ def test_post_telemetry_does_not_trigger_when_no_new_passes(
 
     assert r.status_code == 200
     no_trigger.assert_not_awaited()
+
+
+# ─── Idempotency (2026-06-01, migration 0018) ─────────────────────────
+
+
+def test_post_telemetry_reports_actual_landed_count(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """When the INSERT's ON CONFLICT clause skips a duplicate, the
+    response's ``gps_inserted`` must reflect the rows that ACTUALLY
+    landed, not the rows the client SENT.
+
+    The durable-queue recorder relies on this: it treats a 200 with
+    ``gps_inserted < len(sent)`` as 'these specific points were
+    duplicates — safe to drop from the queue', and a 200 with
+    ``gps_inserted == 0`` as 'whole batch was already stored —
+    nothing to do.'
+    """
+
+    async def _half_landed(sql: str, *args, **kwargs):
+        # Simulate ON CONFLICT skipping every other row. The handler
+        # sent 4 GPS samples; we return 2 RETURNING rows.
+        if "INSERT INTO track_points" in sql:
+            return [{"?column?": 1}, {"?column?": 1}]
+        return []
+
+    fake_conn.fetch.side_effect = _half_landed
+
+    r = client.post(race_url, json={"gps": _gps(4), "imu": []})
+
+    assert r.status_code == 200
+    body = r.json()
+    # Server reports the 2 rows that actually landed, not the 4 sent.
+    assert body["gps_inserted"] == 2
+
+
+def test_post_telemetry_reports_zero_when_full_duplicate_batch(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """A re-send of an already-stored batch returns 200 with
+    ``gps_inserted=0``. This is the recover-from-lost-ack path: the
+    server processed the original batch and committed, but the
+    response didn't make it back to the client. The client retries
+    the same batch and learns it's already stored — drop from queue,
+    no duplicates created.
+    """
+
+    async def _all_duplicates(sql: str, *args, **kwargs):
+        if "INSERT INTO track_points" in sql:
+            return []  # zero RETURNING rows = every sample was a duplicate
+        return []
+
+    fake_conn.fetch.side_effect = _all_duplicates
+
+    r = client.post(race_url, json={"gps": _gps(3), "imu": []})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["gps_inserted"] == 0
+
+
+def test_post_telemetry_imu_insert_uses_on_conflict(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """IMU INSERT must also use ON CONFLICT DO NOTHING with the same
+    (session_id, recorded_at) key. Regression guard for the IMU side
+    of migration 0018.
+    """
+    r = client.post(race_url, json={"gps": [], "imu": _imu(2)})
+
+    assert r.status_code == 200
+    imu_sql = fake_conn.fetch.await_args.args[0]
+    assert "INSERT INTO imu_samples" in imu_sql
+    assert "ON CONFLICT (session_id, recorded_at) DO NOTHING" in imu_sql
+    assert "RETURNING 1" in imu_sql

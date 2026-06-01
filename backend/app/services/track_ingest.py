@@ -101,6 +101,24 @@ async def load_race_for_ingest(
     (default — asyncpg's global JSONB codec converts at the boundary)
     or as raw strings/bytes (in pathological connection setups or
     older fixtures). Both shapes are handled.
+
+    Concurrency (added 2026-06-01): the SELECT uses ``FOR UPDATE`` to
+    serialize concurrent batches against the same race row. The
+    detection-and-update logic in :func:`detect_and_persist_new_passes`
+    is a read-modify-write on ``race_sessions.mark_passes`` (read
+    existing_passes, run detector starting at len(existing_passes),
+    UPDATE with the full new list). Without the row lock two
+    overlapping batches — common once the recorder's durable queue
+    starts retrying — would each read the same starting state, each
+    detect from the same index, and the second UPDATE would clobber
+    the first.
+
+    The ``FOR UPDATE`` is acquired inside the caller's transaction
+    (both /track and /telemetry wrap their work in
+    ``conn.transaction()``). The lock holds until that transaction
+    commits or rolls back. Cost is negligible — we never have more
+    than a handful of concurrent batches per race, and the held
+    duration is the single bulk INSERT plus one short UPDATE.
     """
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
@@ -108,6 +126,7 @@ async def load_race_for_ingest(
         SELECT r.marks, r.mark_passes, r.started_at, r.start_at, r.mode
         FROM race_sessions r
         WHERE r.id = $1 AND {pred}
+        FOR UPDATE OF r
         """,
         race_id,
         uid,
