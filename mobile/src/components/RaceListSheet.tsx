@@ -109,17 +109,28 @@ export function RaceListSheet({
             Your races
           </Text>
           {userEmail ? (
-            <Text
-              style={{
-                color: colors.text.muted,
-                fontFamily: font.body,
-                fontSize: size.small,
-                marginTop: 2,
-              }}
-              numberOfLines={1}
+            // Long-press the user-email pill to open the recorder
+            // debug screen — hidden by design (Phase 2 diagnostics
+            // landing without a top-level UI surface yet). Tap does
+            // nothing visible; the email stays a passive identity
+            // label for everyone who isn't reading this comment.
+            <Pressable
+              onLongPress={() => router.push("/recorder-debug")}
+              delayLongPress={1500}
+              accessibilityLabel="Account email; long-press for recorder debug"
             >
-              {userEmail}
-            </Text>
+              <Text
+                style={{
+                  color: colors.text.muted,
+                  fontFamily: font.body,
+                  fontSize: size.small,
+                  marginTop: 2,
+                }}
+                numberOfLines={1}
+              >
+                {userEmail}
+              </Text>
+            </Pressable>
           ) : null}
         </View>
         <Pressable

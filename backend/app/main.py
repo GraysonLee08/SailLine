@@ -13,6 +13,7 @@ from app.routers import (
     health,
     race_stats,
     races,
+    recorder_debrief,
     routing,
     routing_notifications,
     telemetry,
@@ -76,6 +77,7 @@ app.include_router(boats.router)                  # /api/boats (Session D2)
 app.include_router(crew.router)                   # /api/boats/{id}/crew + /api/invites (Session D3)
 app.include_router(telemetry.router)              # router carries its own /api/races/{id}/telemetry prefix
 app.include_router(telemetry_stream.router)       # WS /api/races/{id}/telemetry/stream
+app.include_router(recorder_debrief.router)       # /api/races/{id}/recorder-debrief (Phase 2)
 app.include_router(routing.router)                # /api/routing - compute endpoint
 app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
 app.include_router(ais.router)                    # /api/ais - vessel positions (cache-only read)
