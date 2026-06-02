@@ -721,3 +721,66 @@ def test_post_telemetry_imu_insert_uses_on_conflict(
     assert "INSERT INTO imu_samples" in imu_sql
     assert "ON CONFLICT (session_id, recorded_at) DO NOTHING" in imu_sql
     assert "RETURNING 1" in imu_sql
+
+
+# ─── Phase 4 — native uploader sentinel coercion ──────────────────────
+
+
+def test_post_telemetry_coerces_negative_sentinels(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """The Transistorsoft native uploader emits -1 for speed / heading /
+    accuracy when the underlying provider hasn't computed a value.
+    The pydantic pre-validator coerces these to null so a single
+    sentinel sample can't 422 the whole batch.
+
+    Phase 4 regression guard — without this, the durable-queue
+    contract breaks on any sample with missing speed (typical for the
+    first 1-2 fixes after start).
+    """
+    sample_with_sentinels = {
+        "t": "2026-05-07T12:00:00Z",
+        "lat": 41.9,
+        "lon": -87.6,
+        "sog_kts": -1.0,
+        "cog_deg": -1.0,
+        "gps_acc_m": -1.0,
+    }
+    r = client.post(
+        race_url,
+        json={"gps": [sample_with_sentinels], "imu": []},
+    )
+
+    assert r.status_code == 200
+    # The handler still inserted (fixture's default fetch returns one
+    # landed row); the negative sentinels reached the INSERT as null.
+    assert r.json()["gps_inserted"] == 1
+    insert_args = fake_conn.fetch.await_args.args
+    # Sog, cog, acc arrays land at args[5], [6], [7] after the SQL,
+    # race_id, ts, lat, lon arrays.
+    sog_arr, cog_arr, acc_arr = insert_args[5], insert_args[6], insert_args[7]
+    assert sog_arr == [None]
+    assert cog_arr == [None]
+    assert acc_arr == [None]
+
+
+def test_post_telemetry_accepts_valid_speeds_unchanged(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """Sentinel coercion must NOT eat real values. A positive speed
+    flows through unchanged into the INSERT."""
+    good_sample = {
+        "t": "2026-05-07T12:00:00Z",
+        "lat": 41.9,
+        "lon": -87.6,
+        "sog_kts": 6.5,
+        "cog_deg": 180.0,
+        "gps_acc_m": 5.0,
+    }
+    r = client.post(race_url, json={"gps": [good_sample], "imu": []})
+
+    assert r.status_code == 200
+    insert_args = fake_conn.fetch.await_args.args
+    assert insert_args[5] == [6.5]
+    assert insert_args[6] == [180.0]
+    assert insert_args[7] == [5.0]

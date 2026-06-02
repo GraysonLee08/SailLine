@@ -22,15 +22,27 @@
 // a RecorderDebrief blob (best-effort) so the next failure is
 // diagnosable without trawling Cloud Logging. See
 // sailline-docs/2026-06-01_durable-upload-pipeline-plan.md.
+//
+// Phase 4 (2026-06-01) — dual-mode. When the ``native_uploader``
+// feature flag is ON at start() time, Transistorsoft owns the queue
+// and POSTs directly; the JS side observes onHttp events to update
+// stats + ring buffer, polls getCount() for the queue depth, and
+// flushNow() becomes a thin wrapper around sync(). When OFF, the
+// hook behaves exactly as Phase 2 — JS owns the queue + flush.
 
+import NetInfo, { type NetInfoState } from "@react-native-community/netinfo";
 import Constants from "expo-constants";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { gpsPointToWire } from "@sailline/shared";
 
-import { apiFetch } from "../api";
+import { API_URL, apiFetch } from "../api";
 import { postRecorderDebrief } from "../api/recorderDebrief";
+import { auth } from "../firebase";
 import {
+  getNativeQueueCount,
+  onNativeHttp,
+  syncNow,
   type LocalPoint,
   startWatcher,
 } from "./backgroundGeolocation";
@@ -40,6 +52,7 @@ import {
   gatherDeviceInfo,
   type LiveStats,
 } from "./debrief";
+import { getFlag } from "./featureFlags";
 import { clearQueue, loadQueue, saveQueue } from "./queue";
 import {
   appendEntry,
@@ -47,9 +60,19 @@ import {
   loadLog,
   type RecorderLogEntry,
 } from "./recorderLog";
+import {
+  deriveUploadStatus,
+  statsToStatusInputs,
+  type UploadStatus,
+} from "./uploadStatus";
 
 const FLUSH_INTERVAL_MS = 30_000;
 const FLUSH_GPS_BATCH_SIZE = 100;
+
+/** How often we recompute the badge status. 1 s gives a snappy UI
+ *  without thrashing — the underlying inputs only really change on
+ *  flush completions and NetInfo events. */
+const STATUS_RECOMPUTE_MS = 1_000;
 
 type RecorderApi = {
   recording: boolean;
@@ -57,6 +80,9 @@ type RecorderApi = {
   points: LocalPoint[];
   queueLength: number;
   lastPoint: LocalPoint | null;
+  /** Coarse upload health for the recording-screen badge. Always
+   *  defined — defaults to "live" before the first event. */
+  uploadStatus: UploadStatus;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   flushNow: () => Promise<void>;
@@ -78,12 +104,36 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   const [queueLength, setQueueLength] = useState(0);
   const [lastPoint, setLastPoint] = useState<LocalPoint | null>(null);
 
-  const gpsQueueRef = useRef<LocalPoint[]>([]); // unflushed points
+  const gpsQueueRef = useRef<LocalPoint[]>([]); // unflushed points (JS mode)
   const watcherRef = useRef<{ stop: () => Promise<void> } | null>(null);
   const watcherPromiseRef = useRef<Promise<{
     stop: () => Promise<void>;
   }> | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── Phase 4 — native uploader state ─────────────────────────────────
+  //
+  // nativeModeRef is snapshotted at start() time so a mid-session
+  // toggle of the feature flag doesn't half-switch the recorder.
+  // Changing the flag mid-session is documented as taking effect on
+  // the next start().
+  //
+  // nativeHttpSubRef holds the BackgroundGeolocation.onHttp
+  // subscription so we can detach it on stop().
+  //
+  // nativeQueueIntervalRef polls the native queue depth every 5 s
+  // while recording so the badge + queueLength stay roughly accurate
+  // (the truth lives in Transistorsoft's SQLite).
+  //
+  // queueLengthRef is the unified ref read by the status-derivation
+  // loop. JS mode updates it in onPosition; native mode updates it in
+  // the poll + after onHttp success.
+  const nativeModeRef = useRef<boolean>(false);
+  const nativeHttpSubRef = useRef<{ remove: () => void } | null>(null);
+  const nativeQueueIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
+    null,
+  );
+  const queueLengthRef = useRef<number>(0);
   const flushingRef = useRef(false);
   const raceIdRef = useRef<string | null>(raceId);
   raceIdRef.current = raceId;
@@ -98,6 +148,58 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   // AsyncStorage rather than subscribing to state.
   const statsRef = useRef<LiveStats>(emptyLiveStats());
   const logRef = useRef<RecorderLogEntry[]>([]);
+
+  // ── Phase 3 — upload-status badge state ─────────────────────────────
+  //
+  // netReachableRef tracks the latest NetInfo reading; isInternetReachable
+  // can be null when the OS hasn't decided yet (cellular handoff, etc.).
+  // null is treated as "online" by deriveUploadStatus — we don't flag
+  // offline without evidence.
+  //
+  // uploadStatus is React state because the badge component subscribes
+  // to it. A 1 s interval re-derives the status from refs + NetInfo
+  // and only setState's if it actually changed; cheap and avoids the
+  // badge re-rendering every second.
+  const netReachableRef = useRef<boolean | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus>("live");
+
+  // ── NetInfo subscription ────────────────────────────────────────────
+  //
+  // Mount once for the hook's lifetime — independent of recording
+  // state because we want fresh data the moment the user opens the
+  // recording screen, not 1 s after they press Start.
+  useEffect(() => {
+    const sub = NetInfo.addEventListener((state: NetInfoState) => {
+      // ``isInternetReachable`` is what we want — ``isConnected`` is a
+      // weaker signal (wifi associated but captive portal). NetInfo
+      // reports null when reachability hasn't been probed yet.
+      netReachableRef.current = state.isInternetReachable;
+    });
+    return () => sub();
+  }, []);
+
+  // ── Upload-status recompute loop ─────────────────────────────────────
+  //
+  // Cheap derivation off refs every second. We compare to the
+  // currently-rendered status and only commit if it changed, so the
+  // badge re-renders only on transitions.
+  //
+  // queueLengthRef is the authoritative source — JS mode writes it
+  // from onPosition, native mode writes it from the poll + onHttp.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const next = deriveUploadStatus(
+        statsToStatusInputs(
+          statsRef.current,
+          queueLengthRef.current,
+          netReachableRef.current,
+        ),
+        Date.now(),
+      );
+      setUploadStatus((prev) => (prev === next ? prev : next));
+    }, STATUS_RECOMPUTE_MS);
+    return () => clearInterval(interval);
+  }, []);
 
   /**
    * Append to the ring buffer, updating both the in-memory mirror and
@@ -115,10 +217,82 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     [],
   );
 
+  // ── Native-mode HTTP event handler ───────────────────────────────────
+  //
+  // Fires whenever Transistorsoft's HTTP layer attempts a POST. Used
+  // to drive LiveStats + the ring buffer in native mode. The handler
+  // is registered in start() and removed in stop().
+  const handleNativeHttp = useCallback(
+    (event: { success: boolean; status: number; responseText?: string }) => {
+      const now = Date.now();
+      statsRef.current.attempts += 1;
+
+      let insertedCount: number | undefined;
+      if (event.success) {
+        // Parse the TelemetryAck for the actually-inserted count.
+        // Phase 1's ON CONFLICT means re-sent batches return 0; we
+        // count what the server says landed, not what was sent.
+        if (event.responseText) {
+          try {
+            const ack = JSON.parse(event.responseText) as TelemetryAck;
+            if (typeof ack.gps_inserted === "number") {
+              insertedCount = ack.gps_inserted;
+            }
+          } catch {
+            // ignore — keep the success but no inserted count
+          }
+        }
+        statsRef.current.successes += 1;
+        if (insertedCount !== undefined) {
+          statsRef.current.pointsUploaded += insertedCount;
+        }
+        if (statsRef.current.lastSuccessTs != null) {
+          const gapS = (now - statsRef.current.lastSuccessTs) / 1000;
+          if (gapS > statsRef.current.longestSuccessGapSeen) {
+            statsRef.current.longestSuccessGapSeen = gapS;
+          }
+        }
+        statsRef.current.lastSuccessTs = now;
+      } else if (event.status >= 500) {
+        statsRef.current.http5xx += 1;
+      } else if (event.status >= 400) {
+        statsRef.current.http4xx += 1;
+      } else {
+        // status 0 / -1 in Transistorsoft means network failure.
+        statsRef.current.networkErrors += 1;
+      }
+
+      recordLog({
+        kind: "flush",
+        status: event.success ? "ok" : "error",
+        http_status: event.status,
+        inserted: insertedCount,
+        queue_depth_after: queueLengthRef.current,
+        message: event.success ? undefined : event.responseText?.slice(0, 200),
+      });
+
+      // Reconcile the badge queue depth eagerly on every event so the
+      // UI matches the native queue without waiting for the 5 s poll.
+      void getNativeQueueCount().then((n) => {
+        queueLengthRef.current = n;
+        setQueueLength(n);
+      });
+    },
+    [recordLog],
+  );
+
   // ── Flush ───────────────────────────────────────────────────────────
   const flushNow = useCallback(async () => {
     const id = raceIdRef.current;
     if (!id) return;
+
+    // Native mode: tell Transistorsoft to drain its queue immediately.
+    // The onHttp handler picks up the resulting events to update stats.
+    if (nativeModeRef.current) {
+      await syncNow();
+      return;
+    }
+
     if (flushingRef.current) return;
     if (gpsQueueRef.current.length === 0) return;
 
@@ -206,23 +380,46 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   }, [recordLog]);
 
   // ── Position handler ─────────────────────────────────────────────────
+  //
+  // Branches on mode. JS mode: push onto the local queue, persist,
+  // flush at 100. Native mode: skip the queue (Transistorsoft owns
+  // it) but keep the breadcrumb UI state and the capture counter
+  // accurate. Native queueLength is reconciled by the poll + onHttp.
   const onPosition = useCallback(
     (point: LocalPoint) => {
       const id = raceIdRef.current;
       if (!id) return;
-      gpsQueueRef.current.push(point);
-      // Persist on every fix (1 Hz) so a crash/kill loses nothing.
-      void saveQueue(id, gpsQueueRef.current);
-      const depth = gpsQueueRef.current.length;
-      setQueueLength(depth);
+
+      // Breadcrumb UI is the same in both modes.
       setPoints((prev) => [...prev, point]);
       setLastPoint(point);
 
-      // ── Stats: capture ──────────────────────────────────────────
+      // ── Stats: capture (same in both modes) ────────────────────
       statsRef.current.pointsCaptured += 1;
       if (statsRef.current.startedAt == null) {
         statsRef.current.startedAt = Date.now();
       }
+
+      if (nativeModeRef.current) {
+        // Native mode — queue depth comes from getNativeQueueCount(),
+        // updated by the polling interval + onHttp success. We
+        // optimistically bump the displayed queue here so the badge
+        // reflects the just-captured fix without waiting for the poll.
+        queueLengthRef.current = queueLengthRef.current + 1;
+        setQueueLength(queueLengthRef.current);
+        if (queueLengthRef.current > statsRef.current.maxQueueDepth) {
+          statsRef.current.maxQueueDepth = queueLengthRef.current;
+        }
+        return;
+      }
+
+      // ── JS mode ────────────────────────────────────────────────
+      gpsQueueRef.current.push(point);
+      // Persist on every fix (1 Hz) so a crash/kill loses nothing.
+      void saveQueue(id, gpsQueueRef.current);
+      const depth = gpsQueueRef.current.length;
+      queueLengthRef.current = depth;
+      setQueueLength(depth);
       if (depth > statsRef.current.maxQueueDepth) {
         statsRef.current.maxQueueDepth = depth;
       }
@@ -254,19 +451,66 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     // ── Phase 2 — reset stats + restore log for this race ────────────
     statsRef.current = emptyLiveStats();
     logRef.current = await loadLog(id);
-    recordLog({ kind: "lifecycle", status: "info", message: "start" });
 
-    // Restore any points left over from a previous (interrupted) session
-    // for this race so they flush with the new run.
-    const restored = await loadQueue(id);
-    if (restored.length > 0) {
-      gpsQueueRef.current = restored.slice();
-      setQueueLength(restored.length);
-      setPoints(restored.slice());
-      setLastPoint(restored[restored.length - 1]);
+    // ── Phase 4 — snapshot the feature flag for this session ─────────
+    //
+    // Snapshotted here so a mid-session toggle doesn't half-switch the
+    // recorder. Native mode needs a fresh Firebase token for the
+    // initial native config; if we can't get one, fall back to JS to
+    // avoid leaving the user with a recorder that captures but never
+    // uploads.
+    const wantNative = await getFlag("native_uploader");
+    let nativeUploaderCfg: { url: string; authHeader: string } | undefined;
+    if (wantNative) {
+      try {
+        const user = auth.currentUser;
+        const token = user ? await user.getIdToken() : null;
+        if (token) {
+          nativeUploaderCfg = {
+            url: `${API_URL}/api/races/${id}/telemetry`,
+            authHeader: `Bearer ${token}`,
+          };
+        }
+      } catch {
+        // ignore — fall back to JS mode below
+      }
+    }
+    nativeModeRef.current = nativeUploaderCfg !== undefined;
+    recordLog({
+      kind: "lifecycle",
+      status: "info",
+      message: `start mode=${nativeModeRef.current ? "native" : "js"}`,
+    });
+
+    // Restore any points left over from a previous (interrupted) JS-mode
+    // session for this race so they flush with the new run. Skipped in
+    // native mode: Transistorsoft's SQLite store already holds the
+    // unsent fixes from the previous session and will drain them on
+    // its own. (Mixed-mode restore is intentionally not supported —
+    // switching modes between sessions resets the queue boundary.)
+    if (!nativeModeRef.current) {
+      const restored = await loadQueue(id);
+      if (restored.length > 0) {
+        gpsQueueRef.current = restored.slice();
+        queueLengthRef.current = restored.length;
+        setQueueLength(restored.length);
+        setPoints(restored.slice());
+        setLastPoint(restored[restored.length - 1]);
+      }
+    } else {
+      // Native mode: read the current native queue depth so the badge
+      // doesn't start at 0 if there's already a backlog from a prior
+      // run.
+      const initial = await getNativeQueueCount();
+      queueLengthRef.current = initial;
+      setQueueLength(initial);
     }
 
-    watcherPromiseRef.current = startWatcher({ onPosition, onError })
+    watcherPromiseRef.current = startWatcher({
+      onPosition,
+      onError,
+      nativeUploader: nativeUploaderCfg,
+    })
       .then((handle) => {
         watcherRef.current = handle;
         watcherPromiseRef.current = null;
@@ -285,8 +529,27 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       // sees the error state and can retry stop/start.
     }
 
-    flushTimerRef.current = setInterval(() => void flushNow(), FLUSH_INTERVAL_MS);
-  }, [onPosition, onError, flushNow, recordLog]);
+    if (nativeModeRef.current) {
+      // Subscribe to native HTTP events for stats + ring buffer.
+      nativeHttpSubRef.current = onNativeHttp(handleNativeHttp);
+      // Poll the native queue count every 5 s as a backstop in case
+      // onHttp's reconcile fires slowly under heavy load. Cheap call;
+      // foreground-only is fine — when JS sleeps the badge stops
+      // updating anyway.
+      nativeQueueIntervalRef.current = setInterval(() => {
+        void getNativeQueueCount().then((n) => {
+          queueLengthRef.current = n;
+          setQueueLength(n);
+        });
+      }, 5_000);
+    } else {
+      // JS mode — the existing 30 s flush timer drives uploads.
+      flushTimerRef.current = setInterval(
+        () => void flushNow(),
+        FLUSH_INTERVAL_MS,
+      );
+    }
+  }, [onPosition, onError, flushNow, recordLog, handleNativeHttp]);
 
   const stop = useCallback(async () => {
     // Wait for any in-flight setup, then tear down the watcher.
@@ -309,13 +572,25 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       clearInterval(flushTimerRef.current);
       flushTimerRef.current = null;
     }
+    // ── Phase 4 cleanup — native subscriptions + poll ─────────────────
+    if (nativeHttpSubRef.current) {
+      nativeHttpSubRef.current.remove();
+      nativeHttpSubRef.current = null;
+    }
+    if (nativeQueueIntervalRef.current) {
+      clearInterval(nativeQueueIntervalRef.current);
+      nativeQueueIntervalRef.current = null;
+    }
     setRecording(false);
     // Final flush so the last few seconds ship without waiting 30 s.
+    // Works in both modes: JS mode runs the apiFetch loop; native mode
+    // calls Transistorsoft.sync().
     await flushNow();
     // If the queue drained clean, drop the persisted entry so the next
-    // session starts empty.
+    // session starts empty. Only relevant in JS mode — native mode
+    // never wrote to the AsyncStorage queue.
     const id = raceIdRef.current;
-    if (id && gpsQueueRef.current.length === 0) {
+    if (!nativeModeRef.current && id && gpsQueueRef.current.length === 0) {
       await clearQueue(id);
     }
 
@@ -372,6 +647,14 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
         clearInterval(flushTimerRef.current);
         flushTimerRef.current = null;
       }
+      if (nativeHttpSubRef.current) {
+        nativeHttpSubRef.current.remove();
+        nativeHttpSubRef.current = null;
+      }
+      if (nativeQueueIntervalRef.current) {
+        clearInterval(nativeQueueIntervalRef.current);
+        nativeQueueIntervalRef.current = null;
+      }
     };
   }, []);
 
@@ -381,6 +664,7 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     points,
     queueLength,
     lastPoint,
+    uploadStatus,
     start,
     stop,
     flushNow,

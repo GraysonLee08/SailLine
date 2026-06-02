@@ -21,9 +21,12 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 
+import { useAuth } from "../auth/AuthContext";
 import { requestBatteryOptimizationExemption } from "./backgroundGeolocation";
+import { startTokenRefresh } from "./tokenRefresh";
 import { useTrackRecorder } from "./useTrackRecorder";
 import type { LocalPoint } from "./backgroundGeolocation";
+import type { UploadStatus } from "./uploadStatus";
 import type { Race } from "../types";
 
 type RecorderApi = {
@@ -32,6 +35,7 @@ type RecorderApi = {
   points: ReadonlyArray<LocalPoint>;
   queueLength: number;
   lastPoint: LocalPoint | null;
+  uploadStatus: UploadStatus;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   flushNow: () => Promise<void>;
@@ -83,6 +87,23 @@ export function RecorderProvider({ children }: { children: ReactNode }) {
       console.warn("[RecorderContext] recording with no selected race");
     }
   }, [recorder.recording, selectedRace]);
+
+  // ── Phase 4 — keep native HTTP authed ──────────────────────────────
+  //
+  // Run only when there's a signed-in user. The token-refresh handlers
+  // call auth.currentUser themselves, so the bare existence of a user
+  // is sufficient to start them — they handle the moment-to-moment
+  // refresh on AppState / onIdTokenChanged / interval ticks.
+  //
+  // No-op in JS-uploader mode: setAuthHeader is best-effort and the
+  // plugin's http config block is absent when the flag is off, so the
+  // header push is wasted work but not harmful. Phase 5 will remove
+  // this branch once native uploader is the only code path.
+  const { user } = useAuth();
+  useEffect(() => {
+    if (!user) return;
+    return startTokenRefresh();
+  }, [user]);
 
   const value = useMemo<RecorderCtx>(
     () => ({ selectedRace, setSelectedRace, recorder, startRecording }),

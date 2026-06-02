@@ -25,6 +25,7 @@ import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas"
 import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
 import { MarkPassControls } from "../../src/components/MarkPassControls";
+import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
@@ -239,6 +240,17 @@ export default function RecordingScreen() {
               LIVE
             </Text>
           </View>
+        ) : null}
+
+        {/* Phase 3 — honest upload-health badge. Sits next to LIVE so
+            the user can tell at a glance whether data is reaching the
+            backend. LIVE means "we are recording"; this badge means
+            "we are or are not uploading." */}
+        {recorder.recording ? (
+          <UploadStatusBadge
+            status={recorder.uploadStatus}
+            queueDepth={recorder.queueLength}
+          />
         ) : null}
       </SafeAreaView>
 

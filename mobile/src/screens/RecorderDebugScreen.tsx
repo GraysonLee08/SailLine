@@ -21,11 +21,13 @@ import {
   SafeAreaView,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   View,
 } from "react-native";
 import { router } from "expo-router";
 
+import { getFlag, setFlag } from "../recorder/featureFlags";
 import { useRecorder } from "../recorder/RecorderContext";
 import { loadLog, type RecorderLogEntry } from "../recorder/recorderLog";
 import { useTheme } from "../theme/ThemeProvider";
@@ -56,6 +58,36 @@ export function RecorderDebugScreen() {
   const [log, setLog] = useState<RecorderLogEntry[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [loaded, setLoaded] = useState(false);
+
+  // Phase 4 feature flag: native uploader toggle. Reads on mount,
+  // writes on change. Changing the flag mid-session has no effect
+  // until the next start() — the recorder snapshots the flag at
+  // start time. Note rendered below the switch makes this visible
+  // to the user.
+  const [nativeUploaderEnabled, setNativeUploaderEnabled] = useState(false);
+  const [flagLoaded, setFlagLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const v = await getFlag("native_uploader");
+      if (!cancelled) {
+        setNativeUploaderEnabled(v);
+        setFlagLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggleNativeUploader = useCallback(
+    async (next: boolean) => {
+      setNativeUploaderEnabled(next);
+      await setFlag("native_uploader", next);
+    },
+    [],
+  );
 
   const refresh = useCallback(async () => {
     if (!selectedRace) {
@@ -139,6 +171,31 @@ export function RecorderDebugScreen() {
           fontSize: size.body,
           marginTop: 2,
         },
+        flagBlock: {
+          marginTop: 16,
+          paddingTop: 12,
+          borderTopWidth: 1,
+          borderTopColor: colors.border.hairline,
+        },
+        flagRow: {
+          flexDirection: "row",
+          alignItems: "center",
+          gap: 12,
+        },
+        flagText: {
+          flex: 1,
+        },
+        flagLabel: {
+          color: colors.text.primary,
+          fontFamily: font.bodySemibold,
+          fontSize: size.body,
+        },
+        flagHelp: {
+          marginTop: 2,
+          color: colors.text.muted,
+          fontFamily: font.body,
+          fontSize: size.caption,
+        },
         listContent: {
           padding: 16,
           paddingBottom: 24,
@@ -218,6 +275,30 @@ export function RecorderDebugScreen() {
             <Text style={styles.statValue}>{log.length}</Text>
           </View>
         </View>
+
+        {/* Phase 4 feature flag — gated on the load completing so the
+            switch doesn't briefly render "off" then flick to "on" if
+            the user had it enabled. */}
+        {flagLoaded ? (
+          <View style={styles.flagBlock}>
+            <View style={styles.flagRow}>
+              <View style={styles.flagText}>
+                <Text style={styles.flagLabel}>Native uploader (Phase 4)</Text>
+                <Text style={styles.flagHelp}>
+                  Routes GPS uploads through Transistorsoft's native HTTP
+                  layer. Takes effect on the next Start.
+                  {recorder.recording
+                    ? " Recording in progress — toggle applies after Stop + Start."
+                    : ""}
+                </Text>
+              </View>
+              <Switch
+                value={nativeUploaderEnabled}
+                onValueChange={toggleNativeUploader}
+              />
+            </View>
+          </View>
+        ) : null}
       </View>
 
       <ScrollView

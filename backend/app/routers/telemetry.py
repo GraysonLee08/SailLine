@@ -56,7 +56,7 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app import db
 from app.auth import get_current_user
@@ -88,7 +88,18 @@ MAX_IMU_SAMPLES_PER_BATCH = 1000
 
 
 class GpsSample(BaseModel):
-    """Single GPS fix from the browser's Geolocation API."""
+    """Single GPS fix from the browser's Geolocation API.
+
+    Sentinel coercion (2026-06-01, Phase 4): the mobile native uploader
+    (Transistorsoft) emits ``-1`` for ``speed`` / ``heading`` /
+    ``accuracy`` when the underlying provider hasn't computed a value,
+    while the JS uploader normalises those to ``null`` client-side. To
+    keep one wire shape across both code paths, this model coerces
+    negative values for ``sog_kts``, ``cog_deg``, and ``gps_acc_m`` to
+    ``None`` before the ``ge=0`` validation runs — same outcome the JS
+    uploader produces, just deferred to the server. A single sample
+    with a missing speed therefore no longer 422s the whole batch.
+    """
 
     t: datetime = Field(
         description="Sample timestamp, ISO 8601 with millisecond precision."
@@ -110,6 +121,24 @@ class GpsSample(BaseModel):
         description="95% horizontal accuracy radius, meters. Filter "
                     "on this in queries to reject low-quality fixes.",
     )
+
+    @field_validator("sog_kts", "cog_deg", "gps_acc_m", mode="before")
+    @classmethod
+    def _coerce_negative_sentinel_to_none(cls, v):
+        """Native SDK sentinel ``-1`` (or any negative) → None.
+
+        Runs BEFORE the ``ge=0`` constraint so negatives don't 422.
+        Idempotent on already-None or already-valid values.
+        """
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return v  # let pydantic surface the original error
+        if f < 0:
+            return None
+        return f
 
 
 class ImuSample(BaseModel):

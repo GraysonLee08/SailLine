@@ -5,13 +5,28 @@
 // recorder's canonical local point shape, plus the start/stop lifecycle
 // and the Android foreground-service notification copy.
 //
-// Design note (deliberate): Transistorsoft ships its own SQLite
-// persistence + HTTP auto-POST. We do NOT use it. Its HTTP layer posts
-// the plugin's own location schema (not our batched {gps:[...]}
-// telemetry shape) and threading hourly-expiring Firebase tokens through
-// the native HTTP layer is fragile. So Transistorsoft is the CAPTURE
-// ENGINE ONLY; the recorder hook owns queueing, batching, flushing, and
-// drop-on-ack (the proven web pattern). See the Phase 1 plan, §2.
+// Two recorder modes (Phase 4 — 2026-06-01):
+//
+//   * "js" mode (the original Phase-1 design). Transistorsoft is the
+//     CAPTURE ENGINE ONLY; the recorder hook owns queueing, batching,
+//     flushing, and drop-on-ack. Failure mode demonstrated by the
+//     2026-05-31 race: JS-driven flushes don't run when the phone is
+//     locked, so uploads stall silently for as long as the user keeps
+//     the screen off.
+//
+//   * "native" mode (Phase 4, flag-gated). Transistorsoft owns the
+//     queue (its own SQLite store), batches with maxBatchSize=100, and
+//     auto-POSTs to our /telemetry endpoint via a templated body
+//     matching the JS uploader's wire shape. Uploads keep flowing
+//     even with the screen off and the app fully backgrounded, because
+//     the HTTP layer runs in native code. The JS side just observes
+//     onHttp events to update LiveStats + the ring buffer.
+//
+// The original "we don't use Transistorsoft's HTTP layer" design note
+// cited two reasons: (a) wire shape mismatch, and (b) hourly-expiring
+// Firebase tokens. Phase 4 resolves both — (a) via the locationTemplate
+// config below, (b) via the tokenRefresh.ts module which pushes a fresh
+// bearer into native config on foreground / token-changed events.
 //
 // v5 upgrade (2026-05-27): Transistorsoft's react-native-background-geolocation
 // shipped v5 with a fully restructured Config API. Every flat option from v4
@@ -52,6 +67,102 @@ export type WatcherCallbacks = {
   onPosition: (point: LocalPoint) => void;
   onError?: (err: Error) => void;
 };
+
+/**
+ * Phase 4 — optional native-uploader configuration. When provided,
+ * Transistorsoft's HTTP layer auto-POSTs to ``url`` with a body of
+ * shape ``{ gps: [ {t, lat, lon, sog_kts, cog_deg, gps_acc_m}, ... ] }``
+ * matching the JS uploader. Token rotation happens via
+ * :func:`setAuthHeader` called from JS on foreground / token-changed
+ * events (see tokenRefresh.ts).
+ *
+ * When omitted the recorder runs in "js" mode and the caller is
+ * responsible for flushing via apiFetch.
+ */
+export type NativeUploaderConfig = {
+  /** Full URL including the race id, e.g.
+   *  ``https://sailline-api.../api/races/{uuid}/telemetry``. */
+  url: string;
+  /** Initial Authorization header. Replace later via setAuthHeader. */
+  authHeader: string;
+};
+
+/**
+ * Push a fresh ``Authorization`` header into the running plugin. Safe
+ * to call repeatedly. Used by tokenRefresh.ts when the Firebase ID
+ * token rotates. No-op (silently) if the plugin isn't initialized
+ * yet — the next ready() call will pick up the latest header.
+ */
+export async function setAuthHeader(authHeader: string): Promise<void> {
+  try {
+    await BackgroundGeolocation.setConfig({
+      http: {
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+      },
+    });
+  } catch {
+    // Plugin not ready yet, or v5 transient — fine. The next ready()
+    // picks up whatever was last passed in; missing-token errors will
+    // surface as 401s in onHttp, which JS retries against.
+  }
+}
+
+/**
+ * Force a native sync. Useful as the "flush now" user action — drains
+ * the local queue immediately rather than waiting on autoSync.
+ * Resolves once the sync completes (or rejects on plugin error). Safe
+ * to call when no native uploader is configured; becomes a no-op.
+ */
+export async function syncNow(): Promise<void> {
+  try {
+    await BackgroundGeolocation.sync();
+  } catch {
+    // No-op: in JS mode this isn't expected to do anything useful;
+    // in native mode a sync failure surfaces as an onHttp event.
+  }
+}
+
+/**
+ * Read the current native queue depth — number of locations awaiting
+ * upload. Used by the recorder to reconcile its displayed queueLength
+ * against native truth on foreground events. Falls back to 0 on any
+ * error so the badge never NaNs out.
+ */
+export async function getNativeQueueCount(): Promise<number> {
+  try {
+    return await BackgroundGeolocation.getCount();
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Subscribe to native HTTP events. Returns an unsubscribe handle.
+ * The native layer fires this for every POST attempt regardless of
+ * whether JS is awake — when JS sleeps the events queue and replay
+ * on wake, so the recorder's LiveStats catch up automatically.
+ */
+export function onNativeHttp(
+  callback: (event: {
+    success: boolean;
+    status: number;
+    responseText?: string;
+  }) => void,
+): { remove: () => void } {
+  const sub = BackgroundGeolocation.onHttp((event) => {
+    callback({
+      success: event.success,
+      status: event.status,
+      // responseText is present in v5; cast loosely so a future SDK
+      // tweak doesn't blow the type-check.
+      responseText: (event as { responseText?: string }).responseText,
+    });
+  });
+  return { remove: () => sub.remove() };
+}
 
 /**
  * Normalise a Transistorsoft Location into the canonical local point.
@@ -113,7 +224,10 @@ export function normalizeLocation(location: Location): LocalPoint {
 export async function startWatcher({
   onPosition,
   onError,
-}: WatcherCallbacks): Promise<{ stop: () => Promise<void> }> {
+  nativeUploader,
+}: WatcherCallbacks & {
+  nativeUploader?: NativeUploaderConfig;
+}): Promise<{ stop: () => Promise<void> }> {
   const locationSub: Subscription = BackgroundGeolocation.onLocation(
     (location) => {
       try {
@@ -175,6 +289,57 @@ export async function startWatcher({
     logger: {
       logLevel: BackgroundGeolocation.LogLevel.Warning,
     },
+
+    // ── Phase 4: native HTTP uploader (flag-gated by caller) ────────
+    //
+    // When ``nativeUploader`` is provided, Transistorsoft auto-POSTs
+    // every queued location as it arrives, in batches up to 100. The
+    // body shape MUST exactly match the JS uploader so the same
+    // /telemetry handler accepts both code paths.
+    //
+    // Config split (v5): `locationTemplate` is a TOP-LEVEL Config
+    // option, NOT a member of the http block (that's the v4 shape).
+    // It shapes the per-location JSON the plugin emits, independent of
+    // whether that JSON is POSTed via the http layer or returned via
+    // the JS onLocation callback. The http block carries the transport
+    // (url, headers, batching, rootProperty).
+    //
+    // locationTemplate uses EJS-style interpolation; the supported
+    // variables are the keys of the plugin's Location object. We map
+    // them to our wire shape, including the m/s → knots conversion
+    // for speed. Negative sentinels (when GPS hasn't computed a value)
+    // are passed through as-is; the backend's pydantic pre-validator
+    // (Phase 4) coerces negative values to null so one sentinel
+    // sample can't 422 the whole batch.
+    //
+    // rootProperty="gps" wraps the array as { "gps": [...] } matching
+    // TelemetryBatch on the server. (v4 called this `httpRootProperty`.)
+    ...(nativeUploader
+      ? {
+          // Top-level: shapes the per-location JSON. Numbers emitted
+          // UNQUOTED so they land as JSON numbers, not strings.
+          locationTemplate:
+            '{"t":"<%= timestamp %>",' +
+            '"lat":<%= latitude %>,' +
+            '"lon":<%= longitude %>,' +
+            '"sog_kts":<%= speed * 1.943844 %>,' +
+            '"cog_deg":<%= heading %>,' +
+            '"gps_acc_m":<%= accuracy %>}',
+          http: {
+            url: nativeUploader.url,
+            method: "POST",
+            autoSync: true,
+            autoSyncThreshold: 1,
+            batchSync: true,
+            maxBatchSize: 100,
+            rootProperty: "gps",
+            headers: {
+              Authorization: nativeUploader.authHeader,
+              "Content-Type": "application/json",
+            },
+          },
+        }
+      : {}),
   });
 
   await BackgroundGeolocation.start();

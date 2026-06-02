@@ -16,7 +16,12 @@ import { auth } from "./firebase";
 const PROD_API_URL =
   "https://sailline-api-105706282249.us-central1.run.app";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || PROD_API_URL;
+/**
+ * Base URL the mobile app posts to. Exported so the Phase 4 native
+ * uploader (Transistorsoft's HTTP layer) can compose its per-race
+ * telemetry URL — `${API_URL}/api/races/{race_id}/telemetry`.
+ */
+export const API_URL = process.env.EXPO_PUBLIC_API_URL || PROD_API_URL;
 
 type ApiOptions = {
   method?: string;
