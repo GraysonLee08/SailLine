@@ -5,6 +5,13 @@
 // hook/screen decides how to surface failure. Mirrors the contract of
 // frontend/src/hooks/useRaces.js so a future shared-package extraction
 // (packages/shared/src/api/races.js) is a near-mechanical move.
+//
+// 2026-06-03 — getRace() now defensively normalises `mark_passes` on
+// the way out. Backend has been observed (studio_results_20260602_1741.json)
+// returning the JSONB column as a string of a JSON array instead of as
+// an array. That's a backend serialisation bug to fix separately; this
+// shim keeps the mobile UI honest in the meantime so the in-race pill
+// row doesn't blink-empty on every poll.
 
 import { apiFetch } from "../api";
 import type { Race, RaceMark } from "../types";
@@ -18,14 +25,14 @@ export async function listRaces(): Promise<Race[]> {
   // Server can't return null for a list endpoint (it 200s with []), but
   // apiFetch's signature allows null for 204s. Normalise defensively so
   // callers never have to nullcheck.
-  return data ?? [];
+  return (data ?? []).map(normaliseRace);
 }
 
 /** Fetch a single race by id. Throws on 404. */
 export async function getRace(id: string): Promise<Race> {
   const data = await apiFetch<Race>(`/api/races/${id}`);
   if (!data) throw new Error(`Race ${id} returned no body`);
-  return data;
+  return normaliseRace(data);
 }
 
 /**
@@ -58,7 +65,7 @@ export async function createRace(payload: RacePayload): Promise<Race> {
     body: payload,
   });
   if (!data) throw new Error("POST /api/races returned no body");
-  return data;
+  return normaliseRace(data);
 }
 
 /** Update an existing race. Returns the persisted row. */
@@ -71,7 +78,7 @@ export async function updateRace(
     body: payload,
   });
   if (!data) throw new Error(`PATCH /api/races/${id} returned no body`);
-  return data;
+  return normaliseRace(data);
 }
 
 /** A persisted mark-rounding event — matches the JSONB shape on
@@ -121,5 +128,59 @@ export async function recordManualMarkPass(
   if (!data) {
     throw new Error(`POST /api/races/${raceId}/mark-passes returned no body`);
   }
-  return data;
+  // Same defensive parse the GET path applies — manual-pass response
+  // comes from the same JSONB column.
+  return {
+    ...data,
+    mark_passes: coerceMarkPassArray(data.mark_passes, "manual-pass response"),
+    new_mark_passes: coerceMarkPassArray(
+      data.new_mark_passes,
+      "manual-pass response new_mark_passes",
+    ),
+  };
+}
+
+// ─── Defensive shape normalisation ─────────────────────────────────────
+//
+// Backend has occasionally returned `mark_passes` as a JSON string of a
+// JSON array instead of as an actual array — a serialisation bug in
+// backend/app/routers/races.py (flagged for a separate fix). Until that
+// lands we coerce here so the UI doesn't blink-empty on every poll.
+
+let _warnedDoubleEncoded = false;
+
+function coerceMarkPassArray(value: unknown, ctx: string): MarkPass[] {
+  if (Array.isArray(value)) return value as MarkPass[];
+  if (typeof value === "string" && value.length > 0) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        if (!_warnedDoubleEncoded) {
+          _warnedDoubleEncoded = true;
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[api/races] mark_passes arrived double-encoded (${ctx}); ` +
+              `JSON.parsed it locally. Backend serialisation needs a fix.`,
+          );
+        }
+        return parsed as MarkPass[];
+      }
+    } catch {
+      // fall through to empty array
+    }
+  }
+  return [];
+}
+
+/**
+ * Normalise a Race row coming off the wire. Today this only patches
+ * mark_passes (the known offender); add other coercions here as
+ * shape-drift bugs are spotted.
+ */
+function normaliseRace(race: Race): Race {
+  if (race.mark_passes === undefined || race.mark_passes === null) return race;
+  const coerced = coerceMarkPassArray(race.mark_passes, `race ${race.id}`);
+  // Avoid allocating a new object when the field was already a valid array.
+  if (coerced === (race.mark_passes as unknown)) return race;
+  return { ...race, mark_passes: coerced };
 }

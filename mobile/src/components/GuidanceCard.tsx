@@ -36,11 +36,23 @@ type Props = {
   speedKt: number | null;
   /** Boat's last-known heading (deg true), or null. */
   headingDeg: number | null;
+  /**
+   * True when the recorder is live but hasn't received a fix with
+   * speed/heading yet. Drives the "Waiting…" labels instead of plain
+   * em-dashes so the user knows the values are coming, not broken.
+   * 2026-06-03 A4. */
+  awaitingGps?: boolean;
 };
 
 const METRES_PER_NM = 1852;
 
-export function GuidanceCard({ guidance, totalMarks, speedKt, headingDeg }: Props) {
+export function GuidanceCard({
+  guidance,
+  totalMarks,
+  speedKt,
+  headingDeg,
+  awaitingGps = false,
+}: Props) {
   const { colors, font, size, tabularVariant } = useTheme();
 
   // Bearing-arrow rotation: rotate an upward arrow by (bearing - heading)
@@ -121,7 +133,10 @@ export function GuidanceCard({ guidance, totalMarks, speedKt, headingDeg }: Prop
         </View>
       </View>
 
-      {/* Bottom row: distance + speed + cross-track */}
+      {/* Bottom row: distance + speed + cross-track.
+          When `awaitingGps` we replace bare em-dashes with a "GPS…"
+          microcopy so the user knows the values are pending a fix
+          rather than missing. 2026-06-03 A4. */}
       <View style={styles.statsRow}>
         <Stat
           label="Distance"
@@ -130,14 +145,32 @@ export function GuidanceCard({ guidance, totalMarks, speedKt, headingDeg }: Prop
               ? distNm < 0.5
                 ? `${Math.round(distNm * METRES_PER_NM)}m`
                 : `${distNm.toFixed(2)} nm`
-              : "—"
+              : awaitingGps
+                ? "GPS…"
+                : "—"
           }
+          compact={awaitingGps && distNm == null}
         />
         <Stat
           label="Speed"
-          value={speedKt != null ? `${speedKt.toFixed(1)} kt` : "—"}
+          value={
+            speedKt != null
+              ? `${speedKt.toFixed(1)} kt`
+              : awaitingGps
+                ? "GPS…"
+                : "—"
+          }
+          compact={awaitingGps && speedKt == null}
         />
-        <Stat label="Track" value={xtLabel} compact />
+        <Stat
+          label="Track"
+          value={
+            awaitingGps && (!guidance || guidance.fromMark == null)
+              ? "GPS…"
+              : xtLabel
+          }
+          compact
+        />
       </View>
     </View>
   );

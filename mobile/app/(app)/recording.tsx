@@ -21,12 +21,14 @@ import { Pressable, SafeAreaView, StyleSheet, Text, View } from "react-native";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
+import { ActualRouteLayer } from "../../src/components/ActualRouteLayer";
 import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
 import { MarkPassControls } from "../../src/components/MarkPassControls";
 import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
+import { useAutoPassSetting } from "../../src/hooks/useAutoPassSetting";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
 import { useNextMarkGuidance } from "../../src/hooks/useNextMarkGuidance";
@@ -69,6 +71,9 @@ export default function RecordingScreen() {
   // Layers FAB state — defaults ON during a race so wind context is visible
   // immediately. Home screen owns its own copy of this state independently.
   const [windOn, setWindOn] = useState(true);
+  // Actual-track polyline — ON by default. The whole point of the recording
+  // screen is to see where you've been; hiding by default would defeat it.
+  const [actualOn, setActualOn] = useState(true);
 
   // MapCanvas imperative handle, used by:
   //   1. The mount effect below to fit the camera to the course on entry
@@ -113,6 +118,12 @@ export default function RecordingScreen() {
     return { lat: p.lat, lon: p.lon };
   }, [recorder.lastPoint]);
 
+  // Global auto-pass preference (B2 — 2026-06-03). Default ON; users can
+  // disable in the Settings screen if they prefer to mark passes only
+  // by hand. When OFF, useMissedMarkNotifier still mounts (rules of
+  // hooks) but its `enabled` flag short-circuits the alert path.
+  const autoPass = useAutoPassSetting();
+
   // Fire a watch-actionable notification if the boat plausibly passed a
   // mark that the v3 detector missed (wide pass outside threshold).
   // Background hook — no UI; the notification owns the user surface.
@@ -124,6 +135,7 @@ export default function RecordingScreen() {
     lastPoint: recorder.lastPoint
       ? { lat: recorder.lastPoint.lat, lon: recorder.lastPoint.lon }
       : null,
+    enabled: autoPass.enabled,
   });
 
   // Bounce out if the user navigated here without a race. Use replace,
@@ -176,6 +188,12 @@ export default function RecordingScreen() {
           features={barbFeatures}
           visible={windOn}
           zoom={viewport?.zoom}
+        />
+        {/* Live breadcrumb of fixes captured this session. Hidden when
+            no points yet OR the user toggled it off. 2026-06-03 B3. */}
+        <ActualRouteLayer
+          points={recorder.points}
+          visible={actualOn && recorder.points.length > 0}
         />
       </MapCanvas>
 
@@ -242,11 +260,15 @@ export default function RecordingScreen() {
           </View>
         ) : null}
 
-        {/* Phase 3 — honest upload-health badge. Sits next to LIVE so
-            the user can tell at a glance whether data is reaching the
-            backend. LIVE means "we are recording"; this badge means
-            "we are or are not uploading." */}
-        {recorder.recording ? (
+        {/* Phase 3 — honest upload-health badge. Only renders when
+            uploads need user attention (BUFFER / STALL / OFFLINE).
+            When status === "live" the dedicated LIVE chip above is
+            already saying "all is well," so showing the badge as a
+            second "LIVE" pill is redundant and was reported as a
+            duplicate by the user (2026-06-03). The badge re-appears
+            the moment something is wrong, which IS when we want it
+            visible. */}
+        {recorder.recording && recorder.uploadStatus !== "live" ? (
           <UploadStatusBadge
             status={recorder.uploadStatus}
             queueDepth={recorder.queueLength}
@@ -263,6 +285,8 @@ export default function RecordingScreen() {
         onToggleCompass={() => mapRef.current?.toggleCompass()}
         windOn={windOn}
         headingDeg={viewport?.headingDeg ?? 0}
+        onToggleActualRoute={() => setActualOn((v) => !v)}
+        actualRouteOn={actualOn}
       />
 
       {/* Bottom action stack: marks row + guidance card + Stop button.
@@ -283,6 +307,15 @@ export default function RecordingScreen() {
           totalMarks={selectedRace.marks.length}
           speedKt={recorder.lastPoint?.speed_kts ?? null}
           headingDeg={recorder.lastPoint?.heading_deg ?? null}
+          /* "Waiting for GPS" mode: actively recording but the last
+             fix lacks speed (stationary on a Couch or the SDK hasn't
+             populated speed yet). Suppresses the bare em-dash so the
+             user knows the recorder is alive. 2026-06-03 A4. */
+          awaitingGps={
+            recorder.recording &&
+            (recorder.lastPoint == null ||
+              recorder.lastPoint.speed_kts == null)
+          }
         />
 
         {recorder.recording ? (

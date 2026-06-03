@@ -111,6 +111,30 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   }> | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // 2026-06-03 A3 fix — synchronous re-entry guard for start().
+  //
+  // The existing check `if (watcherRef.current || watcherPromiseRef.current)`
+  // doesn't fire until AFTER the first async tick of start(); two
+  // simultaneous callers (e.g., the auto-start timer firing while the
+  // user also taps the Start FAB) can both pass the guard before
+  // either has written to the refs. The second start() then calls
+  // BackgroundGeolocation.ready() / .start() while the first is still
+  // mid-flight, and Transistorsoft surfaces this as
+  // "Waiting for previous start action to complete" via onError —
+  // which the recording screen then renders as a red banner.
+  //
+  // startingRef is a plain boolean that flips true SYNCHRONOUSLY at the
+  // very top of start() and clears in finally. That blocks the racing
+  // second call before it can touch any Transistorsoft API.
+  const startingRef = useRef(false);
+
+  // Track whether we've seen at least one successful position fix since
+  // the latest start(). Used to clear sticky start-time errors once the
+  // recorder is demonstrably working — without this, a momentarily
+  // surfaced "Waiting for previous start action…" stays on screen for
+  // the rest of the session even after recording is fine.
+  const haveLivePositionRef = useRef(false);
+
   // ── Phase 4 — native uploader state ─────────────────────────────────
   //
   // nativeModeRef is snapshotted at start() time so a mid-session
@@ -390,6 +414,17 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       const id = raceIdRef.current;
       if (!id) return;
 
+      // First successful fix of this session — clear any sticky start
+      // error so a transient "Waiting for previous start action…" or
+      // "permission probe" message doesn't haunt the screen for the
+      // rest of the race once we're demonstrably capturing fixes. We
+      // only do this on the first fix to avoid clobbering a fresh
+      // error raised mid-session (e.g., GPS loss).
+      if (!haveLivePositionRef.current) {
+        haveLivePositionRef.current = true;
+        setError(null);
+      }
+
       // Breadcrumb UI is the same in both modes.
       setPoints((prev) => [...prev, point]);
       setLastPoint(point);
@@ -442,8 +477,22 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       setError("No active race — set one before recording.");
       return;
     }
-    // Idempotent — guard against double-start.
-    if (watcherRef.current || watcherPromiseRef.current) return;
+    // 2026-06-03 A3 — synchronous re-entry guard. startingRef flips
+    // BEFORE the first await so a racing second start() (e.g. the
+    // auto-start timer firing while the user taps Start) is rejected
+    // immediately, rather than slipping past the async refs and
+    // calling Transistorsoft.start() twice. The original watcher refs
+    // alone weren't enough: they're only set inside the promise body,
+    // so both callers could clear the check.
+    if (
+      startingRef.current ||
+      watcherRef.current ||
+      watcherPromiseRef.current
+    ) {
+      return;
+    }
+    startingRef.current = true;
+    haveLivePositionRef.current = false;
 
     setError(null);
     setRecording(true);
@@ -549,9 +598,21 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
         FLUSH_INTERVAL_MS,
       );
     }
+
+    // 2026-06-03 A3 — clear the synchronous re-entry guard now that
+    // start() is fully wired up. A later call may retry without being
+    // rejected for "already starting." If the watcher promise rejected
+    // above we still clear: stop()+start() is the documented recovery
+    // path and shouldn't be blocked by a stale guard.
+    startingRef.current = false;
   }, [onPosition, onError, flushNow, recordLog, handleNativeHttp]);
 
   const stop = useCallback(async () => {
+    // Belt-and-braces: clear the re-entry guard so a subsequent start()
+    // can never be blocked because a prior start() threw before its
+    // clean-up line ran.
+    startingRef.current = false;
+    haveLivePositionRef.current = false;
     // Wait for any in-flight setup, then tear down the watcher.
     if (watcherPromiseRef.current) {
       try {

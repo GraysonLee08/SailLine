@@ -25,6 +25,15 @@ type Props = {
   windOn: boolean;
   /** Current map heading in degrees (0 = north). Rotates the compass icon. */
   headingDeg: number;
+  /**
+   * Optional — when provided, an additional "actual route" toggle FAB
+   * renders below the wind toggle. Used by the /recording screen so
+   * the sailor can show/hide the live track polyline. Omitted on
+   * screens where there is no actual track to render (the home map
+   * before a race starts). 2026-06-03 B3.
+   */
+  onToggleActualRoute?: () => void;
+  actualRouteOn?: boolean;
 };
 
 export function MapFabs({
@@ -33,6 +42,8 @@ export function MapFabs({
   onToggleCompass,
   windOn,
   headingDeg,
+  onToggleActualRoute,
+  actualRouteOn = false,
 }: Props) {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
@@ -68,6 +79,27 @@ export function MapFabs({
         onPress={onToggleWind}
         accessibilityLabel={windOn ? "Hide wind barbs" : "Show wind barbs"}
       />
+      {/* Actual-route toggle — only visible when a handler is wired
+          (i.e., on /recording). Footprint icon reads as "footsteps /
+          where I've been" which matches the polyline meaning better
+          than a generic line/path icon. 2026-06-03 B3. */}
+      {onToggleActualRoute ? (
+        <Fab
+          icon={
+            <Ionicons
+              name={actualRouteOn ? "footsteps" : "footsteps-outline"}
+              size={22}
+              color={
+                actualRouteOn ? colors.accent.recording : colors.text.primary
+              }
+            />
+          }
+          onPress={onToggleActualRoute}
+          accessibilityLabel={
+            actualRouteOn ? "Hide actual track" : "Show actual track"
+          }
+        />
+      ) : null}
       <Fab
         icon={<Ionicons name="navigate" size={22} color={colors.text.primary} />}
         onPress={onLocateMe}

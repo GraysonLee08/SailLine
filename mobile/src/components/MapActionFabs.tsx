@@ -4,29 +4,23 @@
 // controls (compass / wind layer / locate-me). This cluster holds
 // race-action FABs and is only rendered when a race is selected:
 //
-//   - Start FAB (top)        → Start recording.
-//                              Hidden once `recording === true`
-//                              (mirrors the in-sheet primary CTA which
-//                              also disappears).
-//   - Minimize FAB (bottom)  → Collapses the race detail sheet to the
-//                              peek snap point. Only visible when the
-//                              sheet is expanded — matches Google Maps
-//                              where the X only appears when the place
-//                              sheet is open.
+//   - Minimize FAB → Collapses the race detail sheet to the peek snap
+//                    point. Only visible when the sheet is expanded —
+//                    matches Google Maps where the X only appears when
+//                    the place sheet is open.
 //
-// History — 2026-05-29 the cluster also had a Directions (Compute /
-// Recompute) FAB at the top, mirroring Google Maps' Directions button.
-// Removed 2026-05-29 (evening) because it duplicated the Recompute
-// button already inside the race detail sheet header. The Recompute
-// button in the sheet is the single entry point for route compute now.
+// History
+//   - 2026-05-29 the cluster also had a Directions (Compute / Recompute)
+//     FAB. Removed because it duplicated the Recompute button already
+//     inside the race detail sheet header.
+//   - 2026-06-03 the cluster also had a Start FAB. Removed for the same
+//     reason: the RaceDetailSheet already exposes a prominent Start CTA
+//     and the user reported seeing "two recording FABs" when looking at
+//     the home screen. The sheet's Start button is the single entry
+//     point for going into recording mode; this cluster is now purely
+//     about sheet-management UI (Minimize), not action UI.
 //
 // Phase 1 spec: 2026-05-29_mobile-ui-google-maps-mapping.md §4.
-//
-// The cluster intentionally duplicates the Start CTA already inside the
-// RaceDetailSheet. This is the Google Maps pattern: the bottom sheet
-// holds detail; the map holds the always-reachable action surface. The
-// handlers are the same — we share a callback rather than duplicating
-// state.
 
 import { Pressable, StyleSheet, View } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
@@ -35,21 +29,13 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useTheme } from "../theme/ThemeProvider";
 
 type Props = {
-  onStart: () => void;
   onMinimize: () => void;
-  /** Hides the Start FAB once recording is live. */
-  recording: boolean;
   /** Whether the race detail sheet is currently expanded (not at peek).
       The Minimize FAB only renders when this is true. */
   sheetExpanded: boolean;
 };
 
-export function MapActionFabs({
-  onStart,
-  onMinimize,
-  recording,
-  sheetExpanded,
-}: Props) {
+export function MapActionFabs({ onMinimize, sheetExpanded }: Props) {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   // The race detail sheet's peek snap is 32% of screen height. We sit
@@ -58,25 +44,15 @@ export function MapActionFabs({
   // Using bottom inset keeps the cluster off the gesture bar on iOS.
   const bottomOffset = insets.bottom + 296;
 
+  // Nothing to render when the sheet is at peek — the only FAB this
+  // cluster owns today is Minimize, which is sheet-expanded-only. Keep
+  // the View around so the parent's pointerEvents stacking stays
+  // consistent across both states.
   return (
     <View
       style={[styles.cluster, { bottom: bottomOffset }]}
       pointerEvents="box-none"
     >
-      {!recording ? (
-        <Fab
-          icon={
-            <Ionicons
-              name="radio-button-on"
-              size={22}
-              color={colors.text.onAccent}
-            />
-          }
-          onPress={onStart}
-          accessibilityLabel="Start recording"
-          tone="accent"
-        />
-      ) : null}
       {sheetExpanded ? (
         <Fab
           icon={
@@ -95,18 +71,13 @@ function Fab({
   onPress,
   accessibilityLabel,
   disabled,
-  tone,
 }: {
   icon: React.ReactNode;
   onPress: () => void;
   accessibilityLabel: string;
   disabled?: boolean;
-  /** "accent" gives the FAB a coloured background (used for Start). */
-  tone?: "accent";
 }) {
   const { colors } = useTheme();
-  const background =
-    tone === "accent" ? colors.accent.primary : colors.surface.floating;
   return (
     <Pressable
       onPress={onPress}
@@ -116,7 +87,7 @@ function Fab({
       style={({ pressed }) => [
         styles.fab,
         {
-          backgroundColor: background,
+          backgroundColor: colors.surface.floating,
           shadowColor: colors.scrim.shadow,
           opacity: disabled ? 0.5 : pressed ? 0.85 : 1,
           borderColor: colors.border.hairline,

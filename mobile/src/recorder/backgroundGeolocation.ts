@@ -185,7 +185,7 @@ export function normalizeLocation(location: Location): LocalPoint {
   const speed = coords.speed;
   const heading = coords.heading;
   const accuracy = coords.accuracy;
-  return {
+  const point: LocalPoint = {
     recorded_at: new Date(location.timestamp).toISOString(),
     lat: coords.latitude,
     lon: coords.longitude,
@@ -202,7 +202,41 @@ export function normalizeLocation(location: Location): LocalPoint {
         ? accuracy
         : null,
   };
+
+  // 2026-06-03 A4 — sampled diagnostic. The user reports the
+  // GuidanceCard often shows "—" for Speed / Track during a race.
+  // Two failure modes are plausible: (a) Transistorsoft emits the
+  // unavailable-sentinel (-1 in v4, undefined in v5) when stationary
+  // and the mapping above correctly drops them to null — visible UI
+  // dash is the right behaviour, the bug is purely cosmetic; (b)
+  // the SDK never populates speed/heading for some hardware/permission
+  // permutation and the values are null even when moving.
+  //
+  // Log every Nth fix so we can confirm which case is happening from a
+  // single short on-water test, without spamming console at 1 Hz. Dev
+  // build only — production strips console output via the metro
+  // minifier config.
+  if (__DEV__) {
+    NORMALIZE_LOG_COUNTER += 1;
+    if (NORMALIZE_LOG_COUNTER % NORMALIZE_LOG_EVERY === 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        "[geo] sample speed=%s heading=%s acc=%s → speed_kts=%s heading_deg=%s",
+        speed,
+        heading,
+        accuracy,
+        point.speed_kts,
+        point.heading_deg,
+      );
+    }
+  }
+  return point;
 }
+
+// Counter for the sampled normalizeLocation log above. Module-level so
+// the cadence is consistent across whatever screen is mounted.
+let NORMALIZE_LOG_COUNTER = 0;
+const NORMALIZE_LOG_EVERY = 10; // one log per ~10 fixes ≈ once per 10 s
 
 /**
  * Configure Transistorsoft, register the location listener, and start

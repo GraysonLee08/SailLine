@@ -49,6 +49,14 @@ type Options = {
   passes: MarkPass[];
   /** Recorder's most recent fix. */
   lastPoint: { lat: number; lon: number } | null;
+  /**
+   * When false the hook still mounts (rules of hooks) but never arms
+   * its running-min logic and never fires a notification. Drives the
+   * global "auto-pass" toggle in Settings. Default true preserves the
+   * existing behaviour for any caller that hasn't been migrated.
+   * 2026-06-03 B2.
+   */
+  enabled?: boolean;
 };
 
 // Haversine duplicated here to keep this module free of the @sailline/shared
@@ -77,6 +85,7 @@ export function useMissedMarkNotifier({
   marks,
   passes,
   lastPoint,
+  enabled = true,
 }: Options): void {
   // Next-expected mark index. Same logic as MarkPassControls.
   const nextIdx = useMemo(() => {
@@ -92,15 +101,18 @@ export function useMissedMarkNotifier({
   const lastFireRef = useRef<{ markIndex: number; firedAt: number } | null>(null);
   const armedMarkRef = useRef<number | null>(null);
 
-  // Reset whenever the context fundamentally changes.
+  // Reset whenever the context fundamentally changes. Toggling the
+  // global enabled flag also resets so re-enabling mid-race doesn't
+  // fire on a stale running-min from before the user turned it off.
   useEffect(() => {
     runningMinRef.current = null;
     armedMarkRef.current = null;
     lastFireRef.current = null;
     if (raceId) void dismissMissedMarkNotification(raceId);
-  }, [raceId, nextIdx]);
+  }, [raceId, nextIdx, enabled]);
 
   useEffect(() => {
+    if (!enabled) return; // B2 — global "auto-pass" toggle is OFF.
     if (!recording) return;
     if (!raceId) return;
     if (!lastPoint) return;
@@ -153,6 +165,7 @@ export function useMissedMarkNotifier({
       markName: target.name,
     });
   }, [
+    enabled,
     raceId,
     recording,
     marks,

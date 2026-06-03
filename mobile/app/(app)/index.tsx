@@ -11,11 +11,16 @@
 // guarantees a signed-in user before this screen mounts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Pressable, SafeAreaView, StyleSheet, View } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect } from "expo-router";
 
 import { useAuth } from "../../src/auth/AuthContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
+import {
+  AppMenuSheet,
+  type AppMenuSheetHandle,
+} from "../../src/components/AppMenuSheet";
 import { BetterRouteBanner } from "../../src/components/BetterRouteBanner";
 import {
   MapCanvas,
@@ -35,6 +40,7 @@ import { useAutoStartRecorder } from "../../src/recorder/useAutoStartRecorder";
 import { useWeather } from "../../src/hooks/useWeather";
 import { useOrientationSettings } from "../../src/hooks/useOrientationSettings";
 import { useAutoRouteSetting } from "../../src/hooks/useAutoRouteSetting";
+import { useTheme } from "../../src/theme/ThemeProvider";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
 import { listRaces } from "../../src/api/races";
 import {
@@ -46,8 +52,14 @@ import type { Race } from "../../src/types";
 
 export default function MapHomeScreen() {
   const { user, signOut } = useAuth();
+  const { colors } = useTheme();
   const { selectedRace, setSelectedRace, recorder, startRecording } =
     useRecorder();
+
+  // App menu sheet ref — opened by the hamburger button (top-left).
+  // Mounts globally on the home screen so menu actions don't have to
+  // wait for a route push first. 2026-06-03 B1.
+  const menuRef = useRef<AppMenuSheetHandle>(null);
 
   // Race list
   const [races, setRaces] = useState<Race[] | null>(null);
@@ -201,11 +213,33 @@ export default function MapHomeScreen() {
         headingDeg={viewport?.headingDeg ?? 0}
       />
 
+      {/* Hamburger menu button — opens AppMenuSheet (Races, Race
+          Setup, Boats, Settings, Profile, Sign out). Sits top-left so
+          it doesn't compete with the FAB cluster on the right. Inside
+          SafeAreaView so it clears the notch / status bar. 2026-06-03
+          B1. */}
+      <SafeAreaView style={styles.menuButton} pointerEvents="box-none">
+        <Pressable
+          onPress={() => menuRef.current?.open()}
+          accessibilityRole="button"
+          accessibilityLabel="Open menu"
+          style={({ pressed }) => [
+            styles.menuChip,
+            {
+              backgroundColor: colors.surface.floating,
+              borderColor: colors.border.hairline,
+              opacity: pressed ? 0.85 : 1,
+              shadowColor: colors.scrim.shadow,
+            },
+          ]}
+        >
+          <Ionicons name="menu" size={22} color={colors.text.primary} />
+        </Pressable>
+      </SafeAreaView>
+
       {selectedRace ? (
         <MapActionFabs
-          onStart={handleStartRecording}
           onMinimize={() => detailSheetRef.current?.snapToPeek()}
-          recording={recorder.recording}
           sheetExpanded={sheetExpanded}
         />
       ) : null}
@@ -258,10 +292,36 @@ export default function MapHomeScreen() {
           onSignOut={signOut}
         />
       )}
+
+      {/* App menu — mounts at index=-1 (closed). The hamburger button
+          above calls menuRef.current.open() to surface it. 2026-06-03
+          B1. */}
+      <AppMenuSheet
+        ref={menuRef}
+        userEmail={user?.email ?? null}
+        onSignOut={signOut}
+      />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
+  menuButton: {
+    position: "absolute",
+    top: 8,
+    left: 12,
+  },
+  menuChip: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: StyleSheet.hairlineWidth,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 1,
+    shadowRadius: 8,
+    elevation: 3,
+  },
 });
