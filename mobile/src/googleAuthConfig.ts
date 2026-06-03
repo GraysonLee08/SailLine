@@ -10,11 +10,17 @@
 // Setup notes:
 //   - Both clients live in the same Google Cloud project that backs
 //     Firebase (sailline).
-//   - The Android client is registered with SHA-1
-//     EB:DD:FA:C8:A4:0F:E4:F6:BF:5A:AB:53:32:4B:41:25:90:39:7B:B0
-//     which is the EAS-managed *development* keystore. When we ship to
-//     production, the release keystore has a DIFFERENT SHA-1 — add it as
-//     a second fingerprint to the same Android client at that point.
+//   - The Android OAuth client (com.sailline.app) is registered with
+//     these SHA-1 fingerprints — multiple are allowed on one client:
+//       6C:A1:B3:A3:5D:17:C4:5E:62:E5:93:44:60:3B:09:54:B5:F5:75:21
+//         previously registered (pre-prebuild, likely EAS-managed)
+//       5E:8F:16:06:2E:A3:CD:2C:4A:0D:54:78:76:BA:A6:F3:8C:AB:F6:25
+//         android/app/debug.keystore — the local default debug key used
+//         by `expo prebuild` + Gradle builds (added 2026-06-03)
+//   - When we ship a real release, the release keystore will have its
+//     own SHA-1 — add it as another fingerprint to this same client.
+//     Symptom of a missing fingerprint: code 10 DEVELOPER_ERROR from
+//     @react-native-google-signin/google-signin at sign-in.
 
 export const GOOGLE_WEB_CLIENT_ID =
   "105706282249-v6gpoe4as4u26ur1hk9k3obli9p5dn2s.apps.googleusercontent.com";
