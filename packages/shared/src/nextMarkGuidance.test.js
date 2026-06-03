@@ -3,6 +3,17 @@
 // Pure tests for the live next-mark guidance helpers. Vitest, run via
 // the frontend's npm test (the workspace test runner picks up
 // packages/shared/**/*.test.js).
+//
+// v3 detector note (2026-05-30, commit adf2c97): `MarkRoundingDetector`
+// switched from fixed-radius enter/exit to streaming sequential CPA.
+// A pass now fires when (a) the running minimum-distance to the mark
+// is at or below threshold AND (b) DEPART_CONFIRM_SAMPLES (=3)
+// strictly-increasing samples follow the CPA. The pre-v3 pattern of
+// "one point south + one point on + one point north" doesn't trigger
+// the detector because it lacks enough strictly-increasing samples
+// after the CPA. Tests that need to simulate a rounding use the
+// `passMark()` helper below to generate a CPA-with-three-departures
+// pattern per mark.
 
 import { describe, it, expect } from "vitest";
 
@@ -12,6 +23,27 @@ import {
   initialBearingDeg,
 } from "./nextMarkGuidance.js";
 import { FINAL_MARK_RADIUS_M } from "./markRounding.js";
+
+/**
+ * Generate a point sequence that fires the v3 detector for one mark:
+ * a CPA sample on the mark, followed by three strictly-increasing
+ * northward samples (departing the mark). Returns 4 points starting
+ * at offset `tOffsetS` seconds.
+ *
+ * Samples step 55m → 110m → 220m north of the mark after the CPA, all
+ * well inside the FINAL_MARK_RADIUS_M (=150m) threshold's CPA window
+ * (CPA distance is 0). The next mark in the course is far enough away
+ * that the chained-feed-after-emit doesn't accidentally count these
+ * departing samples toward the next mark's traversal.
+ */
+function passMark(mark, tOffsetS) {
+  return [
+    { lat: mark.lat,           lon: mark.lon, ts: new Date((tOffsetS + 0) * 1000).toISOString() }, // CPA
+    { lat: mark.lat + 0.0005,  lon: mark.lon, ts: new Date((tOffsetS + 1) * 1000).toISOString() }, // dep1 ≈ +55 m
+    { lat: mark.lat + 0.0010,  lon: mark.lon, ts: new Date((tOffsetS + 2) * 1000).toISOString() }, // dep2 ≈ +111 m
+    { lat: mark.lat + 0.0020,  lon: mark.lon, ts: new Date((tOffsetS + 3) * 1000).toISOString() }, // dep3 ≈ +222 m → emit
+  ];
+}
 
 // ── initialBearingDeg ──────────────────────────────────────────────────
 
@@ -80,19 +112,19 @@ const MARKS = [
 
 describe("computeGuidance", () => {
   it("returns null when there is no next mark (race finished)", () => {
-    // Force-replay all marks by feeding tight in/out points around each.
+    // Round every mark by replaying the v3 detector's CPA + departure
+    // pattern at each. Each mark contributes 4 points (CPA + 3
+    // strictly-increasing departures); the chained emit drains the
+    // pass before the next mark's pattern starts.
     const points = [];
-    for (const m of MARKS) {
-      // approach from the south, exit to the north (within 10m of the mark)
-      points.push({ lat: m.lat - 0.001, lon: m.lon, ts: "2026-05-26T00:00:00Z" });
-      points.push({ lat: m.lat, lon: m.lon, ts: "2026-05-26T00:00:01Z" });
-      points.push({ lat: m.lat + 0.001, lon: m.lon, ts: "2026-05-26T00:00:02Z" });
-    }
+    MARKS.forEach((m, i) => {
+      points.push(...passMark(m, i * 100));
+    });
     const result = computeGuidance({
       marks: MARKS,
       points,
       current: { lat: 41.911, lon: -87.600 },
-      radiusM: FINAL_MARK_RADIUS_M, // wide enough for all marks in this test
+      radiusM: FINAL_MARK_RADIUS_M, // 150 m — CPA of 0 m is well inside
     });
     expect(result).toBeNull();
   });
@@ -142,13 +174,12 @@ describe("computeGuidance", () => {
   });
 
   it("computes a non-zero cross-track on the second leg", () => {
-    // Round mark A first.
-    const points = [
-      { lat: 41.899, lon: -87.600, ts: "2026-05-26T00:00:00Z" },
-      { lat: 41.900, lon: -87.600, ts: "2026-05-26T00:00:01Z" }, // inside
-      { lat: 41.9005, lon: -87.600, ts: "2026-05-26T00:00:02Z" }, // exit
-    ];
-    // Now sailing toward B; current point offset to the east of the line.
+    // Round mark A with the v3 detector's CPA + 3 departing pattern.
+    // The departing samples stay 222 m north of A (still ~890 m south
+    // of B), so they don't accidentally round B too.
+    const points = passMark(MARKS[0], 0);
+    // Now sailing toward B; current point offset slightly east of the
+    // A→B line.
     const result = computeGuidance({
       marks: MARKS,
       points,
