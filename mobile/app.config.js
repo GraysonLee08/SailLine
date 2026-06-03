@@ -12,25 +12,30 @@
 //                                 react-native-safe-area-context).
 //   * expo-dev-client           — required: Transistorsoft is a native
 //                                 module, so Expo Go can't load it. We run
-//                                 a custom dev client built by EAS.
+//                                 a custom dev client.
 //   * react-native-background-geolocation (Transistorsoft) — the capture
 //                                 engine.
 //   * expo-gradle-ext-vars      — Transistorsoft's required companion.
 //   * @react-native-google-signin/google-signin — native Google Sign-In.
 //   * expo-notifications        — T-6 reminder paired with the T-5
 //                                 BackgroundFetch fallback.
-//   * @rnmapbox/maps            — map canvas. Requires a build-time
-//                                 download token (Mapbox secret access
-//                                 token, scoped DOWNLOADS:READ) for the
-//                                 private Maven repo + a runtime public
-//                                 token used by the JS SDK at runtime.
-//                                 Both come from EAS secrets:
-//                                   MAPBOX_DOWNLOAD_TOKEN — build-time
-//                                   EXPO_PUBLIC_MAPBOX_TOKEN — runtime (pk.*)
-//                                 The plugin block below uses the
-//                                 download token; the runtime token is
-//                                 read by src/components/MapCanvas.tsx via
-//                                 process.env.EXPO_PUBLIC_MAPBOX_TOKEN.
+//   * @rnmapbox/maps            — map canvas.
+//
+// SECRETS — prebuild pivot 2026-06-02
+// -----------------------------------
+// We moved off EAS to local Gradle. Secrets that used to be EAS secrets
+// (MAPBOX_DOWNLOAD_TOKEN, TRANSISTOR_LICENSE) now live in
+// ~/.gradle/gradle.properties (user-global, NOT committed). The Gradle
+// plugins below read them via project.findProperty('NAME') at build
+// time, NOT via process.env here. That decoupling means:
+//
+//   * `expo prebuild` does NOT need the env vars set to succeed.
+//   * `gradlew assembleDebug` reads them on every build.
+//   * Forgetting to set them surfaces as a Gradle error, not a silent
+//     "UNDEFINED" baked into the generated config.
+//
+// See sailline-docs/2026-06-02_C1-prebuild-runbook.md for the one-time
+// setup of those properties.
 
 module.exports = ({ config }) => ({
   ...config,
@@ -68,6 +73,21 @@ module.exports = ({ config }) => ({
     ...(config.plugins || []),
     "expo-router",
     "expo-dev-client",
+    // Transistorsoft react-native-background-geolocation
+    //
+    // Plugin config no longer takes the license here. With this argument
+    // omitted, prebuild does NOT bake a license string into
+    // android/app/src/main/res/values/strings.xml. Instead, the Gradle
+    // companion (expo-gradle-ext-vars below) emits a buildscript hook
+    // that reads `TRANSISTOR_LICENSE` from gradle.properties at build
+    // time and exposes it to the SDK's manifest-placeholder mechanism.
+    //
+    // If you want to override this locally without touching gradle.properties
+    // (e.g., for a quick dev test), set the env var before prebuild:
+    //   $env:TRANSISTOR_LICENSE = "..."
+    //   npx expo prebuild
+    // The conditional below catches that case for parity with the prior
+    // behaviour.
     [
       "react-native-background-geolocation",
       process.env.TRANSISTOR_LICENSE
@@ -99,18 +119,22 @@ module.exports = ({ config }) => ({
     [
       "@rnmapbox/maps",
       {
-        // Pass the download token ONLY when set. Mirrors the
-        // transistorsoft pattern — an unset value would write the
-        // literal "UNDEFINED" into the gradle config and break the
-        // private-Maven fetch. With the token unset, the prebuild
-        // emits the @rnmapbox plugin config but gradle download
-        // resolution will fail; set the EAS secret before building:
-        //   eas secret:create --name MAPBOX_DOWNLOAD_TOKEN --value <sk.*>
-        // See https://docs.mapbox.com/help/getting-started/access-tokens/
-        // for token scopes (secret token with DOWNLOADS:READ enabled).
-        ...(process.env.MAPBOX_DOWNLOAD_TOKEN
-          ? { RNMapboxMapsDownloadToken: process.env.MAPBOX_DOWNLOAD_TOKEN }
-          : {}),
+        // No RNMapboxMapsDownloadToken here.
+        //
+        // Previously this read process.env.MAPBOX_DOWNLOAD_TOKEN and baked
+        // the secret into android/build.gradle on prebuild. Since the
+        // android/ tree is now committed, baking a secret into it is a
+        // security incident waiting to happen.
+        //
+        // The @rnmapbox/maps Gradle plugin already resolves
+        // MAPBOX_DOWNLOADS_TOKEN from project properties (gradle.properties)
+        // when not passed explicitly here. Put it in
+        // ~/.gradle/gradle.properties — see C1 runbook.
+        //
+        // Verify the token is being read by running:
+        //   cd mobile/android; .\gradlew :app:dependencies | findstr mapbox
+        // If the resolution fails with 401, the property is missing or the
+        // token lacks the DOWNLOADS:READ scope (must start with `sk.`).
       },
     ],
   ],

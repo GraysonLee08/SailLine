@@ -342,14 +342,21 @@ def pack_npz(
 
 
 def upload_to_gcs(blob_bytes: bytes, region: str) -> str:
-    bucket_name = os.environ.get("GCS_WEATHER_BUCKET")
-    if not bucket_name:
-        raise RuntimeError("GCS_WEATHER_BUCKET env var not set")
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(f"bathymetry/{region}/depth.npz")
-    blob.upload_from_string(blob_bytes, content_type="application/octet-stream")
-    uri = f"gs://{bucket_name}/{blob.name}"
+    """Upload the packed npz to ``bathymetry/{region}/depth.npz``.
+
+    Uses the shared :class:`~app.services.ingest.archive.GcsArchive`
+    wrapper introduced in Phase 4. Every ingest worker now goes
+    through one upload path — a future bucket consolidation is a
+    one-line change.
+    """
+    from app.services.ingest import GcsArchive
+    archive = GcsArchive.from_env("GCS_WEATHER_BUCKET", storage_module=storage)
+    uri = archive.upload(
+        f"bathymetry/{region}/depth.npz",
+        blob_bytes,
+        content_type="application/octet-stream",
+        gzip_encoded=False,
+    )
     log.info("uploaded %.1f MB → %s", len(blob_bytes) / 1e6, uri)
     return uri
 

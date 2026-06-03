@@ -1,22 +1,31 @@
 # backend/workers/route_recompute.py
-"""Background route recomputation worker — Google-Maps-style 'better route' alerts.
+"""Background route recomputation worker — 'better route' alerts.
 
-Triggered after each weather_ingest cycle finishes. Walks every active
-race (start_at within recompute window), runs the routing pipeline against
-the freshest forecast, compares total_minutes vs the previously-cached
-best, and publishes a notification when the improvement clears the threshold.
+Triggered after each weather_ingest cycle. Walks every active race
+(``start_at`` within the recompute window), runs the routing pipeline
+against the freshest forecast, compares total_minutes vs the
+previously-stored baseline, and publishes a notification when the
+improvement clears the threshold. Frontend opens an SSE stream on
+``/api/routing/notifications/{race_id}`` to tail the per-race Redis
+pub/sub channel.
 
-Frontend opens an SSE stream on /api/routing/notifications/{race_id} that
-tails the per-race Redis pub/sub channel and surfaces the popup.
+Faithful replay
+---------------
+The synchronous endpoint stores the user's last :class:`RouteRequest`
+under ``route:last_request:{race_id}``. This worker reads it and
+overlays the canonical race fields (marks, start_at, boat_class) from
+the DB onto a fresh :class:`RouteRequest`. That way:
 
-Region resolution mirrors the user-facing endpoint: the marks centroid
-picks both a base region (drives wind + bathymetry) and an optional
-venue (drives harbour-scale ENC hazard loading). Currents resolution
-also mirrors the endpoint: OFS sources whose bbox overlaps the marks
-bbox contribute fields to a CurrentForecast. The background recompute
-must use the same forcing as the synchronous endpoint or 'better' routes
-could cut across model features the user-facing route correctly avoided
-— that would surface as alerts the user immediately distrusts.
+* The same ``safety_factor``, ``duration_hours``, and
+  :class:`DeratingProfile` the user chose are applied here.
+* A race that has been rescheduled or had marks moved since the user
+  last computed gets the new canonical state, not stale snapshots.
+
+When no stored request exists (cold start: Redis flushed, or race
+never opened in the editor since this code shipped) the worker falls
+back to library defaults — the same values the previous hardcoded
+worker used. Cold-start fallbacks are logged so we can monitor the
+frequency.
 
 Trigger options (pick one when wiring infra):
     A. Cloud Scheduler job runs this 5 min after each ingest cycle.
@@ -24,7 +33,7 @@ Trigger options (pick one when wiring infra):
        subscribes and reacts. Lower latency, more moving parts.
 
 This file implements the recompute logic. The trigger wiring lives in
-infra/ — see docs/recompute-rollout.md (TODO).
+infra/ — see docs/recompute-rollout.md.
 """
 from __future__ import annotations
 
@@ -32,32 +41,27 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from uuid import UUID
 
 import asyncpg
 
 from app import db, redis_client
-from app.currents_regions import sources_covering_marks
-from app.regions import base_region_for_point, venue_for_point
 from app.services.bathymetry import BathymetryUnavailable
-from app.services.boats import spec_for_class
-from app.services.currents import (
-    CurrentForecast,
-    CurrentsUnavailable,
-    load_currents_for_race,
+from app.services.redis_keys import (
+    ROUTE_NOTIFICATION_TTL_S,
+    route_alternative_key,
+    route_last_best_key,
+    route_notifications_channel,
 )
-from app.services.polars import load_polar
 from app.services.routing import (
-    DEFAULT_SAFETY_FACTOR,
-    compute_isochrone_route_multileg,
-    make_navigable_predicate,
-    route_to_geojson,
+    RouteRequest,
+    compute_route,
+    load_last_request,
+    request_with_knobs,
 )
-from app.services.weather import ForecastNotAvailable, load_forecast_for_race
+from app.services.weather import ForecastNotAvailable
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +75,9 @@ RECOMPUTE_WINDOW_AFTER_HOURS = 2
 # is 12 minutes — meaningful. Tune based on user feedback.
 IMPROVEMENT_THRESHOLD = 0.05
 
-NOTIFICATION_TTL_S = 7 * 24 * 3600  # last week of alerts kept for review
+# Re-exported for the test suite. Kept as a module constant for now;
+# moves to ``app.services.redis_keys`` if we ever want a single TTL knob.
+NOTIFICATION_TTL_S = ROUTE_NOTIFICATION_TTL_S
 
 
 @dataclass
@@ -97,7 +103,7 @@ async def _list_active_races(conn: asyncpg.Connection) -> list[_ActiveRace]:
         """,
         window_start, window_end,
     )
-    races = []
+    races: list[_ActiveRace] = []
     for row in rows:
         marks_raw = row["marks"]
         marks = json.loads(marks_raw) if isinstance(marks_raw, (bytes, str)) else (marks_raw or [])
@@ -111,73 +117,32 @@ async def _list_active_races(conn: asyncpg.Connection) -> list[_ActiveRace]:
     return races
 
 
-def _resolve_region(marks: list[dict]) -> tuple[str, Optional[str]]:
-    """Return (base_region, venue_or_None) for the marks centroid.
-
-    Matches the synchronous endpoint's resolver so background recomputes
-    use the same hazard set as user-facing computes.
-    """
-    lat_c = sum(m["lat"] for m in marks) / len(marks)
-    lon_c = sum(m["lon"] for m in marks) / len(marks)
-    base = base_region_for_point(lat_c, lon_c)
-    venue = venue_for_point(lat_c, lon_c)
-    return (
-        base.name if base is not None else "conus",
-        venue.name if venue is not None else None,
-    )
-
-
-async def _load_currents_optional(
-    marks: list[dict],
-    race_start: datetime,
-    race_id: UUID,
-) -> Optional[CurrentForecast]:
-    """Mirror of the router's optional-currents loader.
-
-    Currents are non-fatal in the background recompute exactly as in the
-    synchronous endpoint: any failure (no source covers the bbox, no
-    ingested cycle, transient Redis blip) returns None and the route
-    still computes. Keeping the policy identical avoids spurious 'better
-    route' alerts driven by inconsistent currents handling.
-    """
-    sources = sources_covering_marks(marks)
-    if not sources:
-        return None
-    try:
-        return await load_currents_for_race(
-            sources=sources, race_start=race_start,
-        )
-    except CurrentsUnavailable as exc:
-        log.info("currents unavailable for race=%s: %s", race_id, exc)
-        return None
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "currents load raised for race=%s (proceeding without): %s",
-            race_id, exc,
-        )
-        return None
-
-
-async def _read_last_total_minutes(race_id: UUID) -> Optional[float]:
+async def _read_last_total_minutes(race_id: UUID) -> float | None:
     """Last total_minutes we notified about (or computed) for this race."""
     redis = redis_client.get_client()
-    blob = await redis.get(f"route:last_best:{race_id}")
+    blob = await redis.get(route_last_best_key(race_id))
     return float(blob) if blob is not None else None
 
 
 async def _store_last_total_minutes(race_id: UUID, total_minutes: float) -> None:
     redis = redis_client.get_client()
-    await redis.setex(f"route:last_best:{race_id}",
-                      NOTIFICATION_TTL_S,
-                      str(total_minutes).encode())
+    await redis.setex(
+        route_last_best_key(race_id),
+        NOTIFICATION_TTL_S,
+        str(total_minutes).encode(),
+    )
 
 
-async def _publish_better_route(race: _ActiveRace, route_feature: dict,
-                                old_minutes: float, new_minutes: float) -> None:
+async def _publish_better_route(
+    race: _ActiveRace,
+    route_feature: dict,
+    old_minutes: float,
+    new_minutes: float,
+) -> None:
     """Push a 'better route available' message to the per-race channel.
 
     Frontend SSE handler reads from this channel and shows the popup.
-    Also persists the alternative route under route:alternative:{race_id}
+    Also persists the alternative route under ``route:alternative:{race_id}``
     so the user can fetch it after dismissing the popup.
     """
     redis = redis_client.get_client()
@@ -191,98 +156,72 @@ async def _publish_better_route(race: _ActiveRace, route_feature: dict,
         "computed_at": datetime.now(timezone.utc).isoformat(),
     }
     payload_blob = json.dumps(payload).encode()
-    await redis.setex(f"route:alternative:{race.id}", NOTIFICATION_TTL_S, payload_blob)
-    await redis.publish(f"route:notifications:{race.id}", payload_blob)
-    log.info("better-route notification race=%s old=%.1fmin new=%.1fmin (-%.1f%%)",
-             race.id, old_minutes, new_minutes, payload["improvement_pct"])
+    await redis.setex(route_alternative_key(race.id), NOTIFICATION_TTL_S, payload_blob)
+    await redis.publish(route_notifications_channel(race.id), payload_blob)
+    log.info(
+        "better-route notification race=%s old=%.1fmin new=%.1fmin (-%.1f%%)",
+        race.id, old_minutes, new_minutes, payload["improvement_pct"],
+    )
 
 
-async def _recompute_one(race: _ActiveRace, pool: asyncpg.Pool) -> None:
-    region, venue = _resolve_region(race.marks)
+async def _build_request(race: _ActiveRace) -> RouteRequest:
+    """Build the :class:`RouteRequest` to feed the pipeline.
 
-    try:
-        spec = spec_for_class(race.boat_class)
-    except Exception as exc:
-        log.warning("race=%s skip: unknown boat_class %s (%s)",
-                    race.id, race.boat_class, exc)
-        return
-
-    try:
-        forecast = await load_forecast_for_race(
-            region=region, race_start=race.start_at,
+    Reads the user's stored knobs (set by the endpoint on every
+    successful compute) and overlays the canonical race fields. Cold
+    start fallback uses library defaults and is logged.
+    """
+    redis = redis_client.get_client()
+    knobs = await load_last_request(race.id, redis=redis)
+    if knobs is None:
+        log.info(
+            "race=%s no stored knobs — using library defaults for recompute",
+            race.id,
         )
+    return request_with_knobs(
+        race_id=race.id,
+        marks=race.marks,
+        race_start=race.start_at,
+        boat_class=race.boat_class,
+        knobs=knobs,
+    )
+
+
+async def _recompute_one(race: _ActiveRace) -> None:
+    req = await _build_request(race)
+    redis = redis_client.get_client()
+
+    try:
+        outcome = await compute_route(req, redis=redis, use_cache=False)
     except ForecastNotAvailable:
-        # Just outside HRRR yet. Re-run on the next cycle.
+        # Just outside the model horizon. Re-run on the next cycle.
+        return
+    except BathymetryUnavailable as exc:
+        log.warning("race=%s skip: %s", race.id, exc)
         return
     except RuntimeError as exc:
-        log.warning("race=%s forecast load failed: %s", race.id, exc)
+        log.warning("race=%s forecast/setup failed: %s", race.id, exc)
         return
 
-    currents = await _load_currents_optional(
-        marks=race.marks, race_start=race.start_at, race_id=race.id,
-    )
-
-    try:
-        is_navigable = make_navigable_predicate(
-            region=region, draft_m=spec.draft_m,
-            safety_factor=DEFAULT_SAFETY_FACTOR,
-            venue=venue,
-        )
-    except BathymetryUnavailable:
-        log.warning("race=%s skip: no bathymetry for region=%s", race.id, region)
-        return
-
-    polar = load_polar(f"app/services/polars/{spec.polar_csv}")
-
-    log.info(
-        "recompute race=%s region=%s venue=%s polar=%s marks=%d currents=%s",
-        race.id, region, venue, polar.name, len(race.marks),
-        currents.quality if currents is not None else "off",
-    )
-
-    # Multi-leg with default derating. The synchronous endpoint accepts
-    # caller-supplied max_tws_kt / hs_m / polar_margin / density_factor;
-    # the background recompute uses safe defaults so its routes are
-    # apples-to-apples with a freshly-computed user-facing route on a
-    # default request body. Currents are loaded with the same policy as
-    # the endpoint (None-on-failure) for the same reason.
-    result = compute_isochrone_route_multileg(
-        marks=race.marks,
-        polar=polar, wind=forecast,
-        is_navigable=is_navigable,
-        race_start=race.start_at,
-        currents=currents,
-        max_tws_kt=None,
-        hs_m=0.0,
-        density_factor=1.0,
-        polar_margin=0.97,
-    )
-    if not result.reached:
+    if not outcome.meta.get("reached"):
         log.info("race=%s recompute did not reach finish — not notifying", race.id)
         return
 
+    new_minutes = float(outcome.meta["total_minutes"])
     last = await _read_last_total_minutes(race.id)
     if last is None:
         # First time we've seen this race — establish the baseline silently.
-        await _store_last_total_minutes(race.id, result.total_minutes)
+        await _store_last_total_minutes(race.id, new_minutes)
         return
 
-    if last - result.total_minutes < last * IMPROVEMENT_THRESHOLD:
+    if last - new_minutes < last * IMPROVEMENT_THRESHOLD:
         # Within noise. Refresh the baseline so a slow-drifting forecast
         # doesn't accumulate beyond threshold without ever notifying.
-        await _store_last_total_minutes(race.id, result.total_minutes)
+        await _store_last_total_minutes(race.id, new_minutes)
         return
 
-    feature = route_to_geojson(result, properties={
-        "race_start": race.start_at.isoformat(),
-        "forecast_quality": forecast.quality,
-        "polar": polar.name,
-        "region": region,
-        "venue": venue,
-        "currents_quality": currents.quality if currents is not None else None,
-    })
-    await _publish_better_route(race, feature, last, result.total_minutes)
-    await _store_last_total_minutes(race.id, result.total_minutes)
+    await _publish_better_route(race, outcome.feature, last, new_minutes)
+    await _store_last_total_minutes(race.id, new_minutes)
 
 
 async def recompute_all() -> None:
@@ -294,7 +233,7 @@ async def recompute_all() -> None:
     # off the engine's numpy paths. Parallelize if backlog grows.
     for race in races:
         try:
-            await _recompute_one(race, pool)
+            await _recompute_one(race)
         except Exception as exc:  # noqa: BLE001
             log.exception("race=%s recompute failed: %s", race.id, exc)
 
@@ -303,8 +242,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Route recomputation worker")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
-    logging.basicConfig(level=args.log_level,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     asyncio.run(recompute_all())
 
 

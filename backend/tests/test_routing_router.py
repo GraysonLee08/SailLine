@@ -1,10 +1,23 @@
 # backend/tests/test_routing_router.py
-"""Tests for /api/routing/compute under the rolling-forecast contract.
+"""HTTP transport tests for /api/routing/compute.
 
-Mocks load_forecast_for_race rather than Redis blobs — the loader's own
-test file (test_forecast_loader.py) covers the Redis-side details. This
-keeps router tests focused on HTTP contract: 200 on success, 425 when
-forecast pending, cache hit semantics, ownership scoping.
+Post Phase 2 the router is a thin shell over
+``app.services.routing.pipeline.compute_route``. These tests mock
+``compute_route`` itself and verify the HTTP-shaped concerns:
+
+* 200 with the pipeline's RouteOutcome marshaled into the response.
+* 425 (Too Early) when the pipeline raises :class:`ForecastNotAvailable`.
+* 503 when the pipeline raises :class:`BathymetryUnavailable` or
+  :class:`RuntimeError`.
+* 400 when the race has fewer than 2 marks (pre-pipeline guard).
+* 404 when the race is not owned by the caller.
+* Race-start fallback to ``now()`` when ``start_at`` is NULL.
+* The user's :class:`RouteRequest` is persisted via ``save_last_request``
+  on success — this is the wire that lets the background recompute
+  worker replay user knobs.
+
+The pipeline's own internals (region resolution, forecast loading,
+engine call, cache key) are covered by ``test_routing_pipeline.py``.
 """
 from __future__ import annotations
 
@@ -13,14 +26,13 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.routers import routing as routing_module
-from app.services.routing.isochrone import WindField, RouteResult
-from app.services.routing.wind_forecast import WindForecast
+from app.services.bathymetry import BathymetryUnavailable
+from app.services.routing.pipeline import RouteOutcome
 from app.services.weather.forecast_loader import ForecastNotAvailable
 
 
@@ -36,37 +48,41 @@ def waukegan_chicago_marks():
 
 
 @pytest.fixture
-def fake_forecast():
-    """A 2-snapshot WindForecast covering 2 hours of southerly 5 m/s."""
-    def _field(valid_iso):
-        return WindField(
-            lats=np.array([41.0, 42.0, 43.0]),
-            lons=np.array([-89.0, -88.0, -87.0]),
-            u=np.zeros((3, 3), dtype=np.float32),
-            v=np.full((3, 3), 5.0, dtype=np.float32),
-            reference_time="2026-05-05T12:00:00+00:00",
-            valid_time=valid_iso,
-            source="hrrr",
-        )
-    return WindForecast(
-        snapshots=[
-            _field("2026-05-05T12:00:00+00:00"),
-            _field("2026-05-05T14:00:00+00:00"),
-        ],
-        quality="hrrr",
-    )
-
-
-@pytest.fixture
-def fake_engine_result():
-    return RouteResult(
-        path=[(42.3636, -87.8261), (42.1, -87.7), (41.8881, -87.6132)],
-        headings=[200.0, 200.0],
-        total_minutes=420.0,
-        tack_count=2,
-        reached=True,
-        iterations=84,
-        nodes_explored=2400,
+def fake_outcome():
+    """Stand-in for what ``compute_route`` returns. Real pipeline tests
+    cover the field set; here we only need enough for the HTTP marshal."""
+    return RouteOutcome(
+        feature={
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": [[-87.83, 42.36], [-87.61, 41.89]]},
+            "properties": {"region": "conus"},
+        },
+        meta={
+            "total_minutes": 420.0,
+            "tack_count": 2,
+            "reached": True,
+            "iterations": 84,
+            "nodes_explored": 2400,
+            "legs": 1,
+            "region": "conus",
+            "venue": None,
+            "forecast_quality": "hrrr",
+            "race_start": "2026-05-05T13:00:00+00:00",
+            "polar": "beneteau_36_7",
+            "boat_class": "Beneteau First 36.7",
+            "draft_m": 2.05,
+            "min_depth_m": 3.075,
+            "cached": False,
+            "max_tws_kt": None,
+            "polar_margin": 0.97,
+            "hs_m": 0.0,
+            "density_factor": 1.0,
+            "currents_quality": None,
+            "start_wind_dir_deg": 180.0,
+            "start_wind_speed_kt": 10.0,
+        },
+        cached=False,
+        cache_key="route:v11-pipeline:irrelevant",
     )
 
 
@@ -82,14 +98,13 @@ def race_row(waukegan_chicago_marks):
 
 @pytest.fixture
 def mock_conn():
-    conn = AsyncMock()
-    return conn
+    return AsyncMock()
 
 
 @pytest.fixture
 def mock_redis():
     redis = AsyncMock()
-    redis.get.return_value = None  # no cache hits by default
+    redis.get.return_value = None
     redis.setex.return_value = True
     return redis
 
@@ -116,20 +131,16 @@ def client(mock_conn, mock_redis):
 # ─── Tests ───────────────────────────────────────────────────────────────
 
 
-def test_compute_route_happy_path(
-    client, mock_conn, mock_redis, race_row, fake_forecast, fake_engine_result,
-):
+def test_compute_route_happy_path(client, mock_conn, race_row, fake_outcome):
     mock_conn.fetchrow.return_value = race_row
 
     with patch.object(
-        routing_module, "load_forecast_for_race",
-        new=AsyncMock(return_value=fake_forecast),
-    ), patch.object(
-        routing_module, "compute_isochrone_route_multileg",
-        return_value=fake_engine_result,
-    ), patch.object(
-        routing_module, "make_navigable_predicate", return_value=lambda *a, **k: True,
-    ):
+        routing_module, "compute_route",
+        new=AsyncMock(return_value=fake_outcome),
+    ) as mock_compute, patch.object(
+        routing_module, "save_last_request",
+        new=AsyncMock(return_value=None),
+    ) as mock_save:
         r = client.post("/api/routing/compute",
                         json={"race_id": str(race_row["id"])})
 
@@ -137,21 +148,22 @@ def test_compute_route_happy_path(
     body = r.json()
     assert body["meta"]["reached"] is True
     assert body["meta"]["forecast_quality"] == "hrrr"
-    assert body["meta"]["cached"] is False
     assert body["meta"]["region"] == "conus"
-    assert body["meta"]["legs"] == 1
-    assert body["meta"]["polar_margin"] == pytest.approx(0.97)
-    mock_redis.setex.assert_awaited_once()
+    assert body["route"]["type"] == "Feature"
+
+    # Pipeline was called once; save_last_request was called once with
+    # the same RouteRequest. The persisted request is what the worker
+    # replays — the wiring matters.
+    mock_compute.assert_awaited_once()
+    mock_save.assert_awaited_once()
 
 
-def test_compute_route_returns_425_when_forecast_pending(
-    client, mock_conn, race_row,
-):
+def test_compute_route_returns_425_when_forecast_pending(client, mock_conn, race_row):
     mock_conn.fetchrow.return_value = race_row
     available_at = datetime.now(timezone.utc) + timedelta(hours=6)
 
     with patch.object(
-        routing_module, "load_forecast_for_race",
+        routing_module, "compute_route",
         new=AsyncMock(side_effect=ForecastNotAvailable(
             available_at=available_at,
             reason="race starts beyond HRRR forecast horizon",
@@ -167,38 +179,33 @@ def test_compute_route_returns_425_when_forecast_pending(
     assert body["detail"]["hours_until_available"] > 0
 
 
-def test_compute_route_cache_hit(
-    client, mock_conn, mock_redis, race_row, fake_forecast,
+def test_compute_route_returns_503_when_bathymetry_unavailable(
+    client, mock_conn, race_row,
 ):
     mock_conn.fetchrow.return_value = race_row
-    cached_response = {
-        "route": {"type": "Feature",
-                  "geometry": {"type": "LineString", "coordinates": []},
-                  "properties": {}},
-        "meta": {
-            "total_minutes": 410.0, "tack_count": 1, "reached": True,
-            "iterations": 80, "nodes_explored": 2000,
-            "legs": 1,
-            "region": "conus", "forecast_quality": "hrrr",
-            "race_start": race_row["start_at"].isoformat(),
-            "polar": "beneteau_36_7", "boat_class": "Beneteau First 36.7",
-            "draft_m": 2.05, "min_depth_m": 3.075, "cached": False,
-            "max_tws_kt": None, "polar_margin": 0.97,
-            "hs_m": 0.0, "density_factor": 1.0,
-        },
-    }
-    mock_redis.get.return_value = json.dumps(cached_response).encode()
 
     with patch.object(
-        routing_module, "load_forecast_for_race",
-        new=AsyncMock(return_value=fake_forecast),
-    ), patch.object(routing_module, "compute_isochrone_route_multileg") as mock_engine:
+        routing_module, "compute_route",
+        new=AsyncMock(side_effect=BathymetryUnavailable("no grid for region=conus")),
+    ):
         r = client.post("/api/routing/compute",
                         json={"race_id": str(race_row["id"])})
+    assert r.status_code == 503
+    assert "bathymetry_ingest" in r.json()["detail"]
 
-    assert r.status_code == 200
-    assert r.json()["meta"]["cached"] is True
-    mock_engine.assert_not_called()  # cache hit short-circuits engine
+
+def test_compute_route_returns_503_on_pipeline_runtime_error(
+    client, mock_conn, race_row,
+):
+    mock_conn.fetchrow.return_value = race_row
+
+    with patch.object(
+        routing_module, "compute_route",
+        new=AsyncMock(side_effect=RuntimeError("no ingested cycles")),
+    ):
+        r = client.post("/api/routing/compute",
+                        json={"race_id": str(race_row["id"])})
+    assert r.status_code == 503
 
 
 def test_compute_route_404_when_race_not_owned(client, mock_conn):
@@ -221,8 +228,7 @@ def test_compute_route_400_when_fewer_than_two_marks(client, mock_conn):
 
 
 def test_compute_route_falls_back_to_now_when_start_at_null(
-    client, mock_conn, mock_redis, waukegan_chicago_marks,
-    fake_forecast, fake_engine_result,
+    client, mock_conn, waukegan_chicago_marks, fake_outcome,
 ):
     """User computing a route on a race with no scheduled gun time."""
     mock_conn.fetchrow.return_value = {
@@ -232,18 +238,54 @@ def test_compute_route_falls_back_to_now_when_start_at_null(
         "start_at": None,
     }
     with patch.object(
-        routing_module, "load_forecast_for_race",
-        new=AsyncMock(return_value=fake_forecast),
-    ) as mock_loader, patch.object(
-        routing_module, "compute_isochrone_route_multileg",
-        return_value=fake_engine_result,
-    ), patch.object(
-        routing_module, "make_navigable_predicate", return_value=lambda *a, **k: True,
+        routing_module, "compute_route",
+        new=AsyncMock(return_value=fake_outcome),
+    ) as mock_compute, patch.object(
+        routing_module, "save_last_request",
+        new=AsyncMock(return_value=None),
     ):
         r = client.post("/api/routing/compute", json={"race_id": str(uuid4())})
 
     assert r.status_code == 200
-    # Loader was called with a race_start close to "now"
-    called_with = mock_loader.await_args.kwargs
-    delta = abs((called_with["race_start"] - datetime.now(timezone.utc)).total_seconds())
+    # First positional arg to compute_route is the RouteRequest.
+    req = mock_compute.await_args.args[0]
+    delta = abs((req.race_start - datetime.now(timezone.utc)).total_seconds())
     assert delta < 5  # called within 5 seconds of now
+
+
+def test_compute_route_passes_user_knobs_through_to_pipeline(
+    client, mock_conn, race_row, fake_outcome,
+):
+    """Body parameters should reach the pipeline as a RouteRequest with
+    a populated DeratingProfile. This is the contract that prevents the
+    Phase-1 drift bug from re-emerging."""
+    mock_conn.fetchrow.return_value = race_row
+
+    with patch.object(
+        routing_module, "compute_route",
+        new=AsyncMock(return_value=fake_outcome),
+    ) as mock_compute, patch.object(
+        routing_module, "save_last_request",
+        new=AsyncMock(return_value=None),
+    ):
+        r = client.post(
+            "/api/routing/compute",
+            json={
+                "race_id": str(race_row["id"]),
+                "safety_factor": 1.25,
+                "duration_hours": 48.0,
+                "max_tws_kt": 30.0,
+                "polar_margin": 0.95,
+                "hs_m": 0.5,
+                "density_factor": 1.02,
+            },
+        )
+
+    assert r.status_code == 200
+    req = mock_compute.await_args.args[0]
+    assert req.safety_factor == pytest.approx(1.25)
+    assert req.duration_hours == pytest.approx(48.0)
+    assert req.derating.max_tws_kt == pytest.approx(30.0)
+    assert req.derating.polar_margin == pytest.approx(0.95)
+    assert req.derating.hs_m == pytest.approx(0.5)
+    assert req.derating.density_factor == pytest.approx(1.02)

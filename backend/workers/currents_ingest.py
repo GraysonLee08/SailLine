@@ -6,7 +6,7 @@ each forecast cycle, one for each nowcast refresh. Scheduler triggers:
     forecast:  every 6h   (matches OFS cycle cadence)
     nowcast:   hourly     (refreshes the recent-past analyzed window)
 
-Mirrors ``weather_ingest`` in shape; differs in two important ways:
+Differs from ``weather_ingest`` in two important ways:
 
 1. **No bbox clipping or regridding.** OFS data is preserved on its
    native grid (FVCOM unstructured mesh, or ROMS/POM curvilinear
@@ -16,43 +16,29 @@ Mirrors ``weather_ingest`` in shape; differs in two important ways:
 2. **Static topology cached separately.** The mesh (FVCOM) or grid
    (ROMS) is identical across every cycle for a given source. It is
    written once under ``currents:{source}:topology`` and reused; the
-   per-fhour blobs carry only u, v, valid_time. Cuts the Redis footprint
-   roughly 10x compared to embedding the topology in every snapshot.
+   per-fhour blobs carry only u, v, valid_time.
 
 Run types:
 
     forecast (``f``)  — files cover f000..f{forecast_horizon} forward
-                        from cycle start. The routing engine consumes
-                        these for the race window.
+                        from cycle start.
     nowcast  (``n``)  — files cover n001..n{nowcast_horizon} BACKWARD
                         from cycle start (analyzed conditions in the
-                        recent past). Useful for the "current
-                        conditions" overlay and for races that start
-                        very near "now" where the most-recent nowcast
-                        slice is fresher than the cycle's f000.
+                        recent past).
+
+After Phase 4 of the architecture review, the per-cycle orchestration
+(fhour walk → Redis → GCS → manifest → cycles index) is shared with
+``weather_ingest`` via
+:class:`~app.services.ingest.cycle_pipeline.CyclicalIngestPipeline`.
+Currents-specific concerns (NetCDF download, FVCOM/ROMS parsing,
+topology write-once semantics) live in the
+:class:`CurrentsSnapshotSource` adapter below.
 
 Usage (from backend/):
 
     python -m workers.currents_ingest lmhofs --dry-run
     python -m workers.currents_ingest lmhofs --run-type nowcast --dry-run
     python -m workers.currents_ingest cbofs --fhour 1 --dry-run
-
-Cloud Run Job command (one per source per run_type):
-
-    python -m workers.currents_ingest lmhofs --run-type forecast
-    python -m workers.currents_ingest lmhofs --run-type nowcast
-
-Redis key shape:
-
-    currents:{source}:topology                              gzipped JSON, mesh / grid
-    currents:{source}:{cycle}:{f|n}{fhour:03d}              gzipped JSON, u/v + valid_time
-    currents:{source}:{cycle}:{f|n}_manifest                cycle metadata, one per run type
-    currents:{source}:cycles                                sorted set, score = cycle epoch
-
-GCS layout under ``GCS_CURRENTS_BUCKET``:
-
-    {source}/topology.json.gz                               durability copy of topology
-    {source}/{cycle}/{f|n}{fhour:03d}.json.gz               per-fhour archive
 """
 from __future__ import annotations
 
@@ -65,6 +51,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -81,6 +68,18 @@ from app.services.currents.netcdf_extract import (
     RomsSnapshot,
     extract,
 )
+from app.services.ingest import (
+    CyclicalIngestPipeline,
+    GcsArchive,
+    SnapshotResult,
+)
+from app.services.ingest.archive import Archive
+from app.services.redis_keys import (
+    currents_cycles_index_key,
+    currents_manifest_key,
+    currents_snapshot_key,
+    currents_topology_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +93,10 @@ TOPOLOGY_TTL_SECONDS = 30 * 24 * 3600
 # 6h cycle step so that a missed cycle doesn't strand routes; the cycles
 # ZSET trim keeps memory bounded.
 CYCLE_TTL_SECONDS = 12 * 3600
+
+# Keep the most recent 4 cycles per source. NetCDF blobs are large
+# enough that we trim more aggressively than the wind worker.
+CYCLES_TRIM_KEEP = 4
 
 # Friendly aliases for the CLI.
 _RUN_TYPE_ALIASES = {
@@ -147,14 +150,7 @@ def _urlopen_with_retries(req, *, timeout: int, max_attempts: int = 3):
 
 
 def download_netcdf(url: str, out: Path, *, timeout: int = 240) -> int:
-    """Download a NetCDF file to ``out``. Returns bytes received.
-
-    OFS NetCDFs are 20-100 MB each — well within a 4-minute fetch over
-    Cloud Run's egress to NOMADS. Whole-file download (no byte ranges)
-    because NetCDF doesn't have an idx-style sidecar; the savings would
-    require server-side subsetting (NCSS) which not every OFS model
-    publishes consistently.
-    """
+    """Download a NetCDF file to ``out``. Returns bytes received."""
     req = urllib.request.Request(url)
     bytes_written = 0
     with _urlopen_with_retries(req, timeout=timeout) as resp, out.open("wb") as fh:
@@ -172,15 +168,7 @@ def download_netcdf(url: str, out: Path, *, timeout: int = 240) -> int:
 
 
 def _serialize_topology(topology) -> bytes:
-    """Encode the static mesh / grid as gzipped JSON.
-
-    FVCOM: nodes (lat, lon) + triangle connectivity.
-    ROMS:  2-D rho-grid lat, lon, mask, angle.
-
-    Stored once per source under ``currents:{source}:topology`` and
-    reused by every cycle. The field samplers know how to consume this
-    payload via the loader.
-    """
+    """Encode the static mesh / grid as gzipped JSON."""
     if isinstance(topology, FvcomMesh):
         payload = {
             "kind": "fvcom",
@@ -245,81 +233,13 @@ def _serialize_snapshot(snapshot, run_type: RunType) -> bytes:
 
 
 def _to_finite_list(arr: np.ndarray) -> list:
-    """Convert numpy array to nested Python lists, replacing NaN/Inf with None.
-
-    JSON has no representation for NaN; using None preserves the
-    'masked / no-data' semantic the field samplers expect.
-    """
+    """Convert numpy array to nested Python lists, replacing NaN/Inf with None."""
     masked = np.where(np.isfinite(arr), arr, None)  # type: ignore[arg-type]
     return masked.tolist()
 
 
 # ---------------------------------------------------------------------------
-# Storage writes
-
-
-def _redis_client() -> redis.Redis:
-    return redis.Redis(
-        host=os.environ["REDIS_HOST"],
-        port=int(os.environ.get("REDIS_PORT", "6379")),
-        db=0,
-    )
-
-
-def _write_topology_redis(client: redis.Redis, source: str, blob: bytes) -> None:
-    key = f"currents:{source}:topology"
-    client.setex(key, TOPOLOGY_TTL_SECONDS, blob)
-
-
-def _topology_exists_redis(client: redis.Redis, source: str) -> bool:
-    return bool(client.exists(f"currents:{source}:topology"))
-
-
-def _write_topology_gcs(source: str, blob: bytes) -> str:
-    bucket_name = os.environ["GCS_CURRENTS_BUCKET"]
-    gcs = storage.Client()
-    bucket = gcs.bucket(bucket_name)
-    archive_path = f"{source}/topology.json.gz"
-    obj = bucket.blob(archive_path)
-    obj.content_encoding = "gzip"
-    obj.upload_from_string(blob, content_type="application/json")
-    return f"gs://{bucket_name}/{archive_path}"
-
-
-def _snapshot_redis_key(source: str, cycle_iso: str, run_type: RunType, fhour: int) -> str:
-    return f"currents:{source}:{cycle_iso}:{run_type}{fhour:03d}"
-
-
-def _manifest_redis_key(source: str, cycle_iso: str, run_type: RunType) -> str:
-    return f"currents:{source}:{cycle_iso}:{run_type}_manifest"
-
-
-def _write_snapshot_redis(
-    client: redis.Redis, source: str, cycle_iso: str,
-    run_type: RunType, fhour: int, blob: bytes,
-) -> None:
-    client.setex(
-        _snapshot_redis_key(source, cycle_iso, run_type, fhour),
-        CYCLE_TTL_SECONDS,
-        blob,
-    )
-
-
-def _write_snapshot_gcs(
-    source: str, cycle_iso: str, run_type: RunType, fhour: int, blob: bytes,
-) -> str:
-    bucket_name = os.environ["GCS_CURRENTS_BUCKET"]
-    gcs = storage.Client()
-    bucket = gcs.bucket(bucket_name)
-    archive_path = f"{source}/{cycle_iso}/{run_type}{fhour:03d}.json.gz"
-    obj = bucket.blob(archive_path)
-    obj.content_encoding = "gzip"
-    obj.upload_from_string(blob, content_type="application/json")
-    return f"gs://{bucket_name}/{archive_path}"
-
-
-# ---------------------------------------------------------------------------
-# Core ingest
+# Fetch one fhour — used by both single-fhour ``ingest()`` and the pipeline
 
 
 def _fetch_one(
@@ -349,160 +269,125 @@ def _fetch_one(
     return topology, snapshot, snapshot.cycle_iso  # type: ignore[union-attr]
 
 
-def ingest(
-    source_name: str,
-    fhour: int,
-    *,
-    run_type: RunType = "f",
-    dry_run: bool = False,
-) -> dict:
-    """Single-fhour ingest. Useful for ad-hoc backfills and testing."""
-    source = _resolve(source_name)
-    topology, snapshot, cycle_iso = _fetch_one(source, run_type, fhour)
-
-    topo_blob = _serialize_topology(topology)
-    snap_blob = _serialize_snapshot(snapshot, run_type)
-
-    if dry_run:
-        out_dir = Path(__file__).parent.parent / "ingest_output"
-        out_dir.mkdir(exist_ok=True)
-        (out_dir / f"currents_{source.name}_topology.json.gz").write_bytes(topo_blob)
-        (out_dir / f"currents_{source.name}_{cycle_iso}_{run_type}{fhour:03d}.json.gz").write_bytes(snap_blob)
-        print(f"[{source.name}] dry-run wrote topology + {run_type}{fhour:03d}", flush=True)
-        return {"source": source.name, "cycle": cycle_iso, "run_type": run_type, "fhour": fhour}
-
-    client = _redis_client()
-    if not _topology_exists_redis(client, source.name):
-        _write_topology_redis(client, source.name, topo_blob)
-        _write_topology_gcs(source.name, topo_blob)
-        print(f"[{source.name}] topology written", flush=True)
-    _write_snapshot_redis(client, source.name, cycle_iso, run_type, fhour, snap_blob)
-    _write_snapshot_gcs(source.name, cycle_iso, run_type, fhour, snap_blob)
-    return {"source": source.name, "cycle": cycle_iso, "run_type": run_type, "fhour": fhour}
+# ---------------------------------------------------------------------------
+# SnapshotSource adapter
 
 
-def ingest_cycle(
-    source_name: str,
-    *,
-    run_type: RunType = "f",
-    dry_run: bool = False,
-) -> dict:
-    """Ingest the full fhour sequence for the latest cycle of one run type.
+@dataclass
+class CurrentsSnapshotSource:
+    """Adapter that plugs a (source, run_type) pair into the cycle pipeline.
 
-    Forecast: walks f000..f{forecast_horizon}.
-    Nowcast:  walks n001..n{nowcast_horizon}.
+    Holds the source config + run-type. Implements the
+    :class:`~app.services.ingest.SnapshotSource` Protocol so the
+    pipeline can drive a full-cycle ingest without knowing about
+    FVCOM/ROMS NetCDF formats.
 
-    Stops on the first 404. OFS publishes cycles in order, so within a
-    run-type sequence a 404 means the cycle isn't fully out yet and
-    trailing fhours will also be missing — keep what we have, return.
-
-    Forecast and nowcast manifests are written under separate Redis keys
-    so the two ingest schedules don't trample each other.
+    Topology handling: the static mesh/grid is extracted from every
+    fhour's NetCDF (it's part of the file) but we only write it to
+    Redis/GCS once per worker invocation, gated by
+    :meth:`persist_first_snapshot_extras`. The extracted topology
+    is threaded from :meth:`fetch_snapshot` via ``SnapshotResult.extras``.
     """
-    source = _resolve(source_name)
-    fhours = source.fhour_range(run_type)
+    source: CurrentSource
+    run_type: RunType
 
-    print(
-        f"[{source.name}] {run_type}-cycle ingest, "
-        f"fhours={fhours[0]}..{fhours[-1]} "
-        f"({len(fhours)} files, grid={source.grid_type})",
-        flush=True,
-    )
+    @property
+    def name(self) -> str:
+        return f"{self.source.name}/{self.run_type}"
 
-    cycle_iso: Optional[str] = None
-    valid_times: dict[int, str] = {}
-    topo_written = False
-    topo_blob: Optional[bytes] = None
-    snapshot_blobs: dict[int, bytes] = {}  # only kept in memory for dry-run
+    @property
+    def cycle_ttl_seconds(self) -> int:
+        return CYCLE_TTL_SECONDS
 
-    client: Optional[redis.Redis] = None if dry_run else _redis_client()
+    @property
+    def cycles_trim_keep(self) -> int:
+        return CYCLES_TRIM_KEEP
 
-    for fh in fhours:
-        try:
-            topology, snapshot, this_cycle_iso = _fetch_one(source, run_type, fh)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                print(f"  fhour {run_type}{fh:03d}: 404 (not yet published) — stopping", flush=True)
-                break
-            raise
-        cycle_iso = this_cycle_iso
-        valid_times[fh] = snapshot.valid_time.isoformat()  # type: ignore[union-attr]
+    def fhour_range(self) -> list[int]:
+        return self.source.fhour_range(self.run_type)
 
-        # Topology — extract once, write once per worker invocation if
-        # missing from Redis. Subsequent fhours short-circuit.
-        if not topo_written:
-            topo_blob = _serialize_topology(topology)
-            if not dry_run:
-                if not _topology_exists_redis(client, source.name):  # type: ignore[arg-type]
-                    _write_topology_redis(client, source.name, topo_blob)  # type: ignore[arg-type]
-                    _write_topology_gcs(source.name, topo_blob)
-                    print(f"  topology written ({len(topo_blob) / 1e3:.1f} KB gz)", flush=True)
-            topo_written = True
-
-        snap_blob = _serialize_snapshot(snapshot, run_type)
-        if dry_run:
-            snapshot_blobs[fh] = snap_blob
-            continue
-        _write_snapshot_redis(client, source.name, cycle_iso, run_type, fh, snap_blob)  # type: ignore[arg-type]
-        _write_snapshot_gcs(source.name, cycle_iso, run_type, fh, snap_blob)
-
-    if cycle_iso is None:
-        raise RuntimeError(
-            f"no fhours ingested for {source.name} {run_type}-cycle — "
-            "even the first fhour failed"
+    def fetch_snapshot(self, fhour: int) -> SnapshotResult:
+        topology, snapshot, cycle_iso = _fetch_one(
+            self.source, self.run_type, fhour,
+        )
+        snap_blob = _serialize_snapshot(snapshot, self.run_type)
+        return SnapshotResult(
+            blob_gz=snap_blob,
+            cycle_iso=cycle_iso,
+            valid_time_iso=snapshot.valid_time.isoformat(),  # type: ignore[union-attr]
+            # Thread topology through to persist_first_snapshot_extras so
+            # we don't re-extract it on the second fhour.
+            extras={"topology": topology},
         )
 
-    manifest = {
-        "source": source.name,
-        "grid_type": source.grid_type,
-        "run_type": run_type,
-        "cycle": cycle_iso,
-        "fhours": sorted(valid_times.keys()),
-        "valid_times": [valid_times[fh] for fh in sorted(valid_times.keys())],
-    }
-    manifest_blob = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    def snapshot_redis_key(self, cycle_iso: str, fhour: int) -> str:
+        return currents_snapshot_key(self.source.name, cycle_iso, self.run_type, fhour)
 
-    if dry_run:
-        out_dir = Path(__file__).parent.parent / "ingest_output"
-        out_dir.mkdir(exist_ok=True)
-        if topo_blob is not None:
-            (out_dir / f"currents_{source.name}_topology.json.gz").write_bytes(topo_blob)
-        for fh, blob in snapshot_blobs.items():
-            (out_dir / f"currents_{source.name}_{cycle_iso}_{run_type}{fh:03d}.json.gz").write_bytes(blob)
-        (out_dir / f"currents_{source.name}_{cycle_iso}_{run_type}_manifest.json").write_bytes(manifest_blob)
-        print(
-            f"[{source.name}] dry-run {run_type}-cycle complete: "
-            f"{len(snapshot_blobs)} fhours, manifest written",
-            flush=True,
+    def manifest_redis_key(self, cycle_iso: str) -> str:
+        return currents_manifest_key(self.source.name, cycle_iso, self.run_type)
+
+    def cycles_index_redis_key(self) -> str:
+        return currents_cycles_index_key(self.source.name)
+
+    def snapshot_archive_path(self, cycle_iso: str, fhour: int) -> str:
+        return f"{self.source.name}/{cycle_iso}/{self.run_type}{fhour:03d}.json.gz"
+
+    def aliases_for_fhour(self, cycle_iso: str, fhour: int) -> list[str]:
+        """No per-fhour aliases for currents."""
+        return []
+
+    def persist_first_snapshot_extras(
+        self, *, redis_client, archive: Optional[Archive], snapshot: SnapshotResult,
+    ) -> None:
+        """Write the topology blob once per worker invocation, if not
+        already present in Redis.
+
+        The static topology is identical across every cycle of an OFS
+        source. We write it on the FIRST fhour of the run rather than
+        the FIRST cycle ever so that a Redis flush (which expires the
+        topology TTL) self-heals on the next ingest.
+        """
+        if redis_client.exists(currents_topology_key(self.source.name)):
+            return
+        topology = snapshot.extras["topology"] if snapshot.extras else None
+        if topology is None:
+            return
+        topo_blob = _serialize_topology(topology)
+        redis_client.setex(
+            currents_topology_key(self.source.name),
+            TOPOLOGY_TTL_SECONDS,
+            topo_blob,
         )
-        return manifest
+        if archive is not None:
+            archive.upload(
+                f"{self.source.name}/topology.json.gz",
+                topo_blob,
+                content_type="application/json",
+                gzip_encoded=True,
+            )
+        print(f"  topology written ({len(topo_blob) / 1e3:.1f} KB gz)", flush=True)
 
-    client.setex(  # type: ignore[union-attr]
-        _manifest_redis_key(source.name, cycle_iso, run_type),
-        CYCLE_TTL_SECONDS,
-        manifest_blob,
-    )
+    def build_manifest_fields(
+        self, *, cycle_iso: str, fhours: list[int], valid_times: list[str],
+    ) -> dict:
+        return {
+            "source": self.source.name,
+            "grid_type": self.source.grid_type,
+            "run_type": self.run_type,
+            "cycle": cycle_iso,
+            "fhours": fhours,
+            "valid_times": valid_times,
+        }
 
-    # Cycles index — shared across run types. Adding the same cycle twice
-    # (once from the forecast worker, once from nowcast) is a no-op via
-    # ZADD's existing-member behaviour.
-    cycle_dt = datetime.strptime(cycle_iso, "%Y%m%dT%H%MZ").replace(tzinfo=timezone.utc)
-    cycles_key = f"currents:{source.name}:cycles"
-    client.zadd(cycles_key, {cycle_iso: cycle_dt.timestamp()})  # type: ignore[union-attr]
-    # Keep the most recent 4 cycles per source. NetCDF blobs are large
-    # enough that we trim more aggressively than the wind worker.
-    client.zremrangebyrank(cycles_key, 0, -5)  # type: ignore[union-attr]
+    def dry_run_snapshot_filename(self, cycle_iso: str, fhour: int) -> str:
+        return f"currents_{self.source.name}_{cycle_iso}_{self.run_type}{fhour:03d}.json.gz"
 
-    print(
-        f"[{source.name}] {run_type}-cycle ingest complete: "
-        f"{len(valid_times)} fhours, cycle={cycle_iso}",
-        flush=True,
-    )
-    return manifest
+    def dry_run_manifest_filename(self, cycle_iso: str) -> str:
+        return f"currents_{self.source.name}_{cycle_iso}_{self.run_type}_manifest.json"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Resolve / Redis / archive plumbing
 
 
 def _resolve(source_name: str) -> CurrentSource:
@@ -522,6 +407,117 @@ def _normalise_run_type(value: str) -> RunType:
             f"unknown run type: {value!r}. valid: forecast, nowcast, f, n"
         )
     return _RUN_TYPE_ALIASES[key]  # type: ignore[return-value]
+
+
+def _redis_client() -> redis.Redis:
+    return redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        db=0,
+    )
+
+
+def _make_archive() -> GcsArchive:
+    """Wire a GcsArchive against the currents bucket. Tests patch
+    ``workers.currents_ingest.storage.Client`` so the existing
+    storage-mock chain still works."""
+    return GcsArchive.from_env("GCS_CURRENTS_BUCKET", storage_module=storage)
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoints
+
+
+def ingest(
+    source_name: str,
+    fhour: int,
+    *,
+    run_type: RunType = "f",
+    dry_run: bool = False,
+) -> dict:
+    """Single-fhour ingest. Useful for ad-hoc backfills and testing.
+
+    Preserves the existing API shape — the test suite probes it
+    directly. The cycle-pipeline path is :func:`ingest_cycle`.
+    """
+    source = _resolve(source_name)
+    topology, snapshot, cycle_iso = _fetch_one(source, run_type, fhour)
+
+    topo_blob = _serialize_topology(topology)
+    snap_blob = _serialize_snapshot(snapshot, run_type)
+
+    if dry_run:
+        out_dir = Path(__file__).parent.parent / "ingest_output"
+        out_dir.mkdir(exist_ok=True)
+        (out_dir / f"currents_{source.name}_topology.json.gz").write_bytes(topo_blob)
+        (out_dir / f"currents_{source.name}_{cycle_iso}_{run_type}{fhour:03d}.json.gz").write_bytes(snap_blob)
+        print(f"[{source.name}] dry-run wrote topology + {run_type}{fhour:03d}", flush=True)
+        return {"source": source.name, "cycle": cycle_iso, "run_type": run_type, "fhour": fhour}
+
+    client = _redis_client()
+    archive = _make_archive()
+    if not client.exists(currents_topology_key(source.name)):
+        client.setex(currents_topology_key(source.name), TOPOLOGY_TTL_SECONDS, topo_blob)
+        archive.upload(
+            f"{source.name}/topology.json.gz",
+            topo_blob,
+            content_type="application/json",
+            gzip_encoded=True,
+        )
+        print(f"[{source.name}] topology written", flush=True)
+    client.setex(
+        currents_snapshot_key(source.name, cycle_iso, run_type, fhour),
+        CYCLE_TTL_SECONDS,
+        snap_blob,
+    )
+    archive.upload(
+        f"{source.name}/{cycle_iso}/{run_type}{fhour:03d}.json.gz",
+        snap_blob,
+        content_type="application/json",
+        gzip_encoded=True,
+    )
+    return {"source": source.name, "cycle": cycle_iso, "run_type": run_type, "fhour": fhour}
+
+
+def ingest_cycle(
+    source_name: str,
+    *,
+    run_type: RunType = "f",
+    dry_run: bool = False,
+) -> dict:
+    """Ingest the full fhour sequence for the latest cycle of one run type.
+
+    Delegates to :class:`CyclicalIngestPipeline`. Forecast and nowcast
+    are independent run types of the same source — the worker is
+    invoked once per (source, run_type) pair via separate Cloud
+    Scheduler jobs, so this function knows about only one at a time.
+
+    Returns the manifest dict so existing tests keep working.
+    """
+    source = _resolve(source_name)
+    currents_source = CurrentsSnapshotSource(source=source, run_type=run_type)
+
+    if dry_run:
+        dry_run_dir = Path(__file__).parent.parent / "ingest_output"
+        dry_run_dir.mkdir(exist_ok=True)
+        pipeline = CyclicalIngestPipeline(
+            currents_source,
+            dry_run=True,
+            dry_run_dir=dry_run_dir,
+        )
+    else:
+        pipeline = CyclicalIngestPipeline(
+            currents_source,
+            redis_client=_redis_client(),
+            archive=_make_archive(),
+        )
+
+    manifest = pipeline.run_cycle()
+    return manifest.fields
+
+
+# ---------------------------------------------------------------------------
+# CLI
 
 
 def main() -> None:

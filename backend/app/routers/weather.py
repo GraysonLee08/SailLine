@@ -23,6 +23,7 @@ from google.cloud.exceptions import NotFound
 from app import redis_client
 from app.config import settings
 from app.regions import REGIONS
+from app.services.redis_keys import weather_latest_alias_key
 from app.services.weather import ForecastNotAvailable, load_grid_blob_at
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ async def get_weather(
     if at is not None:
         return await _get_weather_at(region, source, at, request)
 
-    key = f"weather:{source}:{region}:latest"
+    key = weather_latest_alias_key(source, region)
     blob = await _read_redis(key)
 
     if blob is None:

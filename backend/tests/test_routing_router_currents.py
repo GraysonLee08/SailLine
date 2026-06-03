@@ -1,40 +1,47 @@
 # backend/tests/test_routing_router_currents.py
-"""Tests for the currents wiring in the routing router.
+"""Tests for the currents wiring in the routing pipeline.
 
-Doesn't exercise the full HTTP endpoint — that's covered by
-test_routing_router.py. This file targets the three currents-specific
-behaviours:
+Previously these tests reached into ``app.routers.routing`` for
+``_currents_cache_tag`` and ``_load_currents_optional``. After the
+Phase-2 pipeline collapse those helpers live in
+``app.services.routing.pipeline`` — same behaviour, single home.
+Tests don't exercise the full HTTP endpoint (that's covered by
+``test_routing_router.py``); they target three currents-specific
+behaviours of the pipeline:
 
-  1. ``_load_currents_optional`` swallows CurrentsUnavailable and any
-     other exception, returning None so the route still computes.
+  1. ``load_currents_optional`` swallows :class:`CurrentsUnavailable`
+     and any other exception, returning ``None`` so the route still
+     computes.
   2. ``_currents_cache_tag`` produces stable, distinct tags for the
-     three states: no currents, currents present, currents-cycle change.
-  3. The router calls ``compute_isochrone_route_multileg`` with the
-     loaded currents (not hard-coded None).
+     three states: no currents, currents present, currents-cycle
+     change.
+  3. The pinned engine version is what's documented in the pipeline
+     module (sanity check — bump-without-test-update is a silent way
+     to orphan cached routes).
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 
-from app.routers.routing import (
+from app.services.currents.fields import CurrentsUnavailable
+from app.services.routing.pipeline import (
     ENGINE_VERSION,
     _currents_cache_tag,
-    _load_currents_optional,
+    load_currents_optional,
 )
-from app.services.currents.fields import CurrentsUnavailable
 
 
 # ─── ENGINE_VERSION sanity ──────────────────────────────────────────────
 
 
-def test_engine_version_bumped_for_currents():
-    """v10 marks the currents integration. Bumping this string forces a
+def test_engine_version_is_v11_pipeline():
+    """v11 marks the pipeline collapse. Bumping this string forces a
     cache invalidation across every existing cached route — intentional."""
-    assert ENGINE_VERSION == "v10-currents"
+    assert ENGINE_VERSION == "v11-pipeline"
 
 
 # ─── _currents_cache_tag ────────────────────────────────────────────────
@@ -77,14 +84,14 @@ def test_currents_cache_tag_present_distinct_from_none():
     assert _currents_cache_tag(_Stub()) != _currents_cache_tag(None)
 
 
-# ─── _load_currents_optional ────────────────────────────────────────────
+# ─── load_currents_optional ─────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_load_currents_optional_no_sources_returns_none():
     """No OFS source covers the marks bbox → None, no exception."""
     marks = [{"lat": 21.0, "lon": -157.8}, {"lat": 21.5, "lon": -157.5}]  # Hawaii
-    result = await _load_currents_optional(
+    result = await load_currents_optional(
         marks=marks,
         race_start=datetime(2026, 5, 13, 12, tzinfo=timezone.utc),
         duration_hours=4.0,
@@ -95,17 +102,17 @@ async def test_load_currents_optional_no_sources_returns_none():
 
 @pytest.mark.asyncio
 async def test_load_currents_optional_swallows_currents_unavailable():
-    """CurrentsUnavailable from the loader → None at the router."""
+    """CurrentsUnavailable from the loader → None at the pipeline edge."""
     marks = [{"lat": 41.9, "lon": -87.6}, {"lat": 45.85, "lon": -84.62}]  # Mac course
 
     async def raise_unavailable(**kwargs):
         raise CurrentsUnavailable(["lmhofs"], "no cycle ingested yet")
 
     with patch(
-        "app.routers.routing.load_currents_for_race",
+        "app.services.routing.pipeline.load_currents_for_race",
         side_effect=raise_unavailable,
     ):
-        result = await _load_currents_optional(
+        result = await load_currents_optional(
             marks=marks,
             race_start=datetime(2026, 5, 13, 12, tzinfo=timezone.utc),
             duration_hours=4.0,
@@ -123,10 +130,10 @@ async def test_load_currents_optional_swallows_arbitrary_exception():
         raise RuntimeError("redis blip")
 
     with patch(
-        "app.routers.routing.load_currents_for_race",
+        "app.services.routing.pipeline.load_currents_for_race",
         side_effect=raise_runtime,
     ):
-        result = await _load_currents_optional(
+        result = await load_currents_optional(
             marks=marks,
             race_start=datetime(2026, 5, 13, 12, tzinfo=timezone.utc),
             duration_hours=4.0,
@@ -137,18 +144,18 @@ async def test_load_currents_optional_swallows_arbitrary_exception():
 
 @pytest.mark.asyncio
 async def test_load_currents_optional_returns_forecast_on_success():
-    """Happy path: loader returns a CurrentForecast → router gets it."""
+    """Happy path: loader returns a CurrentForecast → pipeline gets it."""
     marks = [{"lat": 41.9, "lon": -87.6}, {"lat": 45.85, "lon": -84.62}]
-    sentinel = object()  # stand-in CurrentForecast — router doesn't introspect
+    sentinel = object()  # stand-in CurrentForecast — pipeline doesn't introspect
 
     async def return_sentinel(**kwargs):
         return sentinel
 
     with patch(
-        "app.routers.routing.load_currents_for_race",
+        "app.services.routing.pipeline.load_currents_for_race",
         side_effect=return_sentinel,
     ):
-        result = await _load_currents_optional(
+        result = await load_currents_optional(
             marks=marks,
             race_start=datetime(2026, 5, 13, 12, tzinfo=timezone.utc),
             duration_hours=4.0,

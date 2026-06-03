@@ -47,10 +47,8 @@ EARTH_RADIUS_M = 6_371_000.0
 KT_TO_MS = 0.514_444
 M_PER_NM = 1852.0
 
-# Used only for the per-point fallback path (legacy callers without
-# a `.segment` attribute). The production predicate uses exact line-
-# vs-polygon intersection, where this constant doesn't apply.
-SEGMENT_FALLBACK_STEP_M = 100.0
+# (Phase 3 removed the per-point fallback. Predicates always expose
+# ``.segment`` — see ``navigability.NavigablePredicate``.)
 
 # Offset distance applied when seeding the next leg's frontier after a
 # rounded mark. 200 m is large enough to comfortably separate the seed
@@ -116,31 +114,19 @@ def _twa(heading_deg_: float, wind_dir_from_deg: float) -> float:
 
 def _segment_check(
     lat1: float, lon1: float, lat2: float, lon2: float,
-    is_navigable: Callable[[float, float], bool],
+    is_navigable,
 ) -> bool:
-    """Verify a segment is navigable end-to-end.
+    """Verify a segment is navigable end-to-end via the predicate's
+    ``segment`` method.
 
-    Prefers the exact line-vs-polygon check exposed as
-    ``is_navigable.segment(...)`` by ``make_navigable_predicate``.
-    Falls back to per-point sampling at SEGMENT_FALLBACK_STEP_M
-    intervals for legacy callers (tests with hand-rolled lambdas etc.).
+    Phase 3 removed the per-point fallback. All predicates handed to
+    the engine — production or test — must implement
+    :class:`~app.services.routing.navigability.NavigablePredicate`.
+    Tests that need a trivial predicate use
+    :func:`~app.services.routing.navigability.always_navigable` or
+    :func:`~app.services.routing.navigability.from_point_func`.
     """
-    seg = getattr(is_navigable, "segment", None)
-    if seg is not None:
-        return seg(lat1, lon1, lat2, lon2)
-
-    # Fallback: per-point sampling.
-    distance_m = haversine_m(lat1, lon1, lat2, lon2)
-    if distance_m <= 0:
-        return is_navigable(lat2, lon2)
-    n_checks = max(1, int(math.ceil(distance_m / SEGMENT_FALLBACK_STEP_M)))
-    heading = bearing_deg(lat1, lon1, lat2, lon2)
-    for i in range(1, n_checks + 1):
-        d = distance_m * i / n_checks
-        chk_lat, chk_lon = project(lat1, lon1, heading, d)
-        if not is_navigable(chk_lat, chk_lon):
-            return False
-    return True
+    return is_navigable.segment(lat1, lon1, lat2, lon2)
 
 
 # ─── Wind field ─────────────────────────────────────────────────────────
@@ -315,8 +301,10 @@ def compute_isochrone_route(
                        changing the inner loop.
     """
     if is_navigable is None:
-        def is_navigable(_lat: float, _lon: float) -> bool:  # type: ignore[misc]
-            return True
+        # Default to the singleton always-navigable predicate so the
+        # engine's `.segment` call works uniformly across paths.
+        from app.services.routing.navigability import always_navigable
+        is_navigable = always_navigable()
 
     finish_lat, finish_lon = finish
     start_lat, start_lon = start

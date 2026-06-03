@@ -35,5 +35,13 @@ yarn-error.*
 *.tsbuildinfo
 
 # generated native folders
+# /android is now COMMITTED post-prebuild (2026-06-02). Custom native
+# changes go via app.config.js / expo-build-properties so prebuild regen
+# doesn't clobber them.
 /ios
-/android
+
+# Local-only secrets (never commit). Both are read by Gradle at build time
+# from ~/.gradle/gradle.properties (user-global) or mobile/keystore.properties
+# (repo-local). The .example file is the template; the real one stays out.
+keystore.properties
+*.keystore

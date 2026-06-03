@@ -1,4 +1,3 @@
-# backend/workers/weather_ingest.py
 """NOAA weather ingestion -> wind grid JSON, clipped to a region bbox.
 
 Production: runs as a Cloud Run Job per (source, region). One invocation
@@ -6,12 +5,19 @@ ingests the full forecast sequence for the latest cycle (HRRR F00-F18,
 GFS F000-F120 at 3h step) and writes per-fhour keys to Redis + GCS.
 Local: --dry-run writes JSON to ./ingest_output/ instead.
 
+After Phase 4 of the architecture review, the per-cycle orchestration
+(fhour walk → Redis → GCS → manifest → cycles index) lives in
+``app.services.ingest.cycle_pipeline.CyclicalIngestPipeline``. This
+module keeps the source registry, the .grib2 byte-range download, the
+GRIB → JSON serialisation, and a thin :class:`WeatherSnapshotSource`
+adapter — about half the LOC it carried before.
+
 Usage (from backend/):
     python -m workers.weather_ingest hrrr --region conus --dry-run
     python -m workers.weather_ingest gfs --region conus --dry-run
     python -m workers.weather_ingest hrrr --region conus --fhour 1 --dry-run
 
-Redis key shape (post-rolling-forecast):
+Redis key shape (preserved exactly across the refactor):
     weather:{source}:{region}:{cycle}:f{fhour:03d}   gzipped JSON wind grid
     weather:{source}:{region}:{cycle}:manifest       JSON: cycle, fhours, valid_times
     weather:{source}:{region}:cycles                 sorted set, score=cycle epoch
@@ -28,16 +34,28 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Optional
 
 import redis
 from google.cloud import storage
 
 from app.regions import REGIONS, Region
 from app.services.grib import parse_grib_to_wind_grid
+from app.services.ingest import (
+    CyclicalIngestPipeline,
+    GcsArchive,
+    SnapshotResult,
+)
+from app.services.ingest.archive import Archive
+from app.services.redis_keys import (
+    weather_cycles_index_key,
+    weather_fhour_key,
+    weather_latest_alias_key,
+    weather_manifest_key,
+)
 
 WIND_FIELDS = (":UGRD:10 m above ground:", ":VGRD:10 m above ground:")
 
@@ -91,6 +109,11 @@ SOURCES: dict[str, Source] = {
         fhour_min=0, fhour_max=120, fhour_step=3,
     ),
 }
+
+
+# Trim the cycles sorted set to this many entries. Older cycles' keys
+# age out via TTL anyway — this just keeps the index bounded.
+CYCLES_TRIM_KEEP = 8
 
 
 def latest_cycle(source: Source) -> tuple[str, int]:
@@ -183,167 +206,7 @@ def clip_and_serialize(grid, bbox: tuple[float, float, float, float]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Redis + GCS writes
-
-
-def _redis_client() -> redis.Redis:
-    return redis.Redis(
-        host=os.environ["REDIS_HOST"],
-        port=int(os.environ.get("REDIS_PORT", "6379")),
-        db=0,
-    )
-
-
-def _write_redis(client: redis.Redis, key: str, ttl: int, blob: bytes) -> None:
-    client.setex(key, ttl, blob)
-
-
-def _write_gcs(source_name: str, region_name: str, cycle_iso: str,
-               fhour: int, blob: bytes) -> str:
-    bucket_name = os.environ["GCS_WEATHER_BUCKET"]
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-
-    archive_path = f"{source_name}/{region_name}/{cycle_iso}/f{fhour:03d}.json.gz"
-    obj = bucket.blob(archive_path)
-    obj.content_encoding = "gzip"
-    obj.upload_from_string(blob, content_type="application/json")
-
-    # Per-cycle latest pointer for the default fhour preserves prior behaviour.
-    return f"gs://{bucket_name}/{archive_path}"
-
-
-# ---------------------------------------------------------------------------
-# Core ingest — single fhour (kept compatible with existing tests)
-
-
-def ingest(
-    source_name: str,
-    region_name: str,
-    fhour: int | None = None,
-    dry_run: bool = False,
-) -> dict:
-    """Ingest a single fhour. Existing test contract preserved."""
-    source, region = _resolve(source_name, region_name)
-    if fhour is None:
-        fhour = source.default_fhour
-
-    payload, payload_gz, cycle_iso = _fetch_one(source, region, fhour)
-
-    if dry_run:
-        out_dir = Path(__file__).parent.parent / "ingest_output"
-        out_dir.mkdir(exist_ok=True)
-        out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
-        out_path.write_bytes(payload_gz)
-        print(f"[{source.name}/{region.name}] dry-run -> {out_path}", flush=True)
-        return payload
-
-    client = _redis_client()
-    fhour_key = f"weather:{source.name}:{region.name}:{cycle_iso}:f{fhour:03d}"
-    _write_redis(client, fhour_key, source.cache_ttl_seconds, payload_gz)
-    _write_gcs(source.name, region.name, cycle_iso, fhour, payload_gz)
-
-    # Backwards-compat alias, only when this is the default fhour.
-    if fhour == source.default_fhour:
-        latest_key = f"weather:{source.name}:{region.name}:latest"
-        _write_redis(client, latest_key, source.cache_ttl_seconds, payload_gz)
-
-    return payload
-
-
-def ingest_cycle(
-    source_name: str,
-    region_name: str,
-    dry_run: bool = False,
-) -> dict:
-    """Ingest the FULL forecast sequence for the latest cycle.
-
-    This is the new entry point. One Cloud Run Job invocation per cycle
-    walks every fhour, writes a per-fhour Redis key, and finalises with
-    a manifest + cycles-index update so the API can find this cycle.
-    """
-    source, region = _resolve(source_name, region_name)
-    fhours = source.fhour_range()
-
-    print(f"[{source.name}/{region.name}] cycle ingest, fhours={fhours[0]}..{fhours[-1]} "
-          f"step={source.fhour_step} ({len(fhours)} files)", flush=True)
-
-    cycle_iso: str | None = None
-    valid_times: dict[int, str] = {}
-    fhour_blobs: dict[int, bytes] = {}  # only for dry-run summary
-
-    for fh in fhours:
-        try:
-            payload, payload_gz, this_cycle_iso = _fetch_one(source, region, fh)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                print(f"  fhour {fh:03d}: 404 (not yet published) — stopping cycle", flush=True)
-                break
-            raise
-        cycle_iso = this_cycle_iso  # consistent across the cycle
-        valid_times[fh] = payload["valid_time"]
-
-        if dry_run:
-            fhour_blobs[fh] = payload_gz
-            continue
-
-        client = _redis_client()
-        fhour_key = f"weather:{source.name}:{region.name}:{cycle_iso}:f{fh:03d}"
-        _write_redis(client, fhour_key, source.cache_ttl_seconds, payload_gz)
-        _write_gcs(source.name, region.name, cycle_iso, fh, payload_gz)
-
-        if fh == source.default_fhour:
-            latest_key = f"weather:{source.name}:{region.name}:latest"
-            _write_redis(client, latest_key, source.cache_ttl_seconds, payload_gz)
-
-    if cycle_iso is None:
-        raise RuntimeError("no fhours ingested — even F00 failed")
-
-    manifest = {
-        "source": source.name,
-        "region": region.name,
-        "cycle": cycle_iso,
-        "reference_time": valid_times.get(fhours[0]),  # F00 valid_time == cycle ref
-        "fhours": sorted(valid_times.keys()),
-        "valid_times": [valid_times[fh] for fh in sorted(valid_times.keys())],
-    }
-    manifest_blob = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
-
-    if dry_run:
-        out_dir = Path(__file__).parent.parent / "ingest_output"
-        out_dir.mkdir(exist_ok=True)
-        (out_dir / f"{source.name}_{region.name}_{cycle_iso}_manifest.json").write_bytes(manifest_blob)
-        print(f"[{source.name}/{region.name}] dry-run cycle complete: "
-              f"{len(fhour_blobs)} files, manifest written", flush=True)
-        return manifest
-
-    client = _redis_client()
-    manifest_key = f"weather:{source.name}:{region.name}:{cycle_iso}:manifest"
-    _write_redis(client, manifest_key, source.cache_ttl_seconds, manifest_blob)
-
-    # Cycles index — sorted set, score = cycle epoch, member = cycle iso.
-    cycle_dt = datetime.strptime(cycle_iso, "%Y%m%dT%H%MZ").replace(tzinfo=timezone.utc)
-    cycles_key = f"weather:{source.name}:{region.name}:cycles"
-    client.zadd(cycles_key, {cycle_iso: cycle_dt.timestamp()})
-    # Trim to the most recent 8 cycles per source — older cycles' keys age out
-    # via TTL anyway. ZREMRANGEBYRANK keeps memory bounded.
-    client.zremrangebyrank(cycles_key, 0, -9)
-
-    print(f"[{source.name}/{region.name}] cycle ingest complete: "
-          f"{len(valid_times)} fhours, cycle={cycle_iso}", flush=True)
-    return manifest
-
-
-def _resolve(source_name: str, region_name: str) -> tuple[Source, Region]:
-    if region_name not in REGIONS:
-        raise ValueError(f"unknown region: {region_name}. valid: {sorted(REGIONS)}")
-    region = REGIONS[region_name]
-    if source_name not in region.sources:
-        raise ValueError(
-            f"source {source_name!r} not configured for region {region_name!r}. "
-            f"valid: {list(region.sources)}"
-        )
-    return SOURCES[source_name], region
+# Fetch one fhour — used by both single-fhour ``ingest()`` and the pipeline
 
 
 def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes, str]:
@@ -381,6 +244,218 @@ def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes,
     payload_gz = gzip.compress(payload_json)
     cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
     return payload, payload_gz, cycle_iso
+
+
+# ---------------------------------------------------------------------------
+# SnapshotSource adapter
+
+
+@dataclass
+class WeatherSnapshotSource:
+    """Adapter that plugs a (source, region) pair into the cycle pipeline.
+
+    Holds the source config + region. Implements the
+    :class:`~app.services.ingest.SnapshotSource` Protocol so the
+    pipeline can drive a full-cycle ingest without knowing about
+    GRIB or NOMADS.
+    """
+    source: Source
+    region: Region
+
+    @property
+    def name(self) -> str:
+        return f"{self.source.name}/{self.region.name}"
+
+    @property
+    def cycle_ttl_seconds(self) -> int:
+        return self.source.cache_ttl_seconds
+
+    @property
+    def cycles_trim_keep(self) -> int:
+        return CYCLES_TRIM_KEEP
+
+    def fhour_range(self) -> list[int]:
+        return self.source.fhour_range()
+
+    def fetch_snapshot(self, fhour: int) -> SnapshotResult:
+        payload, payload_gz, cycle_iso = _fetch_one(self.source, self.region, fhour)
+        return SnapshotResult(
+            blob_gz=payload_gz,
+            cycle_iso=cycle_iso,
+            valid_time_iso=payload["valid_time"],
+            extras=None,
+        )
+
+    def snapshot_redis_key(self, cycle_iso: str, fhour: int) -> str:
+        return weather_fhour_key(self.source.name, self.region.name, cycle_iso, fhour)
+
+    def manifest_redis_key(self, cycle_iso: str) -> str:
+        return weather_manifest_key(self.source.name, self.region.name, cycle_iso)
+
+    def cycles_index_redis_key(self) -> str:
+        return weather_cycles_index_key(self.source.name, self.region.name)
+
+    def snapshot_archive_path(self, cycle_iso: str, fhour: int) -> str:
+        return f"{self.source.name}/{self.region.name}/{cycle_iso}/f{fhour:03d}.json.gz"
+
+    def aliases_for_fhour(self, cycle_iso: str, fhour: int) -> list[str]:
+        """Maintain the backwards-compat ``:latest`` pointer.
+
+        Only the source's ``default_fhour`` mirrors to ``:latest`` —
+        otherwise the wind overlay would flicker between fhours as the
+        cycle filled in.
+        """
+        if fhour == self.source.default_fhour:
+            return [weather_latest_alias_key(self.source.name, self.region.name)]
+        return []
+
+    def persist_first_snapshot_extras(
+        self, *, redis_client, archive: Optional[Archive], snapshot: SnapshotResult,
+    ) -> None:
+        """No-op for weather. The :latest alias handling lives in
+        :meth:`aliases_for_fhour` because it's per-fhour, not once-per-cycle.
+        """
+        return
+
+    def build_manifest_fields(
+        self, *, cycle_iso: str, fhours: list[int], valid_times: list[str],
+    ) -> dict:
+        return {
+            "source": self.source.name,
+            "region": self.region.name,
+            "cycle": cycle_iso,
+            "reference_time": valid_times[0] if valid_times else None,  # F00 == cycle ref
+            "fhours": fhours,
+            "valid_times": valid_times,
+        }
+
+    def dry_run_snapshot_filename(self, cycle_iso: str, fhour: int) -> str:
+        return f"{self.source.name}_{self.region.name}_f{fhour:03d}.json.gz"
+
+    def dry_run_manifest_filename(self, cycle_iso: str) -> str:
+        return f"{self.source.name}_{self.region.name}_{cycle_iso}_manifest.json"
+
+
+# ---------------------------------------------------------------------------
+# Resolve / Redis / archive plumbing
+
+
+def _resolve(source_name: str, region_name: str) -> tuple[Source, Region]:
+    if region_name not in REGIONS:
+        raise ValueError(f"unknown region: {region_name}. valid: {sorted(REGIONS)}")
+    region = REGIONS[region_name]
+    if source_name not in region.sources:
+        raise ValueError(
+            f"source {source_name!r} not configured for region {region_name!r}. "
+            f"valid: {sorted(region.sources)}"
+        )
+    if source_name not in SOURCES:
+        raise ValueError(f"unknown source: {source_name}. valid: {sorted(SOURCES)}")
+    return SOURCES[source_name], region
+
+
+def _redis_client() -> redis.Redis:
+    return redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        db=0,
+    )
+
+
+def _make_archive() -> GcsArchive:
+    """Wire a GcsArchive against the weather bucket. Tests patch
+    ``workers.weather_ingest.storage.Client`` so the existing
+    storage-mock chain still works."""
+    return GcsArchive.from_env("GCS_WEATHER_BUCKET", storage_module=storage)
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoints
+
+
+def ingest(
+    source_name: str,
+    region_name: str,
+    fhour: int | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Single-fhour ingest. Existing test contract preserved.
+
+    Used for ad-hoc backfills and the test surface that pins per-fhour
+    write semantics (per-fhour key + alias only on default_fhour). The
+    cycle-pipeline path is :func:`ingest_cycle`.
+    """
+    source, region = _resolve(source_name, region_name)
+    if fhour is None:
+        fhour = source.default_fhour
+
+    payload, payload_gz, cycle_iso = _fetch_one(source, region, fhour)
+
+    if dry_run:
+        out_dir = Path(__file__).parent.parent / "ingest_output"
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / f"{source.name}_{region.name}_f{fhour:03d}.json.gz"
+        out_path.write_bytes(payload_gz)
+        print(f"[{source.name}/{region.name}] dry-run -> {out_path}", flush=True)
+        return payload
+
+    client = _redis_client()
+    archive = _make_archive()
+    fhour_key = weather_fhour_key(source.name, region.name, cycle_iso, fhour)
+    client.setex(fhour_key, source.cache_ttl_seconds, payload_gz)
+    archive.upload(
+        f"{source.name}/{region.name}/{cycle_iso}/f{fhour:03d}.json.gz",
+        payload_gz,
+        content_type="application/json",
+        gzip_encoded=True,
+    )
+
+    # Backwards-compat alias, only when this is the default fhour.
+    if fhour == source.default_fhour:
+        latest_key = weather_latest_alias_key(source.name, region.name)
+        client.setex(latest_key, source.cache_ttl_seconds, payload_gz)
+
+    return payload
+
+
+def ingest_cycle(
+    source_name: str,
+    region_name: str,
+    dry_run: bool = False,
+) -> dict:
+    """Ingest the FULL forecast sequence for the latest cycle.
+
+    Delegates to :class:`CyclicalIngestPipeline`. The orchestration
+    (fhour walk, 404 stop, manifest write, cycles index update) lives
+    there; this function only chooses the source/region and wires the
+    Redis client + archive.
+
+    Returns the manifest dict so existing tests keep working.
+    """
+    source, region = _resolve(source_name, region_name)
+    weather_source = WeatherSnapshotSource(source=source, region=region)
+
+    if dry_run:
+        dry_run_dir = Path(__file__).parent.parent / "ingest_output"
+        dry_run_dir.mkdir(exist_ok=True)
+        pipeline = CyclicalIngestPipeline(
+            weather_source,
+            dry_run=True,
+            dry_run_dir=dry_run_dir,
+        )
+    else:
+        pipeline = CyclicalIngestPipeline(
+            weather_source,
+            redis_client=_redis_client(),
+            archive=_make_archive(),
+        )
+
+    manifest = pipeline.run_cycle()
+    return manifest.fields
+
+
+# ---------------------------------------------------------------------------
+# CLI
 
 
 def main() -> None:

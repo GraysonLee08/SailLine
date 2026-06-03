@@ -83,10 +83,11 @@ Cloud Build auto-deploys on push to `main` — `infra/cloudbuild.yaml` (backend 
 - `app/db.py` — Cloud SQL Connector → asyncpg pool over the VPC's private IP. Startup is **non-fatal**: pool failure leaves the app running and `/health` reports clearly; endpoints needing the DB return 503.
 - `app/redis_client.py` — Same non-fatal pattern for Memorystore.
 - `app/config.py` — pydantic-settings; reads `.env` locally, env vars (incl. Secret Manager-injected) on Cloud Run.
-- `app/regions.py` — **Single source of truth** for wind regions. Two kinds: **base** (`conus` HRRR+GFS, `hawaii` GFS-only, always-on coverage) and **venue** (high-res HRRR overlays at native 0.027°, ~3 km, only at zoom ≥ 11 over the bbox). The frontend mirror lives at `frontend/src/lib/regions.js` — **edit both together**; region names are the public `/api/weather?region=...` contract.
+- `app/regions.py` — **Single source of truth** for wind regions. Two kinds: **base** (`conus` HRRR+GFS, `hawaii` GFS-only, always-on coverage) and **venue** (high-res HRRR overlays at native 0.027°, ~3 km, only at zoom ≥ 11 over the bbox). The shared JS mirror lives at `packages/shared/src/regions.js` — **edit both together**; region names are the public `/api/weather?region=...` contract.
 - `app/routers/` — `health`, `users`, `weather`, `races`, `tracks`, `routing` (POST `/api/routing/compute`), `routing_notifications` (SSE for "better route" alerts).
 - `app/services/` — domain logic. `routing/` (isochrone engine, wind forecast, navigability), `weather/` (forecast loader), `bathymetry/`, `charts/` (ENC hazards), `polars/` (boat polar CSVs), `boats.py`, `grib.py`.
-- `workers/` — Cloud Run Job entrypoints: `weather_ingest.py` (NOAA HRRR/GFS → Redis + GCS, run hourly/6h via Cloud Scheduler), `bathymetry_ingest.py`, `enc_ingest.py` (load ENC hazard polygons to GCS), `route_recompute.py` (post-ingest "better route" detector that publishes to Redis pub/sub channels tailed by the SSE endpoint).
+- `workers/` — Cloud Run Job entrypoints: `weather_ingest.py` (NOAA HRRR/GFS → Redis + GCS, run hourly/6h via Cloud Scheduler), `currents_ingest.py` (NOAA OFS → Redis + GCS), `bathymetry_ingest.py`, `enc_ingest.py` (load ENC hazard polygons to GCS), `route_recompute.py` (post-ingest "better route" detector that publishes to Redis pub/sub channels tailed by the SSE endpoint).
+- `app/services/ingest/` — shared building blocks for ingest workers. `cycle_pipeline.py::CyclicalIngestPipeline` owns the fetch → serialize → Redis → GCS → manifest → cycles-index dance used by `weather_ingest` and `currents_ingest`; each worker plugs in a `SnapshotSource` adapter. `archive.py::GcsArchive` is the single GCS upload wrapper used by all four workers (one place to set `content_encoding=gzip`, one place for future bucket consolidation).
 - `migrations/` — Alembic versions, raw SQL via `op.execute(...)` (no ORM). Sequential numbering: `0001`, `0002`, `0003`. `infra/schema.sql` only handles one-time bootstrap (PostGIS extension, role grants, ownership transfer for pre-Alembic tables) — **never add tables there**.
 - `tests/conftest.py` — sets dummy DB env vars at import time so `app.config.Settings()` constructs cleanly without a real `.env`.
 
@@ -97,7 +98,7 @@ Cloud Build auto-deploys on push to `main` — `infra/cloudbuild.yaml` (backend 
 2. **Region resolution from marks centroid** → `(base_region, venue_or_None)`. Base drives wind+bathymetry; venue (when present) triggers harbour-scale ENC hazard loading.
 3. Load polar (per boat class) + boat spec (draft, `min_depth_m = draft × safety_factor`).
 4. `load_forecast_for_race` builds a time-aware `WindForecast` spanning the race window. Returns HTTP **425 Too Early** with `{available_at, hours_until_available}` when the cycle isn't out yet — the frontend reschedules a refetch.
-5. `make_navigable_predicate(region, draft_m, safety_factor, venue)` returns a callable with a `.segment(lat1, lon1, lat2, lon2)` method (preferred line-vs-polygon check; falls back to per-point sampling for legacy callers).
+5. `make_navigable_predicate(region, draft_m, safety_factor, venue)` returns a `NavigablePredicate` (Protocol) exposing both `__call__(lat, lon) -> bool` and `segment(lat1, lon1, lat2, lon2) -> bool`. The engine always uses `.segment` (exact line-vs-polygon). Tests that need a trivial predicate use `always_navigable()` or `from_point_func(...)` from `app.services.routing.navigability` — never a bare lambda, which now fails the runtime Protocol check.
 6. `compute_isochrone_route` (pure-numpy, in `app/services/routing/isochrone.py`) iterates `dt_minutes` frontiers, sweeps headings, samples wind at simulated `valid_time = race_start + iter*dt`, applies polar + navigability segment check, prunes via Hagiwara bearing-bin culling.
 7. Cache key includes `ENGINE_VERSION` (bump on any algorithm change), race_id, race_start, both cycle ids, snapshot sources, safety_factor, venue. Result stored in Redis with a 1h TTL.
 
@@ -110,7 +111,7 @@ The background `workers/route_recompute.py` runs the same pipeline (must use the
 - `RaceEditor.jsx`, `RacesListView.jsx` — full-screen course editor + list.
 - `components/MapView.jsx` — Mapbox GL canvas, wind barbs, course rendering. `BetterRouteBanner.jsx`, `RouteControls.jsx`.
 - `hooks/` — `useWeather`, `useGeolocation`, `useCountdown`, `useRaces`, `useRegion`, `useRouting`, `useRouteNotifications` (uses `@microsoft/fetch-event-source` because the native `EventSource` API can't send `Authorization` headers — required for our auth model), `useTrackRecorder`.
-- `lib/` — `latlon.js` (decimal + deg-decimal-min parsing), `morfMarks.js` + `morfCourses.js` (24 named MORF marks, 64 buoy course presets), `windBarb.js` (adaptive density barb generator), `regions.js` (mirror of `backend/app/regions.py`), `boatClasses.js`.
+- `lib/` — `latlon.js` (decimal + deg-decimal-min parsing), `morfMarks.js` + `morfCourses.js` (24 named MORF marks, 64 buoy course presets), `windBarb.js` (adaptive density barb generator), `boatClasses.js`. Region constants come from `@sailline/shared` (`packages/shared/src/regions.js`).
 - `firebase.json` rewrites `/api/**` → Cloud Run `sailline-api` so production frontend calls are same-origin (no CORS preflight); dev uses `VITE_API_URL=http://localhost:8080`.
 
 ### Conventions worth knowing
@@ -118,7 +119,7 @@ The background `workers/route_recompute.py` runs the same pipeline (must use the
 - **No ORM** — raw SQL via asyncpg in routers, raw SQL via `op.execute()` in migrations. Keeps migrations readable and matches runtime exactly.
 - JSONB codec is registered globally on every asyncpg connection (`app/db.py::_init_connection`) — pass/receive plain Python dicts, not strings, for JSONB columns.
 - A failed migration mid-deploy is messier than a hand-applied known-state one — that's why migrations are decoupled from auto-deploy. After running a destructive migration, force a Cloud Run revision rollover with `--update-env-vars=BUMP=$(date +%s)` so asyncpg drops stale prepared statements.
-- Region edits require touching `backend/app/regions.py` + `frontend/src/lib/regions.js` together. Tests in `test_regions`/ingest tests catch the mirror drift.
+- Region edits require touching `backend/app/regions.py` + `packages/shared/src/regions.js` together. Tests in `test_regions`/ingest tests catch the mirror drift.
 - ENGINE_VERSION (in `routing.py`) is part of the route cache key — bump it on any change to polar, mask, or algorithm to invalidate stale routes.
 - Pre-Alembic tables (`user_profiles`, `race_sessions`) were created by `postgres` superuser; ownership has been transferred to `sailline`. Tables created by Alembic are owned by `sailline` automatically.
 - Session-summary build log lives in `docs/YYYY-MM-DD-*.md` — useful as historical context for non-obvious decisions.

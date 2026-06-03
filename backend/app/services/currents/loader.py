@@ -44,6 +44,12 @@ import numpy as np
 
 from app import redis_client
 from app.currents_regions import CurrentSource
+from app.services.redis_keys import (
+    currents_cycles_index_key,
+    currents_manifest_key,
+    currents_snapshot_key,
+    currents_topology_key,
+)
 
 from .fields import (
     CurrentField,
@@ -159,7 +165,7 @@ async def load_currents_for_race(
 async def _newest_cycle(source_name: str) -> Optional[str]:
     """Return the most recent cycle iso ingested for this source, or None."""
     redis = redis_client.get_client()
-    key = f"currents:{source_name}:cycles"
+    key = currents_cycles_index_key(source_name)
     raw = await redis.zrevrange(key, 0, 0)
     if not raw:
         return None
@@ -170,7 +176,7 @@ async def _newest_cycle(source_name: str) -> Optional[str]:
 async def _load_topology(source: CurrentSource):
     """Read the static mesh / grid blob, return the appropriate dataclass."""
     redis = redis_client.get_client()
-    blob = await redis.get(f"currents:{source.name}:topology")
+    blob = await redis.get(currents_topology_key(source.name))
     if blob is None:
         return None
     payload = json.loads(gzip.decompress(blob))
@@ -189,7 +195,7 @@ async def _load_manifests(
     out: list[tuple[str, int, datetime]] = []
 
     for run_type in ("n", "f"):
-        key = f"currents:{source_name}:{cycle_iso}:{run_type}_manifest"
+        key = currents_manifest_key(source_name, cycle_iso, run_type)
         blob = await redis.get(key)
         if blob is None:
             continue
@@ -211,7 +217,7 @@ async def _load_snapshot(
 ):
     """Read one fhour blob, return the appropriate snapshot dataclass."""
     redis = redis_client.get_client()
-    key = f"currents:{source.name}:{cycle_iso}:{run_type}{fhour:03d}"
+    key = currents_snapshot_key(source.name, cycle_iso, run_type, fhour)
     blob = await redis.get(key)
     if blob is None:
         log.warning(

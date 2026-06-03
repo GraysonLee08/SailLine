@@ -32,6 +32,10 @@ from sse_starlette.sse import EventSourceResponse
 
 from app import db, redis_client
 from app.auth import get_current_user
+from app.services.redis_keys import (
+    route_alternative_key,
+    route_notifications_channel,
+)
 
 log = logging.getLogger(__name__)
 
@@ -50,8 +54,8 @@ async def _event_publisher(race_id: UUID):
     existing handlers.
     """
     redis = redis_client.get_client()
-    channel = f"route:notifications:{race_id}"
-    alt_key = f"route:alternative:{race_id}"
+    channel = route_notifications_channel(race_id)
+    alt_key = route_alternative_key(race_id)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)

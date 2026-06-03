@@ -1,50 +1,61 @@
 """Navigability predicates for the isochrone engine.
 
-Combines two safety layers into ``(lat, lon) -> bool`` and
-``(lat1, lon1, lat2, lon2) -> bool`` predicates that the engine
-consumes. Two predicates because the cost/precision trade-offs differ:
+Combines two safety layers into a Protocol-shaped object exposing
+``__call__(lat, lon) -> bool`` and ``segment(lat1, lon1, lat2, lon2) -> bool``:
 
   1. Bathymetry depth >= draft × safety_factor
   2. Point not inside / segment not crossing any ENC hazard polygon
 
-The point predicate (``is_navigable``) is what tests + scripts have
-always used. It samples depth at one (lat, lon) and runs a point-in-
-polygon test against hazards.
+Two methods because the cost/precision trade-offs differ:
 
-The segment predicate (``is_navigable.segment``) is what the engine
-actually wants for every isochrone move. It samples depth along the
-line, then runs an exact ``LineString.intersects(Polygon)`` test for
-hazards. The exact line test catches thin polygons (breakwalls,
-narrow islands) that a point-sampler would miss between samples — a
-20 m wide breakwall is ~20 % detectable by 100 m sampling but 100 %
-detectable by line intersection.
+The point method (``__call__``) samples depth at one (lat, lon) and
+runs a point-in-polygon test against hazards. Cheap; used for
+spot-checks like the rounding-side filter.
+
+The segment method (``.segment``) is what the engine uses for every
+isochrone move. It samples depth along the line and runs an exact
+``LineString.intersects(Polygon)`` test for hazards. The line test
+catches thin polygons (breakwalls, narrow islands) that a point
+sampler would miss between samples — a 20 m wide breakwall is ~20 %
+detectable by 100 m sampling but 100 % detectable by line
+intersection.
 
 Hazards are loaded per-region. When a race is inside a known venue
 (chicago, sf_bay, ...), the predicate loads BOTH the base region's
 hazards (general-scale: open-water obstructions, military areas) AND
 the venue's hazards (harbour-scale: breakwalls, jetties, fishing
 facilities). A point/segment is hazardous if it touches any polygon
-from either index. The two scales complement each other — base
-catches things outside the venue bbox, venue catches things too small
-to appear at base scale.
+from either index.
 
 Bathymetry "no data is hazardous" rule: NCEI grids have NaN cells at
 coverage edges (e.g. tile boundaries between CRM volumes). Treating
 NaN as land means the engine routes around data gaps rather than
-through them — the right safety default. If a user complains that the
-route avoids open water near a CRM tile boundary, the answer is to
-ingest the adjacent volume, not to fail-open on NaN.
+through them — the right safety default.
 
-Log levels: the per-call status line is at WARNING so it surfaces in
-Cloud Run's default text-payload feed (INFO from app loggers is
-filtered). Drop back to INFO once we have proper structured logging
-configured.
+Why a Protocol, not a bare callable
+-----------------------------------
+Before Phase 3, ``make_navigable_predicate`` returned a function with
+a ``.segment`` attribute dynamically attached, and the engine
+duck-typed via ``getattr``. Tests that handed the engine a bare
+``lambda *a, **k: True`` silently hit a per-point fallback path —
+production routes used exact line intersection, tests used per-point
+sampling. The behaviour-precision difference quietly diverged.
+
+After Phase 3:
+
+* :class:`NavigablePredicate` is a ``@runtime_checkable`` Protocol
+  requiring both methods.
+* The engine always calls ``.segment``; there is no fallback.
+* Tests build predicates via :func:`always_navigable` or
+  :func:`from_point_func` (or any class that satisfies the Protocol).
+  No bare lambdas to the engine.
 """
 from __future__ import annotations
 
 import logging
 import math
-from typing import Callable, Optional, Protocol
+from dataclasses import dataclass
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 from app.services import bathymetry, charts
 
@@ -54,8 +65,7 @@ log = logging.getLogger(__name__)
 
 # Default safety factor on draft. 1.5× is a common cruising rule of thumb
 # (3 ft buffer for a 6 ft draft). Pro racers run tighter (1.2–1.3×) in
-# calm water; buoy racers in shallow venues run 1.5–2×. Configurable per
-# race in v1.x; hardcoded for v1.
+# calm water; buoy racers in shallow venues run 1.5–2×.
 DEFAULT_SAFETY_FACTOR = 1.5
 
 
@@ -102,16 +112,154 @@ def _project(lat: float, lon: float, heading_deg: float, distance_m: float) -> t
     return math.degrees(lat2), math.degrees(lon2)
 
 
-class NavigablePredicate(Protocol):
-    """Point predicate with an attached `segment` callable.
+# ---------------------------------------------------------------------------
+# Protocol
 
-    The engine duck-types: it tries `is_navigable.segment(...)` first
-    and falls back to per-point sampling if absent. Tests that pre-date
-    the segment API keep working — they just don't get the precision
-    upgrade.
+
+@runtime_checkable
+class NavigablePredicate(Protocol):
+    """Predicate consumed by the isochrone engine.
+
+    Implementations must provide both methods. The engine calls
+    ``segment`` for every candidate move (the precise check) and may
+    call ``__call__`` for spot-tests like the rounding-side filter.
+
+    Marked ``@runtime_checkable`` so ``isinstance(p, NavigablePredicate)``
+    works at runtime — useful in tests that want to assert "the engine
+    received a properly-shaped predicate" rather than a bare callable.
     """
     def __call__(self, lat: float, lon: float) -> bool: ...
-    segment: Callable[[float, float, float, float], bool]
+    def segment(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool: ...
+
+
+# ---------------------------------------------------------------------------
+# Helper predicates (tests + the engine's no-input default)
+
+
+class _AlwaysNavigable:
+    """Predicate that approves every point and every segment.
+
+    Used as the engine's default when no predicate is supplied, and as
+    a convenience for tests that don't exercise navigability. Returning
+    a real Protocol-shaped object (rather than a bare callable) keeps
+    the engine's ``.segment`` call uniform across all code paths.
+    """
+    __slots__ = ()
+
+    def __call__(self, lat: float, lon: float) -> bool:  # noqa: ARG002
+        return True
+
+    def segment(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:  # noqa: ARG002
+        return True
+
+
+_ALWAYS_NAVIGABLE_SINGLETON = _AlwaysNavigable()
+
+
+def always_navigable() -> NavigablePredicate:
+    """Return a predicate that approves all points and segments.
+
+    Singleton — every call returns the same instance, so equality
+    comparisons and identity checks behave predictably in tests.
+    """
+    return _ALWAYS_NAVIGABLE_SINGLETON
+
+
+@dataclass(frozen=True)
+class _FromPointFunc:
+    """Adapt a per-point function into a full :class:`NavigablePredicate`.
+
+    The segment method approves the line iff both endpoints satisfy
+    the point function. This matches what a naive per-point check at
+    the segment endpoints would do — appropriate for tests that want
+    to express "block this rectangle" without writing a full segment
+    check. NOT a substitute for the production
+    ``make_navigable_predicate``, which does exact line-vs-polygon.
+    """
+    point_fn: Callable[[float, float], bool]
+
+    def __call__(self, lat: float, lon: float) -> bool:
+        return self.point_fn(lat, lon)
+
+    def segment(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+        return self.point_fn(lat1, lon1) and self.point_fn(lat2, lon2)
+
+
+def from_point_func(point_fn: Callable[[float, float], bool]) -> NavigablePredicate:
+    """Wrap a per-point callable as a :class:`NavigablePredicate`.
+
+    Convenience for tests that already have a point predicate and
+    don't need a separate segment implementation. Production code
+    should always go through :func:`make_navigable_predicate`.
+    """
+    return _FromPointFunc(point_fn)
+
+
+# ---------------------------------------------------------------------------
+# Production predicate
+
+
+@dataclass
+class _RealPredicate:
+    """The production navigability predicate.
+
+    Owns the loaded bathymetry grid + zero or more hazard indices.
+    Kept as a dataclass (not a closure) so it composes cleanly with
+    the Protocol — :func:`make_navigable_predicate` returns an
+    instance and the engine sees both methods statically.
+    """
+    region: str
+    venue: Optional[str]
+    min_depth_m: float
+    depth_grid: object
+    hazard_indices: list[object]
+
+    def _depth_ok(self, lat: float, lon: float) -> Optional[bool]:
+        """True if depth OK, False if shallow/land, None if outside grid."""
+        depth = self.depth_grid.sample(lat, lon)
+        if depth is None:
+            # Outside the grid bounds — fail open at the edges. The engine's
+            # wind grid already constrains the search; an out-of-bounds
+            # position there is a config mismatch, not a routing failure.
+            return None
+        if math.isnan(depth) or depth < self.min_depth_m:
+            return False
+        return True
+
+    def __call__(self, lat: float, lon: float) -> bool:
+        depth = self._depth_ok(lat, lon)
+        if depth is False:
+            return False
+        for idx in self.hazard_indices:
+            if idx.intersects(lat, lon):
+                return False
+        return True
+
+    def segment(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+        # Depth check: sample along the segment. Bathymetry grids are
+        # smooth, so a moderately coarse sample step is fine.
+        distance_m = _haversine_m(lat1, lon1, lat2, lon2)
+        if distance_m > 0:
+            n_depth_samples = max(2, int(math.ceil(distance_m / DEPTH_SEGMENT_STEP_M)))
+            heading = _bearing_deg(lat1, lon1, lat2, lon2)
+            for i in range(n_depth_samples + 1):
+                d = distance_m * i / n_depth_samples
+                chk_lat, chk_lon = _project(lat1, lon1, heading, d)
+                depth = self._depth_ok(chk_lat, chk_lon)
+                if depth is False:
+                    return False
+        else:
+            depth = self._depth_ok(lat1, lon1)
+            if depth is False:
+                return False
+
+        # Hazard check: exact line-vs-polygon intersection. Catches any
+        # polygon the segment touches regardless of polygon thickness —
+        # the whole point of using LineString over point sampling.
+        for idx in self.hazard_indices:
+            if idx.crosses_line(lat1, lon1, lat2, lon2):
+                return False
+        return True
 
 
 def make_navigable_predicate(
@@ -132,8 +280,9 @@ def make_navigable_predicate(
             the base index. Both are checked for every point/segment.
 
     Returns:
-        Callable ``is_navigable(lat, lon) -> bool`` with an attached
-        ``is_navigable.segment(lat1, lon1, lat2, lon2) -> bool``.
+        A :class:`NavigablePredicate`. Both ``__call__(lat, lon)`` and
+        ``segment(lat1, lon1, lat2, lon2)`` are wired against the same
+        depth grid + hazard indices.
 
     Raises:
         bathymetry.BathymetryUnavailable: if no depth grid is ingested
@@ -146,7 +295,7 @@ def make_navigable_predicate(
     depth_grid = bathymetry.for_region(region)
 
     # Charts are optional. Build a list of zero-or-more loaded indices.
-    hazard_indices: list[charts.HazardIndex] = []
+    hazard_indices: list = []
     base_haz = charts.for_region(region)
     if base_haz is not None:
         hazard_indices.append(base_haz)
@@ -169,61 +318,19 @@ def make_navigable_predicate(
             region, venue, total, len(hazard_indices),
         )
 
-    def _depth_ok(lat: float, lon: float) -> Optional[bool]:
-        """True if depth OK, False if shallow/land, None if outside grid."""
-        depth = depth_grid.sample(lat, lon)
-        if depth is None:
-            # Outside the grid bounds — fail open at the edges. The
-            # engine's wind grid already constrains the search; if a
-            # candidate position is outside the depth grid but inside
-            # the wind grid, that's a configuration mismatch worth
-            # surfacing as a user-visible issue, not a routing failure.
-            return None
-        if math.isnan(depth) or depth < min_depth_m:
-            return False
-        return True
-
-    def is_navigable(lat: float, lon: float) -> bool:
-        depth = _depth_ok(lat, lon)
-        if depth is False:
-            return False
-        # Hazard check — point is blocked if ANY loaded index covers it.
-        for idx in hazard_indices:
-            if idx.intersects(lat, lon):
-                return False
-        return True
-
-    def is_navigable_segment(
-        lat1: float, lon1: float, lat2: float, lon2: float,
-    ) -> bool:
-        # Depth check: sample along the segment. Bathymetry grids are
-        # smooth, so a moderately coarse sample step is fine.
-        distance_m = _haversine_m(lat1, lon1, lat2, lon2)
-        if distance_m > 0:
-            n_depth_samples = max(2, int(math.ceil(distance_m / DEPTH_SEGMENT_STEP_M)))
-            heading = _bearing_deg(lat1, lon1, lat2, lon2)
-            for i in range(n_depth_samples + 1):
-                d = distance_m * i / n_depth_samples
-                chk_lat, chk_lon = _project(lat1, lon1, heading, d)
-                depth = _depth_ok(chk_lat, chk_lon)
-                if depth is False:
-                    return False
-        else:
-            depth = _depth_ok(lat1, lon1)
-            if depth is False:
-                return False
-
-        # Hazard check: exact line-vs-polygon intersection. This catches
-        # any polygon the segment touches, regardless of polygon
-        # thickness — the whole point of using LineString over point
-        # sampling.
-        for idx in hazard_indices:
-            if idx.crosses_line(lat1, lon1, lat2, lon2):
-                return False
-        return True
-
-    is_navigable.segment = is_navigable_segment  # type: ignore[attr-defined]
-    return is_navigable  # type: ignore[return-value]
+    return _RealPredicate(
+        region=region,
+        venue=venue,
+        min_depth_m=min_depth_m,
+        depth_grid=depth_grid,
+        hazard_indices=hazard_indices,
+    )
 
 
-__all__ = ["make_navigable_predicate", "DEFAULT_SAFETY_FACTOR", "NavigablePredicate"]
+__all__ = [
+    "DEFAULT_SAFETY_FACTOR",
+    "NavigablePredicate",
+    "always_navigable",
+    "from_point_func",
+    "make_navigable_predicate",
+]

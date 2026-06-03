@@ -36,6 +36,11 @@ from typing import Optional
 
 from app import redis_client
 from app.regions import REGIONS
+from app.services.redis_keys import (
+    weather_cycles_index_key,
+    weather_fhour_key,
+    weather_manifest_key,
+)
 from app.services.routing.isochrone import WindField
 from app.services.routing.wind_forecast import WindForecast, _parse_iso
 
@@ -77,13 +82,13 @@ class _CycleInfo:
 
 async def _newest_cycle(source: str, region: str) -> Optional[_CycleInfo]:
     redis = redis_client.get_client()
-    cycles_key = f"weather:{source}:{region}:cycles"
+    cycles_key = weather_cycles_index_key(source, region)
     raw = await redis.zrevrange(cycles_key, 0, 0)
     if not raw:
         return None
     cycle_iso = raw[0].decode() if isinstance(raw[0], bytes) else raw[0]
 
-    manifest_key = f"weather:{source}:{region}:{cycle_iso}:manifest"
+    manifest_key = weather_manifest_key(source, region, cycle_iso)
     manifest_blob = await redis.get(manifest_key)
     if manifest_blob is None:
         log.warning("cycles index has %s but manifest missing", cycle_iso)
@@ -99,7 +104,7 @@ async def _newest_cycle(source: str, region: str) -> Optional[_CycleInfo]:
 
 async def _load_snapshot(source: str, region: str, cycle_iso: str, fhour: int) -> WindField:
     redis = redis_client.get_client()
-    key = f"weather:{source}:{region}:{cycle_iso}:f{fhour:03d}"
+    key = weather_fhour_key(source, region, cycle_iso, fhour)
     blob = await redis.get(key)
     if blob is None:
         raise RuntimeError(f"missing forecast snapshot: {key}")
@@ -276,7 +281,7 @@ async def load_grid_blob_at(
     chosen_valid = valid_times[idx]
 
     redis = redis_client.get_client()
-    key = f"weather:{source}:{region}:{cycle.cycle_iso}:f{fhour:03d}"
+    key = weather_fhour_key(source, region, cycle.cycle_iso, fhour)
     blob = await redis.get(key)
     if blob is None:
         raise RuntimeError(f"missing forecast snapshot: {key}")

@@ -1,52 +1,34 @@
 # backend/app/routers/routing.py
-"""Route compute endpoint.
+"""Route compute HTTP endpoint.
 
 POST /api/routing/compute
-    Body: {
-      "race_id": "<uuid>",
-      "safety_factor": 1.5,
-      "duration_hours": 6.0,            # optional
-      "max_tws_kt": null,               # optional heavy-weather cutoff
-      "polar_margin": 0.97,             # optional gust/perf de-rating
-      "hs_m": 0.0,                      # optional wave height (until ingest)
-      "density_factor": 1.0,            # optional air density factor
-    }
+    Body: see :class:`ComputeRouteIn`. Returns a GeoJSON Feature plus
+    diagnostic meta, or HTTP 425 (Too Early) when the forecast for the
+    race window hasn't been ingested yet.
 
-Resolves the race, picks the wind region from marks centroid, builds a
-time-aware WindForecast spanning the race window, optionally builds a
-CurrentForecast from any OFS source whose bbox overlaps the marks bbox,
-runs the multi-leg isochrone engine threading simulated time across
-every leg, and returns a GeoJSON Feature plus diagnostic metadata.
+This module is the *transport* layer for the routing pipeline. The
+heavy lifting (region resolution, forecast + currents loading, cache
+key, engine call, GeoJSON assembly) lives in
+``app/services/routing/pipeline.py`` — same code path the background
+recompute worker uses, so 'better route' alerts are computed against
+the same physics the user sees.
 
-Region resolution returns a (base_region, venue) pair. base_region drives
-wind + bathymetry lookup (always set; defaults to 'conus'). venue is set
-only when the marks centroid falls inside a high-res venue bbox — that's
-the trigger to load harbour-scale ENC hazards alongside the base ones.
+Concerns kept here:
 
-Currents are optional. ``app.currents_regions.sources_covering_marks(...)``
-returns 0..N OFS sources for the marks bbox. When 0, the route is
-computed with ``currents=None`` and the engine path is unchanged. When
-≥1, the currents loader builds a ``CurrentForecast`` that the engine
-samples each iteration. If the loader fails for any reason the route
-still computes (currents are non-fatal) — the failure is logged and the
-meta response reports ``currents_quality: null``.
-
-Forecast not yet available: returns HTTP 425 (Too Early) with
-{ available_at, hours_until_available }. The frontend schedules a
-refetch at that timestamp.
-
-Cache key: (engine_version, race_id, safety_factor, hrrr_cycle, gfs_cycle,
-race_start_iso, snapshot_sources, venue, derating tuple, currents tag).
-race_start changes ⇒ cache miss; new cycle ⇒ cache miss; any derating
-param change ⇒ cache miss; new currents cycle or transition between
-"currents available" and "currents unavailable" ⇒ cache miss.
+* Pydantic wire models for FastAPI validation.
+* Race ownership check (auth concern — pipeline is auth-agnostic).
+* Pro-tier polar gating: free-tier callers route with the GENERIC
+  polar regardless of which boat_class the race carries.
+* HTTP status mapping: ForecastNotAvailable → 425, ownership fail →
+  404, marks < 2 → 400, missing bathymetry → 503.
+* Persisting the user's request via ``pipeline.save_last_request`` so
+  the background recompute worker can faithfully replay it.
 """
 from __future__ import annotations
 
 import json
 import logging
-import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -56,30 +38,23 @@ from pydantic import BaseModel, Field
 
 from app import db, redis_client
 from app.auth import get_current_user
-from app.currents_regions import sources_covering_marks
-from app.regions import REGIONS, base_region_for_point, venue_for_point
 from app.services.bathymetry import BathymetryUnavailable
-from app.services.boats import spec_for_class
-from app.services.currents import (
-    CurrentForecast,
-    CurrentsUnavailable,
-    load_currents_for_race,
-)
-from app.services.polars import load_polar
 from app.services.routing import (
     DEFAULT_SAFETY_FACTOR,
-    compute_isochrone_route_multileg,
-    make_navigable_predicate,
-    route_to_geojson,
+    ENGINE_VERSION,
+    DeratingProfile,
+    RouteRequest,
+    compute_route,
+    save_last_request,
 )
-from app.services.weather import ForecastNotAvailable, load_forecast_for_race
+from app.services.weather import ForecastNotAvailable
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/routing", tags=["routing"])
 
 
-# ─── Models ──────────────────────────────────────────────────────────────
+# ─── Wire models ─────────────────────────────────────────────────────────
 
 
 class ComputeRouteIn(BaseModel):
@@ -137,17 +112,7 @@ class RouteMeta(BaseModel):
     polar_margin: float = 1.0
     hs_m: float = 0.0
     density_factor: float = 1.0
-    # New in v10 — populated when any OFS source covers the marks bbox
-    # AND its ingested cycle intersects the race window. None means no
-    # currents were folded into the route; the engine ran with
-    # ``currents=None``.
     currents_quality: Optional[str] = None
-    # New in v10.1 — wind sampled at marks[0] at race_start_at using the
-    # same forecast that fed the engine. Lets the frontend's pre-start
-    # freshness check (T-5 banner) compute a wind delta against the
-    # current forecast without re-running compute. None when the sample
-    # falls outside the forecast horizon (rare; would only happen for
-    # races scheduled past the loaded duration_hours window).
     start_wind_dir_deg: Optional[float] = None
     start_wind_speed_kt: Optional[float] = None
 
@@ -166,116 +131,12 @@ class ForecastPendingOut(BaseModel):
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 
-# Bump on any change to engine inputs/outputs (polar, mask, algorithm).
-# v10: surface-currents integration via NOAA OFS ingest.
-ENGINE_VERSION = "v10-currents"
-
-ROUTE_CACHE_TTL_S = 3600
-
-
-def _resolve_region(marks: list[dict]) -> tuple[str, Optional[str]]:
-    """Return (base_region, venue_or_None) for the centroid of the marks.
-
-    Base region drives wind + bathymetry lookup (always set, defaults to
-    'conus'). Venue is set only when the centroid falls inside one of
-    the high-res venue bboxes — that's the trigger for loading
-    harbour-scale ENC hazards.
-    """
-    if not marks:
-        return "conus", None
-    lat_c = sum(m["lat"] for m in marks) / len(marks)
-    lon_c = sum(m["lon"] for m in marks) / len(marks)
-    base = base_region_for_point(lat_c, lon_c)
-    venue = venue_for_point(lat_c, lon_c)
-    return (
-        base.name if base is not None else "conus",
-        venue.name if venue is not None else None,
-    )
-
-
-async def _load_currents_optional(
-    marks: list[dict],
-    race_start: datetime,
-    duration_hours: float,
-    race_id: UUID,
-) -> Optional[CurrentForecast]:
-    """Load a CurrentForecast for the race, or return None.
-
-    Wraps ``load_currents_for_race`` with the policy that currents are
-    optional — a CurrentsUnavailable exception or any other failure
-    returns None and the route still computes. The router never fails a
-    request because currents weren't available.
-    """
-    sources = sources_covering_marks(marks)
-    if not sources:
-        return None
-    try:
-        return await load_currents_for_race(
-            sources=sources,
-            race_start=race_start,
-            duration_hours=duration_hours,
-        )
-    except CurrentsUnavailable as exc:
-        log.info(
-            "currents unavailable for race=%s — proceeding without: %s",
-            race_id, exc,
-        )
-        return None
-    except Exception as exc:  # noqa: BLE001
-        # Don't let a currents-side bug take down the whole compute.
-        log.warning(
-            "currents load raised for race=%s (proceeding without currents): %s",
-            race_id, exc,
-        )
-        return None
-
-
-def _sample_start_wind(
-    forecast,
-    start_lat: float,
-    start_lon: float,
-    race_start: datetime,
-) -> tuple[Optional[float], Optional[float]]:
-    """Sample wind at the start mark at race_start time.
-
-    Returns ``(dir_deg, speed_kt)`` or ``(None, None)`` when the sample
-    falls outside the forecast's spatial or temporal coverage. Used by
-    the frontend's T-5 freshness check to detect material forecast
-    drift since the route was computed.
-
-    Direction follows the meteorological "wind from" convention to match
-    the rest of the app (``uvToSpeedDir`` in ``windBarb.js`` does the
-    same: ``atan2(-u, -v)``).
-    """
-    uv = forecast.sample(start_lat, start_lon, race_start)
-    if uv is None:
-        return None, None
-    u, v = uv
-    speed_ms = math.hypot(u, v)
-    speed_kt = speed_ms * 1.94384
-    dir_deg = (math.degrees(math.atan2(-u, -v)) + 360.0) % 360.0
-    return dir_deg, speed_kt
-
-
-def _currents_cache_tag(currents: Optional[CurrentForecast]) -> str:
-    """Stable string capturing the currents state for cache-key purposes.
-
-    Different cycles of the same source produce different tags so a
-    fresh ingest invalidates cached routes. The absence of currents is
-    a distinct state from "currents present with no coverage" so the
-    cache correctly differentiates the two.
-    """
-    if currents is None:
-        return "none"
-    return f"{currents.quality}:{currents.t_min.isoformat()}:{currents.t_max.isoformat()}"
-
-
 async def _assert_race_owned(
     conn: asyncpg.Connection, race_id: UUID, uid: str,
 ) -> dict:
-    """D3: route compute is a WRITE op (owner + crew). Viewer can
-    READ the route the owner already computed via the SSE stream;
-    they can't kick off a fresh compute."""
+    """D3: route compute is a WRITE op (owner + crew). Viewer can READ
+    the route the owner already computed via the SSE stream; they can't
+    kick off a fresh compute."""
     from app.auth_helpers import race_write_predicate
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
@@ -301,12 +162,20 @@ async def _assert_race_owned(
     }
 
 
+def _effective_boat_class(requested: str, tier: Optional[str]) -> str:
+    """D3: free-tier callers route with the GENERIC polar regardless of
+    which boat_class the race carries. Pro + Hardware tiers get the
+    class-specific polar.
+    """
+    return requested if tier in ("pro", "hardware") else "GENERIC"
+
+
 # ─── Endpoint ────────────────────────────────────────────────────────────
 
 
 @router.post("/compute", response_model=ComputeRouteOut,
              responses={425: {"model": ForecastPendingOut}})
-async def compute_route(
+async def compute_route_endpoint(
     payload: ComputeRouteIn,
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
@@ -322,47 +191,30 @@ async def compute_route(
         )
 
     # Race start: use scheduled start_at; fall back to "now" for races
-    # without a gun time set (the user is exploring routing pre-schedule).
+    # without a gun time set (user exploring routing pre-schedule).
     race_start = race["start_at"] or datetime.now(timezone.utc)
     if race_start.tzinfo is None:
         race_start = race_start.replace(tzinfo=timezone.utc)
 
-    region, venue = _resolve_region(marks)
-    if region not in REGIONS:
-        raise HTTPException(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            f"resolved region {region!r} not in registry",
-        )
-
-    log.warning(
-        "ROUTING DEBUG region=%s venue=%s has_gfs=%s race_start=%s now+18h=%s",
-        region, venue,
-        "gfs" in REGIONS[region].sources,
-        race_start.isoformat(),
-        (datetime.now(timezone.utc) + timedelta(hours=18)).isoformat(),
+    req = RouteRequest(
+        race_id=payload.race_id,
+        marks=marks,
+        race_start=race_start,
+        boat_class=_effective_boat_class(race["boat_class"], user.get("tier")),
+        safety_factor=payload.safety_factor,
+        duration_hours=payload.duration_hours,
+        derating=DeratingProfile(
+            max_tws_kt=payload.max_tws_kt,
+            polar_margin=payload.polar_margin,
+            hs_m=payload.hs_m,
+            density_factor=payload.density_factor,
+        ),
     )
 
-    # Pro-tier gating (D3): free callers route with the GENERIC polar
-    # regardless of which boat_class the race carries. Pro + Hardware
-    # tiers get the class-specific polar.
-    requested_class = race["boat_class"]
-    effective_class = (
-        requested_class
-        if user.get("tier") in ("pro", "hardware")
-        else "GENERIC"
-    )
-    spec = spec_for_class(effective_class)
-    polar_path = f"app/services/polars/{spec.polar_csv}"
-    polar = load_polar(polar_path)
-    min_depth_m = spec.draft_m * payload.safety_factor
+    redis = redis_client.get_client()
 
-    # Load the wind forecast first — we need cycle ids for the cache key.
     try:
-        forecast = await load_forecast_for_race(
-            region=region,
-            race_start=race_start,
-            duration_hours=payload.duration_hours,
-        )
+        outcome = await compute_route(req, redis=redis, use_cache=True)
     except ForecastNotAvailable as exc:
         raise HTTPException(
             status_code=425,  # Too Early
@@ -372,152 +224,17 @@ async def compute_route(
                 "hours_until_available": exc.hours_until_available,
             },
         )
-    except RuntimeError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
-
-    # Load currents — optional. Same race-window duration as the wind
-    # forecast; the loader picks bracketing fhours from each OFS source
-    # whose bbox overlaps the marks bbox.
-    currents = await _load_currents_optional(
-        marks=marks,
-        race_start=race_start,
-        duration_hours=payload.duration_hours,
-        race_id=payload.race_id,
-    )
-
-    # Cache key. Cycle iso is stable for a given cycle; race_start changes
-    # per scheduled gun time. Forecast quality string captures whether
-    # this is HRRR-only, GFS-only, or hybrid. Venue is part of the key
-    # so a venue-hazard ingest invalidates cached routes for that venue
-    # without touching base-region routes. Derating tuple is included so
-    # changing any user-visible polar/cutoff knob is a cache miss.
-    # Currents tag invalidates routes when a new OFS cycle lands.
-    redis = redis_client.get_client()
-    snapshot_sources = "+".join(
-        sorted({s.source or "?" for s in forecast.snapshots})
-    )
-    derating_tag = (
-        f"hs={payload.hs_m:.2f}:dens={payload.density_factor:.3f}:"
-        f"margin={payload.polar_margin:.3f}:"
-        f"cutoff={payload.max_tws_kt if payload.max_tws_kt is not None else '-'}"
-    )
-    cache_key = (
-        f"route:{ENGINE_VERSION}:{payload.race_id}:"
-        f"{race_start.isoformat()}:"
-        f"{forecast.snapshots[0].reference_time}:{forecast.snapshots[-1].valid_time}:"
-        f"{snapshot_sources}:{payload.safety_factor:.2f}:venue={venue or '-'}:"
-        f"{derating_tag}:currents={_currents_cache_tag(currents)}"
-    )
-    cached_blob = await redis.get(cache_key)
-    if cached_blob is not None:
-        cached = json.loads(cached_blob)
-        cached["meta"]["cached"] = True
-        log.info("route cache hit race_id=%s", payload.race_id)
-        return cached
-
-    try:
-        is_navigable = make_navigable_predicate(
-            region=region,
-            draft_m=spec.draft_m,
-            safety_factor=payload.safety_factor,
-            venue=venue,
-        )
     except BathymetryUnavailable as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             f"{exc}. Run bathymetry_ingest for this region before computing routes.",
         )
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
 
-    currents_quality = currents.quality if currents is not None else None
+    # Persist the user's tunables so the background recompute worker
+    # replays the same physics. Non-fatal: a write failure is logged
+    # inside save_last_request and the user's response still ships.
+    await save_last_request(req, redis=redis)
 
-    # Sample the wind the route is "anchored to" at the start mark / gun
-    # time. Stamped onto the response meta so the T-5 freshness check
-    # can compute a delta against the current forecast without re-doing
-    # the route compute.
-    start_wind_dir_deg, start_wind_speed_kt = _sample_start_wind(
-        forecast=forecast,
-        start_lat=marks[0]["lat"],
-        start_lon=marks[0]["lon"],
-        race_start=race_start,
-    )
-
-    log.info(
-        "compute route race_id=%s region=%s venue=%s polar=%s race_start=%s "
-        "forecast_quality=%s marks=%d max_tws=%s margin=%.3f hs=%.2f dens=%.3f "
-        "currents=%s",
-        payload.race_id, region, venue, polar.name, race_start.isoformat(),
-        forecast.quality, len(marks), payload.max_tws_kt,
-        payload.polar_margin, payload.hs_m, payload.density_factor,
-        currents_quality or "off",
-    )
-
-    result = compute_isochrone_route_multileg(
-        marks=marks,
-        polar=polar,
-        wind=forecast,
-        is_navigable=is_navigable,
-        race_start=race_start,
-        currents=currents,
-        max_tws_kt=payload.max_tws_kt,
-        hs_m=payload.hs_m,
-        density_factor=payload.density_factor,
-        polar_margin=payload.polar_margin,
-    )
-
-    feature = route_to_geojson(
-        result,
-        properties={
-            "start": [marks[0]["lat"], marks[0]["lon"]],
-            "finish": [marks[-1]["lat"], marks[-1]["lon"]],
-            "polar": polar.name,
-            "boat_class": spec.name,
-            "draft_m": spec.draft_m,
-            "min_depth_m": min_depth_m,
-            "region": region,
-            "venue": venue,
-            "race_start": race_start.isoformat(),
-            "forecast_quality": forecast.quality,
-            "max_tws_kt": payload.max_tws_kt,
-            "polar_margin": payload.polar_margin,
-            "hs_m": payload.hs_m,
-            "density_factor": payload.density_factor,
-            "currents_quality": currents_quality,
-            "start_wind_dir_deg": start_wind_dir_deg,
-            "start_wind_speed_kt": start_wind_speed_kt,
-        },
-    )
-
-    response: dict = {
-        "route": feature,
-        "meta": {
-            "total_minutes": result.total_minutes,
-            "tack_count": result.tack_count,
-            "reached": result.reached,
-            "iterations": result.iterations,
-            "nodes_explored": result.nodes_explored,
-            "legs": result.legs,
-            "region": region,
-            "venue": venue,
-            "forecast_quality": forecast.quality,
-            "race_start": race_start.isoformat(),
-            "polar": polar.name,
-            "boat_class": spec.name,
-            "draft_m": spec.draft_m,
-            "min_depth_m": min_depth_m,
-            "cached": False,
-            "max_tws_kt": payload.max_tws_kt,
-            "polar_margin": payload.polar_margin,
-            "hs_m": payload.hs_m,
-            "density_factor": payload.density_factor,
-            "currents_quality": currents_quality,
-            "start_wind_dir_deg": start_wind_dir_deg,
-            "start_wind_speed_kt": start_wind_speed_kt,
-        },
-    }
-
-    try:
-        await redis.setex(cache_key, ROUTE_CACHE_TTL_S, json.dumps(response))
-    except Exception as exc:  # noqa: BLE001
-        log.warning("route cache write failed: %s", exc)
-
-    return response
+    return {"route": outcome.feature, "meta": outcome.meta}

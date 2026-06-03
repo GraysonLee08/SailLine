@@ -46,9 +46,12 @@ Thumbs.db
 
 # === Mobile (Expo) ===
 # Capacitor was superseded by the React Native/Expo app (2026-05-24).
-# The Expo app keeps its own mobile/.gitignore; the generated native
-# folders (mobile/ios, mobile/android) are produced by EAS prebuild and
-# are not committed.
+# 2026-06-02: pivoted off EAS to local Gradle via `expo prebuild`.
+# mobile/android/ is now COMMITTED so the build environment is
+# reproducible across machines (and CI can build without a prebuild
+# step). mobile/ios/ stays ignored — we're not building iOS today.
+# Secrets that used to live in EAS secrets now live in
+# mobile/keystore.properties (gitignored via mobile/.gitignore) or
+# ~/.gradle/gradle.properties (user-global, outside the repo).
 mobile/ios/
-mobile/android/
 mobile/.expo/
