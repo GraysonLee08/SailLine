@@ -27,6 +27,16 @@
 //     the app is open; the fallbacks cover the suspended-app case.
 //   - On mount, replays any pending notification tap that happened
 //     before the hook had registered its onFire ref (cold-start path).
+//
+// Countdown UI (2026-06-04 fix):
+//   ``msUntilFire`` is updated on a 1 s tick interval while armed. The
+//   prior shape set it ONCE at effect mount and never updated, so the
+//   "Auto-start armed — fires in 2h 8m" line in RaceDetailSheet was a
+//   stale snapshot that never ticked down. The 2026-06-03 on-water
+//   test exposed this: a race two minutes away kept reading 2h 8m in
+//   the UI because the value reflected the moment the user first
+//   opened the race detail. Adding the interval is a small cost (one
+//   timer per armed race) and the fix the user actually wanted.
 
 import { useEffect, useRef, useState } from "react";
 
@@ -196,7 +206,29 @@ export function useAutoStartRecorder({
 
     setArmed(true);
     setMsUntilFire(delay);
-    const t = setTimeout(() => {
+
+    // One-shot dev-only breadcrumb so the next on-water test can
+    // confirm the parsed startAt matches what the user expects (the
+    // 2026-06-03 report showed a 1h 17m discrepancy between mobile and
+    // web countdowns; we want to know if the parse value differed or
+    // only the snapshot was stale). Stripped from release builds by the
+    // __DEV__ gate.
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.log(
+        "[autoStart] armed",
+        JSON.stringify({
+          raceId,
+          startAtIso,
+          parsedStartAt: new Date(startAt).toISOString(),
+          armAtIso: new Date(armAt).toISOString(),
+          nowIso: new Date(now).toISOString(),
+          delayMs: delay,
+        }),
+      );
+    }
+
+    const fireT = setTimeout(() => {
       if (!recordingRef.current) {
         try {
           void startRef.current?.();
@@ -210,8 +242,29 @@ export function useAutoStartRecorder({
       setMsUntilFire(null);
     }, delay);
 
+    // 1 Hz countdown tick so the UI text "fires in X" reflects the
+    // current time. Runs alongside the one-shot fire timer above —
+    // they each clear independently in cleanup. Recomputes from
+    // armAt (wall-clock target) rather than decrementing the prior
+    // value, so a backgrounded app re-render doesn't drift relative
+    // to real time. Interval stops itself once the remaining time
+    // crosses zero; the fire timer above handles the actual start.
+    const tickT = setInterval(() => {
+      const remaining = armAt - Date.now();
+      if (remaining <= 0) {
+        // setMsUntilFire(0) so the UI flips to "Starting…" instead of
+        // showing a negative duration in the tiny window before fireT
+        // fires.
+        setMsUntilFire(0);
+        clearInterval(tickT);
+        return;
+      }
+      setMsUntilFire(remaining);
+    }, 1000);
+
     return () => {
-      clearTimeout(t);
+      clearTimeout(fireT);
+      clearInterval(tickT);
       // Note: we deliberately do NOT cancelAutoStart on every cleanup,
       // because the cleanup also runs when the effect re-runs with the
       // same key. scheduleAutoStart at the top of the next run is

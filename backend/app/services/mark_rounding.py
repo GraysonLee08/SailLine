@@ -60,13 +60,25 @@ What's deliberately NOT in v3 (deferred to follow-up):
     a reach past passage marks).
   * Missed-mark timeout (the "you sailed past without registering"
     notification) — lives in the mobile recorder, not the detector.
-  * In-batch state persistence: if a CPA happens to span a batch
-    boundary (sample N in batch K, departing samples in batch K+1) the
-    departing-count resets. Matches v2's accepted limitation; batches
-    are 30 s and the depart-confirm needs 3 samples (~15 s), so the
-    realistic case where this bites is a sample landing exactly on the
-    batch boundary at CPA. Acceptable for v1; persist the state on the
-    race row if it surfaces.
+
+Cross-batch state persistence (added 2026-06-04):
+
+The v3 docstring previously called batch-boundary state loss "acceptable
+for v1." The 2026-06-03 Beer Can Race 4 proved otherwise: with the
+mobile native uploader running ``autoSyncThreshold: 1``, batches arrive
+containing 1-3 samples each. The depart-confirm window (3 increasing
+samples after CPA) spans 3-4 batches in that cadence, and ``_last_dist``
+resets to ``None`` at the start of every batch — so the increment branch
+``elif self._last_dist is not None and d > self._last_dist`` never
+fires. The detector misses the pass despite a clean 1.1 m CPA.
+
+The detector now exposes :meth:`dump_state` and :meth:`restore_state`
+so callers can persist the traversal state across batches. ``track_ingest``
+writes the dumped state to ``race_sessions.detector_state`` (added in
+migration 0020) after every batch and restores it on the next call.
+NULL state means "fresh traversal" — matches the v3 behaviour for the
+first batch of a race, and the behaviour immediately after a pass emits
+(``_reset_traversal_state`` is called inside ``feed``).
 
 Distance math is haversine. Marks at sailing-relevant scales (tens to
 hundreds of metres) don't justify projecting to a local plane.
@@ -146,6 +158,37 @@ class MarkPass:
     lon: float
 
 
+def _opt_float(v) -> Optional[float]:
+    """Coerce a JSONB value to float-or-None.
+
+    JSONB-decoded values reach us as ``int | float | None``. asyncpg's
+    global JSONB codec normalises numeric types but we still see ``int``
+    for whole-number values (e.g. ``departing: 3`` round-trips as int).
+    """
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_state_ts(s: str) -> Optional[datetime]:
+    """Parse the ISO-8601 ``min_ts`` produced by :meth:`dump_state`.
+
+    Tolerant of the trailing ``Z`` shape some serialisers prefer; the
+    in-house dumper always uses ``+00:00`` but a hand-written test
+    fixture or a future client that round-trips through JSON.dump could
+    well land here with Z.
+    """
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in metres."""
     p1 = math.radians(lat1)
@@ -184,17 +227,24 @@ def _normalise_thresholds(
 class MarkRoundingDetector:
     """Stateful detector — feed points in chronological order, get passes.
 
-    Resumable: callers (specifically the tracks router) construct the
-    detector with the index of the next-expected mark (= the count of
-    existing persisted passes), then feed only the new batch.
+    Resumable on two axes:
 
-    Traversal state (running minimum, last distance, departing count) is
-    intentionally NOT resumed across batches. The DB persists only
-    completed passes. On resume after a batch flush, state resets. In
-    the rare case where the CPA happens to span a batch boundary, the
-    departing-count resets and the algorithm waits for fresh decreases
-    + increases. Acceptable for the v3 ship; persist state on the race
-    row if this bites in practice.
+    1. **Mark index** — construct with ``next_mark_index`` equal to the
+       count of already-persisted passes. The detector skips marks the
+       race has already rounded.
+
+    2. **Traversal state** — for streaming uploaders that emit batches
+       too small to contain the full CPA + depart pattern, callers can
+       persist the running ``{last_dist, min_dist, min_ts, min_lat,
+       min_lon, departing}`` from :meth:`dump_state` and restore it on
+       the next batch via :meth:`restore_state`. Without persistence
+       the depart-confirm counter would reset on every batch and the
+       detector would never emit when uploads run at ~1 sample/batch
+       (the realistic mobile cadence under good connectivity).
+
+    Constructing with ``state=None`` (the default) gives a fresh
+    traversal — equivalent to the pre-2026-06-04 behaviour for the
+    very first batch of a race or immediately after a pass emits.
 
     ``threshold_m`` accepts either:
       * a scalar (float) — applies to every mark.
@@ -214,6 +264,7 @@ class MarkRoundingDetector:
         depart_confirm_samples: int = DEPART_CONFIRM_SAMPLES,
         *,
         radius_m: Union[float, Sequence[float], None] = None,
+        state: Optional[dict] = None,
     ) -> None:
         if next_mark_index < 0:
             raise ValueError("next_mark_index must be >= 0")
@@ -229,6 +280,12 @@ class MarkRoundingDetector:
         self._next = int(next_mark_index)
         self._depart_n = int(depart_confirm_samples)
         self._reset_traversal_state()
+        # Restore last-batch traversal state if the caller has it. Safe
+        # to call with None — no-op. Safe to call with a stale state
+        # for an already-rounded mark — the detector validates ``done``
+        # at the top of ``feed`` and ignores the state in that case.
+        if state is not None:
+            self.restore_state(state)
 
     @property
     def next_mark_index(self) -> int:
@@ -247,6 +304,69 @@ class MarkRoundingDetector:
         self._min_lat: Optional[float] = None
         self._min_lon: Optional[float] = None
         self._departing: int = 0
+
+    # ── State persistence (added 2026-06-04 for cross-batch detection) ──
+
+    def dump_state(self) -> Optional[dict]:
+        """Return a JSONB-friendly snapshot of the current traversal state,
+        or ``None`` if no traversal is in progress (fresh / just-reset).
+
+        Pair with :meth:`restore_state` on the next-batch detector.
+        Caller persists the dict to ``race_sessions.detector_state`` and
+        passes it back into the next constructor.
+
+        Returns ``None`` (not an empty dict) when there is nothing to
+        persist, so the caller can write SQL NULL — keeps the JSONB
+        column clean for races that haven't fed a sample yet, and for
+        races where the previous batch ended exactly on a pass emit
+        (which calls ``_reset_traversal_state``).
+
+        ``next_mark_index`` is NOT part of the state — it is derived
+        from ``len(existing_passes)`` by the caller, so persisting it
+        here would duplicate truth.
+        """
+        if (
+            self._last_dist is None
+            and self._min_dist is None
+            and self._departing == 0
+        ):
+            return None
+        return {
+            "last_dist": self._last_dist,
+            "min_dist": self._min_dist,
+            "min_ts": self._min_ts.isoformat() if self._min_ts else None,
+            "min_lat": self._min_lat,
+            "min_lon": self._min_lon,
+            "departing": self._departing,
+        }
+
+    def restore_state(self, state: Optional[dict]) -> None:
+        """Restore a traversal state previously produced by
+        :meth:`dump_state`.
+
+        ``None`` is a no-op (caller hasn't seen a state yet). An empty
+        dict ``{}`` is treated the same way. Any missing key falls back
+        to the reset-state default so a partial / older-shape persisted
+        state remains usable across detector upgrades.
+        """
+        if not state:
+            return
+        self._last_dist = _opt_float(state.get("last_dist"))
+        self._min_dist = _opt_float(state.get("min_dist"))
+        ts_raw = state.get("min_ts")
+        if isinstance(ts_raw, str):
+            self._min_ts = _parse_state_ts(ts_raw)
+        elif isinstance(ts_raw, datetime):
+            self._min_ts = ts_raw
+        else:
+            self._min_ts = None
+        self._min_lat = _opt_float(state.get("min_lat"))
+        self._min_lon = _opt_float(state.get("min_lon"))
+        dep = state.get("departing", 0)
+        try:
+            self._departing = int(dep) if dep is not None else 0
+        except (TypeError, ValueError):
+            self._departing = 0
 
     def feed(self, point: Point) -> Optional[MarkPass]:
         """Consume one point. Returns a ``MarkPass`` if the point completed

@@ -2,6 +2,33 @@
 // Without this, Metro won't find @sailline/shared (hoisted to the repo
 // root) and will throw "Unable to resolve module". This is the standard
 // Expo monorepo setup.
+
+// 2026-06-03 — release-build monorepo fix.
+//
+// Expo's metro-config calls `getMetroServerRoot(projectRoot)`, which by
+// default walks UP from `mobile/` to find the workspaces root and uses
+// THAT as Metro's `unstable_serverRoot`. Metro's `_resolveRelativePath`
+// then resolves the embed entry (`./index.js`) from `${serverRoot}/.`
+// — i.e. `<workspace>/.` — which has no index.js, and `gradlew
+// assembleRelease` fails with "Unable to resolve module ./index.js from
+// E:\Personal\Coding\SailLine/.".
+//
+// Setting `EXPO_NO_METRO_WORKSPACE_ROOT=1` BEFORE requiring
+// `expo/metro-config` short-circuits `getMetroServerRoot` so it returns
+// `projectRoot` directly. serverRoot stays at `mobile/`, the entry
+// resolves against the real `mobile/index.js` shim, and the bundle
+// task completes. Cross-package imports from `@sailline/shared` keep
+// working because the resolution there goes through node_modules
+// (workspace-hoisted) + the explicit `nodeModulesPaths` we set below,
+// neither of which is affected by serverRoot.
+//
+// Debug builds were unaffected because they skip the embed step and
+// load the JS bundle from the dev Metro server at runtime.
+//
+// Must be set before any `require("expo/metro-config")` and before any
+// `require("expo/...")` that transitively loads metro-config.
+process.env.EXPO_NO_METRO_WORKSPACE_ROOT = "1";
+
 const { getDefaultConfig } = require("expo/metro-config");
 const path = require("path");
 

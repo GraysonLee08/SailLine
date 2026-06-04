@@ -58,6 +58,7 @@ def _race_row(
     started_at=None,
     start_at=None,
     mode="distance",
+    detector_state=None,
 ):
     """Build the row shape that ``load_race_for_ingest`` expects.
 
@@ -75,6 +76,10 @@ def _race_row(
     ``mode`` was added in v3 (2026-05-30) so the detector picks the
     right per-mark thresholds. Defaults to "distance" — the wider
     tolerance, mirroring the production safer-default.
+
+    ``detector_state`` was added in 0020 (2026-06-04) for cross-batch
+    traversal persistence. Defaults to None — the "fresh traversal"
+    sentinel, matching a newly-created race.
     """
     if marks is None:
         marks = [{"name": "Far", "lat": 0.0, "lon": 0.0}]
@@ -86,6 +91,7 @@ def _race_row(
         "started_at": started_at,
         "start_at": start_at,
         "mode": mode,
+        "detector_state": detector_state,
     }
 
 
@@ -394,8 +400,16 @@ def test_post_telemetry_gps_only(
     client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
 ):
     """GPS-only batch: single ``fetch`` for the INSERT (RETURNING 1),
-    no ``execute`` (UPDATE) because the default fixture mark is far
-    away, no ``executemany`` because IMU is empty.
+    one ``execute`` (UPDATE) to persist the detector traversal state
+    for the next batch (migration 0020 — 2026-06-04). No mark_passes
+    UPDATE because the default fixture mark is far away. No
+    ``executemany`` because IMU is empty.
+
+    Pre-0020 this test asserted ``execute.assert_not_called()``. The
+    cross-batch state persistence work makes every batch hit the
+    UPDATE so the next batch can resume; without that, depart-confirm
+    counters reset across small batches and Mark-2-style misses come
+    back (see sailline-docs/2026-06-04_session.md, Item 5).
 
     ``gps_inserted`` mirrors the row count returned by the INSERT,
     which the fixture defaults to "every sent row landed."
@@ -411,7 +425,13 @@ def test_post_telemetry_gps_only(
     assert body["new_mark_passes"] == []
     fake_conn.executemany.assert_not_called()
     assert fake_conn.fetch.await_count == 1
-    fake_conn.execute.assert_not_called()
+    # Single UPDATE persists detector_state. Must target the
+    # detector_state column and must NOT include mark_passes (no
+    # new passes detected in this batch).
+    assert fake_conn.execute.await_count == 1
+    update_sql = fake_conn.execute.await_args.args[0]
+    assert "detector_state" in update_sql
+    assert "mark_passes" not in update_sql
     no_trigger.assert_not_awaited()
 
 
@@ -485,12 +505,18 @@ def test_post_telemetry_full_batch(
     """GPS + IMU + calibration — the common 'first flush after re-zero'
     shape.
 
-    Call counts after the 2026-06-01 idempotency change:
+    Call counts after the 2026-06-04 cross-batch detector-state work
+    (migration 0020):
       * ``fetch`` x2 — GPS unnest INSERT (RETURNING 1) + IMU unnest
         INSERT (RETURNING 1). Both report actual landed counts.
-      * ``execute`` x1 — calibration INSERT (the mark-pass UPDATE is
-        the OTHER potential ``execute`` caller; default mark is far
-        so no UPDATE fires).
+      * ``execute`` x2 — calibration INSERT + detector_state UPDATE.
+        The detector_state UPDATE persists the traversal state for
+        the next batch even when no new pass was detected (default
+        fixture mark is far so no mark_passes UPDATE fires).
+
+    Pre-0020 this asserted ``execute.await_count == 1`` (just
+    calibration). The state-persistence UPDATE is now unconditional;
+    see sailline-docs/2026-06-04_session.md, Item 5.
     """
     r = client.post(
         race_url,
@@ -510,7 +536,10 @@ def test_post_telemetry_full_batch(
     assert body["new_mark_passes"] == []
     fake_conn.executemany.assert_not_called()
     assert fake_conn.fetch.await_count == 2
-    assert fake_conn.execute.await_count == 1
+    assert fake_conn.execute.await_count == 2
+    # Exactly one of the two executes is the detector_state UPDATE.
+    update_sqls = [c.args[0] for c in fake_conn.execute.await_args_list]
+    assert sum("detector_state" in s for s in update_sqls) == 1
     no_trigger.assert_not_awaited()
 
 

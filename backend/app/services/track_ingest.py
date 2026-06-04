@@ -123,7 +123,8 @@ async def load_race_for_ingest(
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     row = await conn.fetchrow(
         f"""
-        SELECT r.marks, r.mark_passes, r.started_at, r.start_at, r.mode
+        SELECT r.marks, r.mark_passes, r.started_at, r.start_at, r.mode,
+               r.detector_state
         FROM race_sessions r
         WHERE r.id = $1 AND {pred}
         FOR UPDATE OF r
@@ -146,6 +147,19 @@ async def load_race_for_ingest(
     else:
         passes = passes_raw or []
 
+    # detector_state: JSONB column added in 0020. NULL is the "fresh
+    # traversal" sentinel; restore_state treats both None and {} as
+    # no-op. Same dual-shape tolerance as marks/mark_passes — asyncpg
+    # global JSONB codec usually decodes for us but older connection
+    # setups occasionally hand back the raw string.
+    detector_state_raw = row["detector_state"]
+    if isinstance(detector_state_raw, (bytes, str)):
+        detector_state = (
+            json.loads(detector_state_raw) if detector_state_raw else None
+        )
+    else:
+        detector_state = detector_state_raw
+
     return {
         "marks": marks,
         "mark_passes": passes,
@@ -154,6 +168,7 @@ async def load_race_for_ingest(
         # v3 mark-detection thresholds vary by mode. Default to "distance"
         # (the wider tolerance) when the column is somehow NULL.
         "mode": row["mode"] or "distance",
+        "detector_state": detector_state,
     }
 
 
@@ -215,6 +230,7 @@ async def detect_and_persist_new_passes(
     started_at: Optional[datetime] = None,
     start_at: Optional[datetime] = None,
     mode: str = "distance",
+    detector_state: Optional[dict] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run the detector over a single batch, persist new passes, return
     ``(all_passes, new_passes)`` as plain JSONB-shaped dicts.
@@ -230,11 +246,23 @@ async def detect_and_persist_new_passes(
     ``started_at = start_at`` in the same UPDATE that persists new
     passes. Idempotent — only writes if currently NULL.
 
-    Side effect: when at least one new pass is detected, OR
-    ``started_at`` needs backfilling, OR the final pass just closed the
-    course (``ended_at`` write), executes ONE UPDATE on
-    ``race_sessions``. No UPDATE runs in the all-quiet case — keeps the
-    hot path quiet for the common no-rounding case.
+    ``detector_state`` (added 2026-06-04) is the JSONB snapshot of the
+    previous batch's traversal state from
+    ``race_sessions.detector_state``. ``None`` means "fresh traversal"
+    — required for the first batch of a race and any batch following
+    a pass emit. With cross-batch state persistence the detector can
+    accumulate the depart-confirm count across small batches; without
+    it, batches containing ≤ 3 samples would never trigger an emit
+    because ``_last_dist`` resets to None on every call.
+
+    Side effect: every call writes ``detector_state`` (even on quiet
+    batches) so the next batch can resume. The other lifecycle columns
+    are conditionally appended to the same UPDATE: ``mark_passes``
+    when new passes detected, ``started_at`` when backfilling, and
+    ``ended_at`` when the final pass closes the course. Before 0020
+    the quiet case ran no UPDATE; now it always runs one. The cost is
+    ~negligible (single row, small JSONB) compared to the depart-
+    confirm bug it fixes.
 
     Auth: the caller MUST have already gone through
     :func:`load_race_for_ingest` so the UPDATE-by-id below is safe.
@@ -271,39 +299,35 @@ async def detect_and_persist_new_passes(
     next_idx = len(existing_passes)
     if next_idx >= len(detector_marks):
         # All marks already rounded; nothing more to detect. Still need
-        # to handle the started_at backfill if applicable.
-        if needs_started_at_write:
-            await conn.execute(
-                """
-                UPDATE race_sessions
-                SET started_at = $1,
-                    updated_at = NOW()
-                WHERE id = $2
-                """,
-                start_at,
-                race_id,
-            )
+        # to handle the started_at backfill if applicable. Also clear
+        # any lingering detector_state — the course is closed.
+        await _persist_quiet_state(
+            conn,
+            race_id=race_id,
+            new_detector_state=None,
+            backfill_start_at=start_at if needs_started_at_write else None,
+        )
         return list(existing_passes), []
 
     det = MarkRoundingDetector(
         detector_marks,
         threshold_m=thresholds_for_course(len(detector_marks), mode=mode),
         next_mark_index=next_idx,
+        state=detector_state,
     )
     new_pass_objs = det.feed_batch(new_points)
+    # Capture the AFTER-batch traversal state for the next call.
+    # If a pass emitted, dump_state returns None because _reset_traversal_state
+    # was called inside feed() — that's the correct "fresh" sentinel.
+    new_state = det.dump_state()
 
     if not new_pass_objs:
-        if needs_started_at_write:
-            await conn.execute(
-                """
-                UPDATE race_sessions
-                SET started_at = $1,
-                    updated_at = NOW()
-                WHERE id = $2
-                """,
-                start_at,
-                race_id,
-            )
+        await _persist_quiet_state(
+            conn,
+            race_id=race_id,
+            new_detector_state=new_state,
+            backfill_start_at=start_at if needs_started_at_write else None,
+        )
         return list(existing_passes), []
 
     new_passes = _passes_to_dicts(new_pass_objs, next_idx)
@@ -320,10 +344,17 @@ async def detect_and_persist_new_passes(
         final_pass_ts = _parse_iso(new_passes[-1]["ts"])
 
     # Build the UPDATE dynamically so we only set the lifecycle columns
-    # when they need it. mark_passes is always written when we got here
-    # (new_pass_objs is non-empty by this point).
-    set_parts: list[str] = ["mark_passes = $1::jsonb", "updated_at = NOW()"]
-    args: list = [json.dumps(all_passes)]
+    # when they need it. mark_passes + detector_state are always written
+    # when we got here (new_pass_objs is non-empty by this point).
+    set_parts: list[str] = [
+        "mark_passes = $1::jsonb",
+        "detector_state = $2::jsonb",
+        "updated_at = NOW()",
+    ]
+    args: list = [
+        json.dumps(all_passes),
+        json.dumps(new_state) if new_state is not None else None,
+    ]
     if needs_started_at_write:
         args.append(start_at)
         set_parts.append(f"started_at = ${len(args)}")
@@ -346,6 +377,46 @@ async def detect_and_persist_new_passes(
         *args,
     )
     return all_passes, new_passes
+
+
+async def _persist_quiet_state(
+    conn: asyncpg.Connection,
+    *,
+    race_id: UUID,
+    new_detector_state: Optional[dict],
+    backfill_start_at: Optional[datetime],
+) -> None:
+    """Single UPDATE for the no-new-pass case.
+
+    Writes ``detector_state`` (the load-bearing one for the cross-batch
+    fix), ``started_at`` if a backfill is pending, and ``updated_at``.
+
+    Runs unconditionally — every batch needs to persist its traversal
+    state so the next batch can resume. The pre-0020 code path
+    short-circuited this case with no UPDATE; with cross-batch detection
+    we cannot, or the depart-confirm count is lost the moment a tiny
+    batch arrives without a fresh CPA.
+    """
+    set_parts: list[str] = [
+        "detector_state = $1::jsonb",
+        "updated_at = NOW()",
+    ]
+    args: list = [
+        json.dumps(new_detector_state) if new_detector_state is not None else None,
+    ]
+    if backfill_start_at is not None:
+        args.append(backfill_start_at)
+        set_parts.append(f"started_at = ${len(args)}")
+    args.append(race_id)
+    race_id_idx = len(args)
+    await conn.execute(
+        f"""
+        UPDATE race_sessions
+        SET {", ".join(set_parts)}
+        WHERE id = ${race_id_idx}
+        """,
+        *args,
+    )
 
 
 # --- Postprocess trigger ---------------------------------------------

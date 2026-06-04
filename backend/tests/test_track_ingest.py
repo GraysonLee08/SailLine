@@ -74,47 +74,57 @@ async def test_load_race_for_ingest_returns_parsed_jsonb(conn):
         "started_at": None,
         "start_at": None,
         "mode": "distance",
+        "detector_state": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
     assert out["marks"] == marks
     assert out["mark_passes"] == passes
+    assert out["detector_state"] is None
 
 
 async def test_load_race_for_ingest_parses_string_jsonb(conn):
     """Defensive path: some fixtures (and older asyncpg configs)
-    return JSONB as a string. The loader must parse it."""
+    return JSONB as a string. The loader must parse it. Same path
+    is exercised for ``detector_state`` (also a JSONB column)."""
     marks = [{"name": "M", "lat": 42.3, "lon": -87.8}]
+    state = {"last_dist": 50.0, "min_dist": 12.5, "min_ts": None,
+             "min_lat": 42.3, "min_lon": -87.8, "departing": 1}
     conn.fetchrow.return_value = {
         "marks": json.dumps(marks),
         "mark_passes": json.dumps([]),
         "started_at": None,
         "start_at": None,
         "mode": "distance",
+        "detector_state": json.dumps(state),
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
     assert out["marks"] == marks
     assert out["mark_passes"] == []
+    assert out["detector_state"] == state
 
 
 async def test_load_race_for_ingest_handles_null_jsonb(conn):
     """A pre-Alembic race row with NULL marks/mark_passes must not
-    crash. Returns empty lists."""
+    crash. Returns empty lists. detector_state stays None — that's
+    the "fresh traversal" sentinel."""
     conn.fetchrow.return_value = {
         "marks": None,
         "mark_passes": None,
         "started_at": None,
         "start_at": None,
         "mode": "distance",
+        "detector_state": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
 
     assert out["marks"] == []
     assert out["mark_passes"] == []
+    assert out["detector_state"] is None
 
 
 async def test_load_race_for_ingest_404_when_not_writeable(conn):
@@ -136,6 +146,7 @@ async def test_load_race_for_ingest_uses_write_predicate(conn):
         "started_at": None,
         "start_at": None,
         "mode": "distance",
+        "detector_state": None,
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -161,6 +172,7 @@ async def test_load_race_for_ingest_acquires_for_update(conn):
         "started_at": None,
         "start_at": None,
         "mode": "distance",
+        "detector_state": None,
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -169,12 +181,32 @@ async def test_load_race_for_ingest_acquires_for_update(conn):
     assert "FOR UPDATE" in sql
 
 
+async def test_load_race_for_ingest_reads_detector_state_column(conn):
+    """0020 regression: the SELECT must include ``detector_state`` so
+    the cross-batch traversal-state persistence has something to
+    restore. If this column is dropped the depart-confirm counter
+    silently resets on every batch and Mark-2-style misses come back."""
+    conn.fetchrow.return_value = {
+        "marks": [],
+        "mark_passes": [],
+        "started_at": None,
+        "start_at": None,
+        "mode": "distance",
+        "detector_state": None,
+    }
+
+    await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
+
+    sql = conn.fetchrow.await_args.args[0]
+    assert "detector_state" in sql
+
+
 # ─── detect_and_persist_new_passes ────────────────────────────────────
 
 
 async def test_detect_and_persist_emits_passes(conn):
     """Happy path: batch crosses a mark → returns new pass + persists
-    via UPDATE."""
+    mark_passes AND detector_state via a single UPDATE."""
     race_id = uuid4()
     mark = {"name": "M", "lat": 42.30, "lon": -87.80}
 
@@ -194,13 +226,28 @@ async def test_detect_and_persist_emits_passes(conn):
     sql = conn.execute.await_args.args[0]
     assert "UPDATE race_sessions" in sql
     assert "mark_passes" in sql
-    persisted = json.loads(conn.execute.await_args.args[1])
-    assert persisted == new_p
+    # detector_state is part of the same UPDATE; emit case resets it to
+    # NULL because _reset_traversal_state ran inside feed().
+    assert "detector_state" in sql
+    persisted_passes = json.loads(conn.execute.await_args.args[1])
+    assert persisted_passes == new_p
+    # The second positional arg is the new detector_state JSONB. After
+    # an emit the state should be None (the traversal is done for this
+    # mark; next batch starts fresh on the next mark).
+    persisted_state = conn.execute.await_args.args[2]
+    assert persisted_state is None
 
 
-async def test_detect_and_persist_no_update_when_no_passes(conn):
-    """Batch doesn't cross any mark → no UPDATE call."""
-    far_mark = {"name": "Far", "lat": 0.0, "lon": 0.0}
+async def test_detect_and_persist_persists_state_when_no_passes(conn):
+    """Even when no pass emits, the UPDATE MUST run to persist the
+    traversal state for the next batch. Pre-0020 this case ran no
+    UPDATE; post-0020 it always does, because skipping the write loses
+    the depart-confirm counter that makes 1-sample-per-batch detection
+    work."""
+    # Place a mark *near* the point trajectory so the detector picks
+    # up a traversal (last_dist non-None) without crossing the threshold
+    # — gives us a non-None state to persist.
+    far_mark = {"name": "Far", "lat": 42.30, "lon": -87.85}
 
     all_p, new_p = await track_ingest.detect_and_persist_new_passes(
         conn,
@@ -212,12 +259,20 @@ async def test_detect_and_persist_no_update_when_no_passes(conn):
 
     assert new_p == []
     assert all_p == []
-    conn.execute.assert_not_called()
+    # Single UPDATE was issued to persist the traversal state.
+    conn.execute.assert_awaited_once()
+    sql = conn.execute.await_args.args[0]
+    assert "detector_state" in sql
+    # mark_passes column is NOT in the SQL when there are no new passes
+    # — the quiet-state writer only touches detector_state + updated_at
+    # (+ optional started_at backfill).
+    assert "mark_passes" not in sql
 
 
 async def test_detect_and_persist_resumes_from_existing(conn):
     """A re-flushed batch (offline-queue retry) that re-rounds an
-    already-recorded mark must NOT create a duplicate pass."""
+    already-recorded mark must NOT create a duplicate pass. State is
+    still persisted (the next batch needs it)."""
     marks = [
         {"name": "A", "lat": 42.30, "lon": -87.80},
         {"name": "B", "lat": 42.31, "lon": -87.80},
@@ -239,12 +294,63 @@ async def test_detect_and_persist_resumes_from_existing(conn):
 
     assert new_p == []
     assert all_p == existing
-    conn.execute.assert_not_called()
+    # Quiet-state UPDATE still runs to persist whatever traversal state
+    # accumulated against mark B (the next-expected). Mark A pass is
+    # NOT re-emitted (existing_passes already covers it).
+    conn.execute.assert_awaited_once()
+
+
+async def test_detect_and_persist_threads_state_into_detector(conn):
+    """A non-None detector_state passed in MUST be restored on the
+    detector, so the next batch resumes where the previous left off.
+
+    Approach: pre-seed traversal state where ``departing=2`` and the
+    running minimum is well within threshold. Feeding even a single
+    further-away sample should now satisfy depart-confirm and emit.
+    Without state restoration the same single sample would not emit.
+    """
+    mark = {"name": "M", "lat": 42.30, "lon": -87.80}
+    # State that represents: mark CPA was 5 m, last sample was 10 m,
+    # departing count already at 2. Next strictly-increasing sample
+    # tips depart_confirm to 3 → emit.
+    seeded_state = {
+        "last_dist": 10.0,
+        "min_dist": 5.0,
+        "min_ts": "2026-05-14T18:00:05+00:00",
+        "min_lat": mark["lat"],
+        "min_lon": mark["lon"],
+        "departing": 2,
+    }
+    # One sample, further away than last_dist → triggers the emit.
+    further = DetectorPoint(
+        lat=mark["lat"] + 0.0005,  # ~55 m N
+        lon=mark["lon"],
+        ts=datetime(2026, 5, 14, 18, 0, 10, tzinfo=timezone.utc),
+    )
+
+    all_p, new_p = await track_ingest.detect_and_persist_new_passes(
+        conn,
+        race_id=uuid4(),
+        marks=[mark],
+        existing_passes=[],
+        new_points=[further],
+        detector_state=seeded_state,
+    )
+
+    assert len(new_p) == 1, (
+        "With seeded state at departing=2, one more increasing sample "
+        "must complete the depart-confirm and emit."
+    )
+    # The pass is emitted at the SEEDED min_ts (CPA from a previous batch),
+    # not the timestamp of the further-away sample fed in this call.
+    assert new_p[0]["ts"] == "2026-05-14T18:00:05+00:00"
 
 
 async def test_detect_and_persist_skips_when_marks_malformed(conn):
     """Defensive: malformed mark dict (missing lat/lon) → bail out
-    cleanly, no passes emitted, no UPDATE."""
+    cleanly, no passes emitted, no UPDATE. The malformed-marks path
+    short-circuits BEFORE the cross-batch persistence machinery, so
+    no state UPDATE either."""
     all_p, new_p = await track_ingest.detect_and_persist_new_passes(
         conn,
         race_id=uuid4(),
@@ -260,7 +366,9 @@ async def test_detect_and_persist_skips_when_marks_malformed(conn):
 
 async def test_detect_and_persist_no_op_when_all_marks_rounded(conn):
     """If existing_passes already covers every mark, the detector
-    can't emit anything new — short-circuit before constructing it."""
+    can't emit anything new — short-circuit before constructing it.
+    Still issues an UPDATE to clear any lingering detector_state
+    (the course is closed, no more traversal to track)."""
     marks = [{"name": "M", "lat": 42.30, "lon": -87.80}]
     existing = [{
         "mark_index": 0,
@@ -279,7 +387,12 @@ async def test_detect_and_persist_no_op_when_all_marks_rounded(conn):
 
     assert new_p == []
     assert all_p == existing
-    conn.execute.assert_not_called()
+    # Single UPDATE to clear detector_state to NULL.
+    conn.execute.assert_awaited_once()
+    sql = conn.execute.await_args.args[0]
+    assert "detector_state" in sql
+    state_val = conn.execute.await_args.args[1]
+    assert state_val is None
 
 
 # ─── maybe_trigger_postprocess ────────────────────────────────────────

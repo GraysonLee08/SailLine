@@ -212,6 +212,7 @@ async def append_track(
                 started_at=race["started_at"],
                 start_at=race["start_at"],
                 mode=race["mode"],
+                detector_state=race["detector_state"],
             )
 
     # Final-mark trigger lives outside the conn block so a job failure

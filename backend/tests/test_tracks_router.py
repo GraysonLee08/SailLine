@@ -104,6 +104,7 @@ def _race_row(
     started_at=None,
     start_at=None,
     mode="distance",
+    detector_state=None,
 ):
     if marks is None:
         marks = [{"name": "M", "lat": 42.30, "lon": -87.80}]
@@ -115,6 +116,9 @@ def _race_row(
         "started_at": started_at,
         "start_at": start_at,
         "mode": mode,
+        # detector_state added in 0020 for cross-batch traversal
+        # persistence. None == "fresh traversal" (default for a new race).
+        "detector_state": detector_state,
     }
 
 
@@ -286,11 +290,20 @@ def test_post_emits_mark_pass_when_batch_rounds_a_mark(client, mock_conn):
     assert persisted[0]["mark_index"] == 0
 
 
-def test_post_skips_update_when_no_new_passes(client, mock_conn):
-    """No mark passes detected → no UPDATE on race_sessions.
+def test_post_persists_detector_state_when_no_new_passes(client, mock_conn):
+    """No mark passes detected → still ONE UPDATE to persist the
+    detector traversal state for the next batch.
 
-    Call topology after 2026-06-01: fetch=1 (GPS INSERT only),
-    execute=0 (no UPDATE because no passes detected).
+    Call topology after 2026-06-04 (migration 0020): fetch=1 (GPS
+    INSERT only), execute=1 (detector_state UPDATE — no mark_passes
+    column in the SQL because no new passes detected).
+
+    Pre-0020 this test asserted ``execute.await_count == 0`` and was
+    named ``test_post_skips_update_when_no_new_passes``. The
+    cross-batch state persistence work makes the UPDATE unconditional;
+    without it, the depart-confirm counter resets on every small batch
+    and live races miss marks despite tight CPAs (see Beer Can Race 4
+    post-mortem in sailline-docs/2026-06-04_session.md, Item 5).
     """
     mock_conn.fetchrow.return_value = _race_row(
         marks=[{"name": "Far", "lat": 0.0, "lon": 0.0}],
@@ -301,7 +314,10 @@ def test_post_skips_update_when_no_new_passes(client, mock_conn):
     )
     assert r.status_code == 201
     assert mock_conn.fetch.await_count == 1
-    assert mock_conn.execute.await_count == 0
+    assert mock_conn.execute.await_count == 1
+    update_sql = mock_conn.execute.await_args.args[0]
+    assert "detector_state" in update_sql
+    assert "mark_passes" not in update_sql
 
 
 def test_post_resumes_from_existing_passes(client, mock_conn):

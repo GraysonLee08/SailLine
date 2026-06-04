@@ -489,3 +489,255 @@ def test_real_world_colors_bravo_inshore_mode_misses_distance_passes():
     # Dever (208 m wide pass) — detection stalls at index 4 onwards.
     detected = [p.mark_index for p in passes]
     assert detected == [0, 1, 2, 3]
+
+
+# ─── Cross-batch state persistence (2026-06-04) ─────────────────────────
+
+
+def test_dump_and_restore_round_trip_preserves_state():
+    """dump_state → restore_state should produce a detector that
+    behaves identically to the source. Sanity check before relying on
+    persistence across batches in the realistic fixture below."""
+    marks = [Mark(lat=REF_LAT, lon=REF_LON)]
+    src = MarkRoundingDetector(marks, threshold_m=100.0)
+    # Feed two approach samples to push some traversal state in.
+    src.feed(pt(REF_LAT, REF_LON + m_to_dlon(200), 0))
+    src.feed(pt(REF_LAT, REF_LON + m_to_dlon(150), 1))
+
+    state = src.dump_state()
+    assert state is not None
+    # Round-trip through JSON to mirror the JSONB transport.
+    import json
+    state = json.loads(json.dumps(state))
+
+    restored = MarkRoundingDetector(marks, threshold_m=100.0, state=state)
+    # Continue the approach + depart on both — they must emit identically.
+    extra = [
+        pt(REF_LAT, REF_LON + m_to_dlon(50), 2),
+        pt(REF_LAT, REF_LON, 3),                 # CPA
+        pt(REF_LAT, REF_LON + m_to_dlon(40), 4),
+        pt(REF_LAT, REF_LON + m_to_dlon(80), 5),
+        pt(REF_LAT, REF_LON + m_to_dlon(120), 6),
+    ]
+    src_passes = []
+    rst_passes = []
+    for p in extra:
+        s = src.feed(p)
+        r = restored.feed(p)
+        if s:
+            src_passes.append(s)
+        if r:
+            rst_passes.append(r)
+    assert [p.mark_index for p in src_passes] == [p.mark_index for p in rst_passes]
+    assert [p.ts for p in src_passes] == [p.ts for p in rst_passes]
+
+
+def test_dump_state_is_none_for_fresh_detector():
+    """A detector that hasn't seen a sample (or just emitted a pass)
+    should report no traversal state to persist. Lets the caller write
+    SQL NULL — keeps the column clean."""
+    det = MarkRoundingDetector(
+        [Mark(lat=REF_LAT, lon=REF_LON)], threshold_m=100.0,
+    )
+    assert det.dump_state() is None
+
+
+def test_one_sample_batches_without_state_misses_pass():
+    """Regression: with no cross-batch state persistence, feeding one
+    sample per batch fails to emit even on a textbook approach. This
+    documents the bug that motivated migration 0020 — production behaviour
+    before the fix, and what would happen if a caller forgot to thread
+    ``detector_state`` through."""
+    marks = [Mark(lat=REF_LAT, lon=REF_LON)]
+    threshold = 100.0
+    # Approach + CPA + 5 increasing departing samples.
+    samples = [
+        pt(REF_LAT, REF_LON + m_to_dlon(50), 0),
+        pt(REF_LAT, REF_LON + m_to_dlon(20), 1),
+        pt(REF_LAT, REF_LON, 2),                 # CPA
+        pt(REF_LAT, REF_LON + m_to_dlon(30), 3),
+        pt(REF_LAT, REF_LON + m_to_dlon(60), 4),
+        pt(REF_LAT, REF_LON + m_to_dlon(90), 5),
+        pt(REF_LAT, REF_LON + m_to_dlon(120), 6),
+    ]
+    emitted = []
+    for s in samples:
+        # Each batch is a fresh detector with no state — the pre-0020
+        # production behaviour.
+        det = MarkRoundingDetector(marks, threshold_m=threshold)
+        passes = det.feed_batch([s])
+        emitted.extend(passes)
+    assert emitted == [], (
+        "Without cross-batch state, depart-confirm never accumulates and "
+        "the detector misses the pass. This is the bug 0020 fixes."
+    )
+
+
+def test_one_sample_batches_with_state_detects_pass():
+    """With dump_state / restore_state threaded through every batch,
+    the same one-sample-per-batch cadence detects the pass correctly.
+    This is the post-0020 production path."""
+    marks = [Mark(lat=REF_LAT, lon=REF_LON)]
+    threshold = 100.0
+    samples = [
+        pt(REF_LAT, REF_LON + m_to_dlon(50), 0),
+        pt(REF_LAT, REF_LON + m_to_dlon(20), 1),
+        pt(REF_LAT, REF_LON, 2),                 # CPA
+        pt(REF_LAT, REF_LON + m_to_dlon(30), 3),
+        pt(REF_LAT, REF_LON + m_to_dlon(60), 4),
+        pt(REF_LAT, REF_LON + m_to_dlon(90), 5),
+        pt(REF_LAT, REF_LON + m_to_dlon(120), 6),
+    ]
+    persisted: dict | None = None
+    next_idx = 0
+    emitted = []
+    for s in samples:
+        det = MarkRoundingDetector(
+            marks,
+            threshold_m=threshold,
+            next_mark_index=next_idx,
+            state=persisted,
+        )
+        new_passes = det.feed_batch([s])
+        emitted.extend(new_passes)
+        next_idx += len(new_passes)
+        persisted = det.dump_state()
+    assert [p.mark_index for p in emitted] == [0]
+    # Pass should be timestamped at the CPA sample (t=2), not the depart
+    # samples. Confirms the state correctly tracked the running minimum.
+    assert emitted[0].ts == samples[2].ts
+
+
+# ─── Beer Can Race 4 (2026-06-03) — real-world streaming fixture ─────────
+
+
+_BEER_CAN_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "beer_can_race_4_20260603.json"
+)
+
+_BEER_CAN_MARKS = [
+    Mark(lat=41.852833333333336, lon=-87.55683333333333),  # SA7 start
+    Mark(lat=41.852833333333336, lon=-87.5325),            # 3
+    Mark(lat=41.86566666666667, lon=-87.5395),             # 2
+    Mark(lat=41.86566666666667, lon=-87.574),              # 8
+    Mark(lat=41.852833333333336, lon=-87.58116666666666),  # 7  (never reached — DNF)
+    Mark(lat=41.852833333333336, lon=-87.55683333333333),  # SA7 finish (never reached)
+]
+
+
+def _load_beer_can_points() -> list[Point]:
+    """Load the Beer Can 4 telemetry. Returns Point objects in chrono
+    order. Skipped at module import if the fixture isn't checked in."""
+    import json as _json
+    import re as _re
+
+    raw = _json.loads(_BEER_CAN_FIXTURE.read_text())
+    out: list[Point] = []
+    for p in raw["points"]:
+        ts_str = p["ts"]
+        # Tolerate Z + truncated fractional seconds — the studio export
+        # mixes both. fromisoformat is fussy about exactly 3 or 6 digits.
+        ts_str = ts_str.replace("Z", "+00:00")
+        m = _re.match(r"(.+?)\.(\d+)([+-]\d{2}:\d{2})", ts_str)
+        if m:
+            frac = (m.group(2) + "000000")[:6]
+            ts_str = f"{m.group(1)}.{frac}{m.group(3)}"
+        out.append(
+            Point(
+                lat=float(p["lat"]),
+                lon=float(p["lon"]),
+                ts=datetime.fromisoformat(ts_str),
+                speed_kts=float(p.get("sog_kts") or 0.0),
+            )
+        )
+    return out
+
+
+@pytest.mark.skipif(
+    not _BEER_CAN_FIXTURE.exists(),
+    reason="Beer Can 4 fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_beer_can_4_bulk_batch_detects_first_four_marks():
+    """Whole-track baseline: feeding the entire trace as a single batch
+    detects the 4 marks the boat actually sailed (SA7 start, 3, 2, 8)
+    before DNF. Inshore mode = 100 m threshold; Mark 2 CPA was 1.1 m so
+    well inside."""
+    points = _load_beer_can_points()
+    thresholds = thresholds_for_course(len(_BEER_CAN_MARKS), mode="inshore")
+    passes = compute_passes(_BEER_CAN_MARKS, points, threshold_m=thresholds)
+    assert [p.mark_index for p in passes] == [0, 1, 2, 3], (
+        "Whole-track replay must catch marks 0-3. Mark 4 and 5 are not "
+        "reachable on this trace (DNF + motor back to harbour)."
+    )
+
+
+@pytest.mark.skipif(
+    not _BEER_CAN_FIXTURE.exists(),
+    reason="Beer Can 4 fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_beer_can_4_streaming_one_sample_batches_with_state_detects_all_marks():
+    """The bug fix in action: replaying the same trace one sample per
+    feed_batch call (mirroring the mobile native uploader's
+    autoSyncThreshold=1 cadence), with dump_state / restore_state
+    threaded between calls, detects the same 4 marks as the bulk run.
+
+    Without the cross-batch state persistence this test would emit zero
+    passes — which is exactly what production did on 2026-06-03 for
+    Mark 2 (CPA was 1.1 m, but the depart-confirm samples landed in
+    separate batches and the counter reset on each)."""
+    import json as _json
+
+    points = _load_beer_can_points()
+    marks = _BEER_CAN_MARKS
+    thresholds = thresholds_for_course(len(marks), mode="inshore")
+
+    persisted: dict | None = None
+    next_idx = 0
+    emitted: list = []
+    for p in points:
+        det = MarkRoundingDetector(
+            marks,
+            threshold_m=thresholds,
+            next_mark_index=next_idx,
+            state=persisted,
+        )
+        new_passes = det.feed_batch([p])
+        emitted.extend(new_passes)
+        next_idx += len(new_passes)
+        # Round-trip through JSON to mirror the JSONB persistence path.
+        # If the dumped state can't survive JSON it can't survive PostgreSQL.
+        raw = det.dump_state()
+        persisted = _json.loads(_json.dumps(raw)) if raw is not None else None
+
+    assert [p.mark_index for p in emitted] == [0, 1, 2, 3]
+
+
+@pytest.mark.skipif(
+    not _BEER_CAN_FIXTURE.exists(),
+    reason="Beer Can 4 fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_beer_can_4_streaming_one_sample_batches_without_state_misses_marks():
+    """Regression guard: the same one-sample-per-batch replay WITHOUT
+    cross-batch state persistence drops most or all of the passes.
+    Documents the production bug for posterity — if a future change
+    accidentally severs the state thread, this test surfaces it."""
+    points = _load_beer_can_points()
+    marks = _BEER_CAN_MARKS
+    thresholds = thresholds_for_course(len(marks), mode="inshore")
+    next_idx = 0
+    emitted = []
+    for p in points:
+        det = MarkRoundingDetector(
+            marks,
+            threshold_m=thresholds,
+            next_mark_index=next_idx,
+        )
+        new_passes = det.feed_batch([p])
+        emitted.extend(new_passes)
+        next_idx += len(new_passes)
+    # Without state persistence the detector emits 0 or close to 0
+    # passes — definitely fewer than the 4 the boat actually sailed.
+    assert len(emitted) < 4, (
+        "Without cross-batch state, the streaming cadence cannot accumulate "
+        "the depart-confirm count and most marks are missed."
+    )

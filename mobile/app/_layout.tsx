@@ -23,10 +23,10 @@
 //      The root Stack just owns the screen-options + tells the OS
 //      what's behind the status bar.
 
-import { useEffect } from "react";
 import { StatusBar } from "expo-status-bar";
 import { Stack } from "expo-router";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import { GoogleSignin } from "@react-native-google-signin/google-signin";
 
 import * as Notifications from "expo-notifications";
@@ -34,10 +34,8 @@ import * as Notifications from "expo-notifications";
 import { AuthProvider, useAuth } from "../src/auth/AuthContext";
 import { RecorderProvider } from "../src/recorder/RecorderContext";
 import { ThemeProvider, useTheme } from "../src/theme/ThemeProvider";
-import {
-  registerHandlers,
-  requestNotificationPermission,
-} from "../src/recorder/scheduledAutoStart";
+import { registerHandlers } from "../src/recorder/scheduledAutoStart";
+import { PermissionWelcomeCard } from "../src/components/PermissionWelcomeCard";
 import {
   ACTION_MARK_AS_PASSED,
   ACTION_SKIP_MARK,
@@ -117,21 +115,29 @@ Notifications.addNotificationResponseReceivedListener((response) => {
 export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
-      <ThemeProvider>
-        <AuthProvider>
-          <RecorderProvider>
-            <ThemedStatusBar />
-            <NotificationPermissionGate />
-            <Stack
-              screenOptions={{
-                headerShown: false,
-                animation: "fade",
-                contentStyle: { backgroundColor: "transparent" },
-              }}
-            />
-          </RecorderProvider>
-        </AuthProvider>
-      </ThemeProvider>
+      {/* SafeAreaProvider feeds insets to react-native-safe-area-context's
+          SafeAreaView so children clear the Android status bar + clock
+          + battery icons. The base react-native SafeAreaView is iOS-only
+          (notch + home indicator); on Android it does nothing, which is
+          why the hamburger chip and back chip were rendering behind the
+          system icons (see 2026-06-04 user report, item 3). */}
+      <SafeAreaProvider>
+        <ThemeProvider>
+          <AuthProvider>
+            <RecorderProvider>
+              <ThemedStatusBar />
+              <WelcomeGate />
+              <Stack
+                screenOptions={{
+                  headerShown: false,
+                  animation: "fade",
+                  contentStyle: { backgroundColor: "transparent" },
+                }}
+              />
+            </RecorderProvider>
+          </AuthProvider>
+        </ThemeProvider>
+      </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }
@@ -147,19 +153,20 @@ function ThemedStatusBar() {
 }
 
 /**
- * Request notification permission once after the user signs in. Idempotent
- * — the OS does not re-prompt if already answered. A denial silently
- * disables the T-6 reminder path; the T-5 BG-fetch fallback still works.
+ * Show the permission welcome card once per install after the user
+ * signs in. The card runs notifications + location (Always) + activity
+ * prompts in sequence and surfaces per-row results so the user can see
+ * what they granted. Replaces the old NotificationPermissionGate, which
+ * only asked for notifications and left location to be prompted lazily
+ * by BackgroundGeolocation.ready() — a path the 2026-06-04 user report
+ * showed was not discoverable.
  *
- * Lives at this layer (not in a screen) because expo-router can mount
- * different screens depending on auth state, and the prompt should fire
- * exactly once per signed-in session, not per screen.
+ * Lives at this layer (not inside a screen) for the same reason as
+ * before: expo-router can mount different screens depending on auth
+ * state and the welcome card should anchor to "user just signed in,"
+ * not "user happens to be on screen X."
  */
-function NotificationPermissionGate() {
+function WelcomeGate() {
   const { user } = useAuth();
-  useEffect(() => {
-    if (!user) return;
-    void requestNotificationPermission();
-  }, [user]);
-  return null;
+  return <PermissionWelcomeCard visible={!!user} />;
 }

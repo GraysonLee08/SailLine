@@ -149,6 +149,38 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
   // effects from clobbering each other.
   const didInitialCenter = useRef(false);
 
+  // Android touch-swallow workaround (2026-06-04 item 2):
+  // rnmapbox's Android view occasionally fails to wire up touch handling
+  // on first mount — pans, taps and zoom gestures all silently no-op until
+  // an external relayout (e.g. split-screen → exit) forces the SDK to
+  // re-measure. The user hit this immediately after sign-in on the home
+  // screen and worked around it with a split-screen toggle. We can't
+  // diagnose without a Gradle build, but the canonical community fix is
+  // to issue a no-op camera setCamera shortly after mount: it forces the
+  // SDK to recompute its viewport, which incidentally rebinds touch
+  // dispatch. The nudge is invisible (zoomLevel unchanged, no animation)
+  // and runs once per MapCanvas instance.
+  const didTouchNudge = useRef(false);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (didTouchNudge.current) return;
+      didTouchNudge.current = true;
+      try {
+        // Use the camera's own setCamera with no actual movement —
+        // animationDuration 0 + zoomLevel as-current is a no-op visually
+        // but triggers the native invalidate that fixes touch routing.
+        camRef.current?.setCamera({
+          animationDuration: 0,
+          padding: { paddingTop: 0, paddingBottom: 0, paddingLeft: 0, paddingRight: 0 },
+        });
+      } catch {
+        /* defensive — if the ref isn't ready yet we'll fall through to
+           the onMapIdle path below which fires a real nudge. */
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, []);
+
   // Monochromatic-leaning styles so the overlay data (wind barbs, route
   // polyline, marks) reads clearly without competing with vibrant
   // basemap colours. Light = whites/greys with muted land + water;

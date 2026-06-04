@@ -3,11 +3,18 @@
 // Google-Maps-style FAB cluster, top-right (under the compass). Each
 // button is a circular surface with a single icon + soft shadow. Pure
 // presentational — the parent owns the handlers + state (e.g., is the
-// wind layer on?).
+// layers panel open?).
 //
 // Top to bottom:
-//   - Layers toggle (turns wind barbs on/off — additive over time)
+//   - Compass (toggles map-follows-heading vs north-up)
+//   - Layers (opens LayersPanel — Route / Actual route / Wind / Waves)
 //   - Locate-me
+//
+// 2026-06-04 reshape: the previous design had a separate FAB for each
+// individual layer (Wind, Actual route). That didn't scale — adding
+// Waves and Map style would have crowded the rail and required users
+// to remember which pictogram meant which layer. Replaced both with
+// one Layers FAB and a popover (LayersPanel) hosting the full list.
 //
 // Spacing leaves room above the compass at the top of MapCanvas
 // (top: 18 + ~36 compass + 16 gap = ~70px).
@@ -20,30 +27,25 @@ import { useTheme } from "../theme/ThemeProvider";
 
 type Props = {
   onLocateMe: () => void;
-  onToggleWind: () => void;
+  onOpenLayers: () => void;
   onToggleCompass: () => void;
-  windOn: boolean;
   /** Current map heading in degrees (0 = north). Rotates the compass icon. */
   headingDeg: number;
   /**
-   * Optional — when provided, an additional "actual route" toggle FAB
-   * renders below the wind toggle. Used by the /recording screen so
-   * the sailor can show/hide the live track polyline. Omitted on
-   * screens where there is no actual track to render (the home map
-   * before a race starts). 2026-06-03 B3.
+   * Whether ANY layer is currently visible. Drives the Layers icon's
+   * filled vs outline variant — gives the user a quick "things are
+   * showing on the map" tell from the rail without opening the panel.
+   * Default: true. Pass false only when every layer is off.
    */
-  onToggleActualRoute?: () => void;
-  actualRouteOn?: boolean;
+  anyLayerOn?: boolean;
 };
 
 export function MapFabs({
   onLocateMe,
-  onToggleWind,
+  onOpenLayers,
   onToggleCompass,
-  windOn,
   headingDeg,
-  onToggleActualRoute,
-  actualRouteOn = false,
+  anyLayerOn = true,
 }: Props) {
   const { colors } = useTheme();
   const insets = useSafeAreaInsets();
@@ -68,38 +70,19 @@ export function MapFabs({
         onPress={onToggleCompass}
         accessibilityLabel="Toggle compass mode (north / follow heading)"
       />
+      {/* Layers FAB — opens the LayersPanel popover. Filled icon when
+          any layer is showing, outline when everything is hidden. */}
       <Fab
         icon={
           <Ionicons
-            name={windOn ? "layers" : "layers-outline"}
+            name={anyLayerOn ? "layers" : "layers-outline"}
             size={22}
-            color={windOn ? colors.accent.primary : colors.text.primary}
+            color={anyLayerOn ? colors.accent.primary : colors.text.primary}
           />
         }
-        onPress={onToggleWind}
-        accessibilityLabel={windOn ? "Hide wind barbs" : "Show wind barbs"}
+        onPress={onOpenLayers}
+        accessibilityLabel="Open layers panel"
       />
-      {/* Actual-route toggle — only visible when a handler is wired
-          (i.e., on /recording). Footprint icon reads as "footsteps /
-          where I've been" which matches the polyline meaning better
-          than a generic line/path icon. 2026-06-03 B3. */}
-      {onToggleActualRoute ? (
-        <Fab
-          icon={
-            <Ionicons
-              name={actualRouteOn ? "footsteps" : "footsteps-outline"}
-              size={22}
-              color={
-                actualRouteOn ? colors.accent.recording : colors.text.primary
-              }
-            />
-          }
-          onPress={onToggleActualRoute}
-          accessibilityLabel={
-            actualRouteOn ? "Hide actual track" : "Show actual track"
-          }
-        />
-      ) : null}
       <Fab
         icon={<Ionicons name="navigate" size={22} color={colors.text.primary} />}
         onPress={onLocateMe}

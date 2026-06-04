@@ -17,11 +17,13 @@
 // when recording stops.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, SafeAreaView, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
 import { ActualRouteLayer } from "../../src/components/ActualRouteLayer";
+import { LayersPanel } from "../../src/components/LayersPanel";
 import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
@@ -29,6 +31,7 @@ import { MarkPassControls } from "../../src/components/MarkPassControls";
 import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useAutoPassSetting } from "../../src/hooks/useAutoPassSetting";
+import { useLayerSettings } from "../../src/hooks/useLayerSettings";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
 import { useNextMarkGuidance } from "../../src/hooks/useNextMarkGuidance";
@@ -68,12 +71,12 @@ export default function RecordingScreen() {
     headingDeg: number;
   } | null>(null);
 
-  // Layers FAB state — defaults ON during a race so wind context is visible
-  // immediately. Home screen owns its own copy of this state independently.
-  const [windOn, setWindOn] = useState(true);
-  // Actual-track polyline — ON by default. The whole point of the recording
-  // screen is to see where you've been; hiding by default would defeat it.
-  const [actualOn, setActualOn] = useState(true);
+  // Layer visibility (2026-06-04 item 6) — shared with home via
+  // AsyncStorage. The Layers FAB opens LayersPanel which writes back.
+  // Recording-screen-specific layers (actualRoute) come from the same
+  // hook so the user's preference survives across launches and screens.
+  const layers = useLayerSettings();
+  const [layersOpen, setLayersOpen] = useState(false);
 
   // MapCanvas imperative handle, used by:
   //   1. The mount effect below to fit the camera to the course on entry
@@ -181,25 +184,33 @@ export default function RecordingScreen() {
       <MapCanvas
         ref={mapRef}
         marks={selectedRace.marks}
-        route={routing.route}
+        route={layers.route ? routing.route : null}
         onCameraChanged={setViewport}
       >
         <WindBarbLayer
           features={barbFeatures}
-          visible={windOn}
+          visible={layers.wind}
           zoom={viewport?.zoom}
         />
         {/* Live breadcrumb of fixes captured this session. Hidden when
             no points yet OR the user toggled it off. 2026-06-03 B3. */}
         <ActualRouteLayer
           points={recorder.points}
-          visible={actualOn && recorder.points.length > 0}
+          visible={layers.actualRoute && recorder.points.length > 0}
         />
       </MapCanvas>
 
       {/* Top-LEFT row: back chip + LIVE pill. Both sit inside the SafeArea
-          so they never overlap the status bar / battery / signal icons. */}
-      <SafeAreaView style={styles.topBar} pointerEvents="box-none">
+          so they never overlap the status bar / battery / signal icons.
+          SafeAreaView from react-native-safe-area-context (not the base
+          react-native one — that's iOS-only and let the chip render
+          behind the Android clock; 2026-06-04 item 3). edges=["top"]
+          so the bottom inset doesn't push the row down. */}
+      <SafeAreaView
+        edges={["top"]}
+        style={styles.topBar}
+        pointerEvents="box-none"
+      >
         <Pressable
           onPress={handleBack}
           disabled={recorder.recording}
@@ -276,24 +287,43 @@ export default function RecordingScreen() {
         ) : null}
       </SafeAreaView>
 
-      {/* Top-RIGHT: same FAB cluster the home screen uses. Compass toggles
-          orientation (north / follow-heading), layers toggles wind barbs,
-          centre re-centres on the user's position. */}
+      {/* Top-RIGHT: same FAB cluster the home screen uses. Compass
+          toggles orientation (north / follow-heading), layers opens the
+          LayersPanel (Route / Actual route / Wind / Waves), centre
+          re-centres on the user's position. */}
       <MapFabs
         onLocateMe={() => mapRef.current?.locateMe()}
-        onToggleWind={() => setWindOn((v) => !v)}
+        onOpenLayers={() => setLayersOpen(true)}
         onToggleCompass={() => mapRef.current?.toggleCompass()}
-        windOn={windOn}
         headingDeg={viewport?.headingDeg ?? 0}
-        onToggleActualRoute={() => setActualOn((v) => !v)}
-        actualRouteOn={actualOn}
+        anyLayerOn={layers.route || layers.actualRoute || layers.wind}
+      />
+
+      <LayersPanel
+        visible={layersOpen}
+        onClose={() => setLayersOpen(false)}
+        layers={{
+          route: layers.route,
+          actualRoute: layers.actualRoute,
+          wind: layers.wind,
+          waves: layers.waves,
+        }}
+        onToggleLayer={layers.setLayer}
+        /* Recording screen has a live track to render → show the
+           Actual route toggle. */
+        showActualRouteRow
       />
 
       {/* Bottom action stack: marks row + guidance card + Stop button.
           MarkPassControls sits above the GuidanceCard so the "what's
           confirmed" picture is immediately visible without obscuring
-          the next-mark guidance. */}
-      <SafeAreaView style={styles.bottomStack} pointerEvents="box-none">
+          the next-mark guidance. edges=["bottom"] keeps the stack above
+          the home-indicator / nav bar without padding the top. */}
+      <SafeAreaView
+        edges={["bottom"]}
+        style={styles.bottomStack}
+        pointerEvents="box-none"
+      >
         <MarkPassControls
           marks={selectedRace.marks}
           passes={markPasses.passes}

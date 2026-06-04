@@ -11,7 +11,8 @@
 // guarantees a signed-in user before this screen mounts.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, SafeAreaView, StyleSheet, View } from "react-native";
+import { Pressable, StyleSheet, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect } from "expo-router";
 
@@ -22,6 +23,7 @@ import {
   type AppMenuSheetHandle,
 } from "../../src/components/AppMenuSheet";
 import { BetterRouteBanner } from "../../src/components/BetterRouteBanner";
+import { LayersPanel } from "../../src/components/LayersPanel";
 import {
   MapCanvas,
   type MapCanvasHandle,
@@ -34,6 +36,7 @@ import {
 } from "../../src/components/RaceDetailSheet";
 import { RaceListSheet } from "../../src/components/RaceListSheet";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
+import { useLayerSettings } from "../../src/hooks/useLayerSettings";
 import { useRouteNotifications } from "../../src/hooks/useRouteNotifications";
 import { useRouting } from "../../src/hooks/useRouting";
 import { useAutoStartRecorder } from "../../src/recorder/useAutoStartRecorder";
@@ -130,12 +133,17 @@ export default function MapHomeScreen() {
     centerLon: number;
     headingDeg: number;
   } | null>(null);
-  const [windOn, setWindOn] = useState(true);
+  // Layer visibility — single source of truth for what's drawn on the
+  // map. The Layers FAB opens LayersPanel which writes back through
+  // setLayer. Persisted across launches in AsyncStorage. 2026-06-04
+  // item 6 — replaced the previous one-FAB-per-layer cluster.
+  const layers = useLayerSettings();
+  const [layersOpen, setLayersOpen] = useState(false);
 
   const barbFeatures = useMemo(() => {
-    if (!windGrid || !viewport || !windOn) return [];
+    if (!windGrid || !viewport || !layers.wind) return [];
     return computeBarbFeatures(viewport, windGrid, null);
-  }, [windGrid, viewport, windOn]);
+  }, [windGrid, viewport, layers.wind]);
 
   // Routing.
   const routing = useRouting(selectedRace?.id ?? null);
@@ -195,30 +203,53 @@ export default function MapHomeScreen() {
       <MapCanvas
         ref={mapRef}
         marks={selectedRace?.marks ?? []}
-        route={routing.route}
+        /* Passing null when the Route layer is off hides the polyline
+           without bothering MapCanvas / RouteLayer. Cheap toggle. */
+        route={layers.route ? routing.route : null}
         onCameraChanged={setViewport}
       >
         <WindBarbLayer
           features={barbFeatures}
-          visible={windOn}
+          visible={layers.wind}
           zoom={viewport?.zoom}
         />
       </MapCanvas>
 
       <MapFabs
         onLocateMe={() => mapRef.current?.locateMe()}
-        onToggleWind={() => setWindOn((v) => !v)}
+        onOpenLayers={() => setLayersOpen(true)}
         onToggleCompass={() => mapRef.current?.toggleCompass()}
-        windOn={windOn}
         headingDeg={viewport?.headingDeg ?? 0}
+        anyLayerOn={layers.route || layers.wind}
+      />
+
+      <LayersPanel
+        visible={layersOpen}
+        onClose={() => setLayersOpen(false)}
+        layers={{
+          route: layers.route,
+          actualRoute: layers.actualRoute,
+          wind: layers.wind,
+          waves: layers.waves,
+        }}
+        onToggleLayer={layers.setLayer}
+        /* The home map never renders an actual-track polyline — hide
+           that row to avoid offering a toggle with no effect. */
+        showActualRouteRow={false}
       />
 
       {/* Hamburger menu button — opens AppMenuSheet (Races, Race
           Setup, Boats, Settings, Profile, Sign out). Sits top-left so
-          it doesn't compete with the FAB cluster on the right. Inside
-          SafeAreaView so it clears the notch / status bar. 2026-06-03
-          B1. */}
-      <SafeAreaView style={styles.menuButton} pointerEvents="box-none">
+          it doesn't compete with the FAB cluster on the right.
+          SafeAreaView from react-native-safe-area-context honours the
+          Android status bar (the base react-native one does not); edges
+          opt into "top" so we clear the clock + battery icons. 2026-06-04
+          item 3. */}
+      <SafeAreaView
+        edges={["top"]}
+        style={styles.menuButton}
+        pointerEvents="box-none"
+      >
         <Pressable
           onPress={() => menuRef.current?.open()}
           accessibilityRole="button"
