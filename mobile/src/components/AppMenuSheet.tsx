@@ -29,6 +29,7 @@ import {
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
 } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import BottomSheet, { BottomSheetBackdrop, BottomSheetView } from "@gorhom/bottom-sheet";
@@ -67,11 +68,24 @@ export const AppMenuSheet = forwardRef<AppMenuSheetHandle, Props>(
   function AppMenuSheet({ userEmail, onSignOut }, ref) {
     const { colors, font, size } = useTheme();
     const sheetRef = useRef<BottomSheet>(null);
+    // Conditional-mount state. Previously the sheet was always rendered
+    // with ``index={-1}`` (closed). The 2026-06-04 on-water test showed
+    // that the always-mounted Gorhom sheet + its backdrop intercepted
+    // taps on the map screen — Pressables couldn't fire, but pan
+    // gestures still worked. Mounting the sheet only when open removes
+    // the always-on overlay entirely.
+    const [mounted, setMounted] = useState(false);
 
     useImperativeHandle(
       ref,
       () => ({
-        open: () => sheetRef.current?.snapToIndex(0),
+        open: () => {
+          setMounted(true);
+          // sheetRef.current is null until after the BottomSheet has
+          // mounted on this render. Defer the snapToIndex to the next
+          // tick so the imperative call lands on the mounted instance.
+          setTimeout(() => sheetRef.current?.snapToIndex(0), 0);
+        },
         close: () => sheetRef.current?.close(),
       }),
       [],
@@ -92,14 +106,31 @@ export const AppMenuSheet = forwardRef<AppMenuSheetHandle, Props>(
       }, 100);
     }, [onSignOut]);
 
+    // Fully unmount once the sheet animates closed. Until this fires
+    // the sheet stays in the tree so the close animation can play out;
+    // after, the View tree is rid of the overlay entirely.
+    const handleAnimate = useCallback(
+      (_fromIndex: number, toIndex: number) => {
+        if (toIndex === -1) {
+          // Slight defer so any in-flight close animation finishes
+          // before the unmount, avoiding a visual snap.
+          setTimeout(() => setMounted(false), 250);
+        }
+      },
+      [],
+    );
+
     const snapPoints = useMemo(() => ["55%"], []);
+
+    if (!mounted) return null;
 
     return (
       <BottomSheet
         ref={sheetRef}
-        index={-1}
+        index={0}
         snapPoints={snapPoints}
         enablePanDownToClose
+        onAnimate={handleAnimate}
         backgroundStyle={{ backgroundColor: colors.surface.elevated }}
         handleIndicatorStyle={{ backgroundColor: colors.border.hairline }}
         backdropComponent={(props) => (

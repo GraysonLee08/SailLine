@@ -68,6 +68,14 @@ export function LayersPanel({
   const { colors, font, size } = useTheme();
   const insets = useSafeAreaInsets();
 
+  // Conditional mount: React Native's <Modal> on Android keeps a native
+  // Dialog Window in the view hierarchy even when ``visible={false}``,
+  // which has been observed to swallow taps on Pressables behind it
+  // while letting Gorhom pan gestures through (different responder
+  // path). 2026-06-04 on-water test exposed this. Returning null when
+  // not visible fully unmounts the Modal so the window is destroyed.
+  if (!visible) return null;
+
   // Match the MapFabs cluster offset so the panel anchors visually to
   // the Layers FAB. Cluster lives at top: insets.top + 16, with three
   // FABs * (48 height + 12 gap) before the Layers one in the stack.
@@ -108,7 +116,7 @@ export function LayersPanel({
 
   return (
     <Modal
-      visible={visible}
+      visible
       transparent
       animationType="fade"
       onRequestClose={onClose}

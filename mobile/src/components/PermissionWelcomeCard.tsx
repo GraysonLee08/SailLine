@@ -136,6 +136,19 @@ function WelcomeModal({ onDone }: { onDone: () => void }) {
   const { colors, font, size } = useTheme();
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState<RecorderPermissionStatus | null>(null);
+  // ``mounted`` flips false the instant the user dismisses, so the
+  // <Modal> unmounts immediately even before the parent re-renders to
+  // strip it out. RN's Android Modal has been observed to keep a
+  // native Dialog Window in the view tree across the "visible flips
+  // false → parent re-renders → returns null" window, catching taps
+  // on Pressables in the background. Forcing the inner Modal to
+  // unmount on the press handler closes the window deterministically.
+  const [mounted, setMounted] = useState(true);
+
+  const dismiss = useCallback(() => {
+    setMounted(false);
+    onDone();
+  }, [onDone]);
 
   const onStart = useCallback(async () => {
     setRunning(true);
@@ -150,13 +163,15 @@ function WelcomeModal({ onDone }: { onDone: () => void }) {
   // Once the user has seen results, the primary CTA flips to "Done".
   const allAnswered = status !== null;
 
+  if (!mounted) return null;
+
   return (
     <Modal
       visible
       animationType="fade"
       transparent
       statusBarTranslucent
-      onRequestClose={onDone}
+      onRequestClose={dismiss}
     >
       <View style={[styles.scrim, { backgroundColor: colors.scrim.overlay }]}>
         <View
@@ -199,7 +214,7 @@ function WelcomeModal({ onDone }: { onDone: () => void }) {
           ))}
 
           <Pressable
-            onPress={allAnswered ? onDone : onStart}
+            onPress={allAnswered ? dismiss : onStart}
             disabled={running}
             accessibilityRole="button"
             accessibilityLabel={allAnswered ? "Done" : "Get started"}
@@ -229,7 +244,7 @@ function WelcomeModal({ onDone }: { onDone: () => void }) {
           </Pressable>
 
           {!allAnswered ? (
-            <Pressable onPress={onDone} disabled={running} style={styles.skip}>
+            <Pressable onPress={dismiss} disabled={running} style={styles.skip}>
               <Text
                 style={{
                   color: colors.text.muted,
