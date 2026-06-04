@@ -1098,7 +1098,20 @@ const SIDEBAR_WIDTH = 380;
 
 const styles = {
   shell: { position: "absolute", inset: 0, background: "var(--paper)", display: "flex", flexDirection: "column", overflow: "hidden" },
-  topBar: { display: "flex", alignItems: "center", gap: 16, padding: "12px 20px", borderBottom: "1px solid var(--rule)", background: "var(--paper)", flexShrink: 0 },
+  topBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 16,
+    // Reserve room for the iOS notch / status bar when SailLine is added
+    // to the home screen (PWA mode reaches under the system bar).
+    // env(safe-area-inset-top) is 0 on desktop and non-PWA mobile, so
+    // this is a no-op except where it's needed. 2026-06-04 user report.
+    padding:
+      "calc(env(safe-area-inset-top, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 20px) 12px calc(env(safe-area-inset-left, 0px) + 20px)",
+    borderBottom: "1px solid var(--rule)",
+    background: "var(--paper)",
+    flexShrink: 0,
+  },
   cancelBtn: { border: "1px solid var(--rule)", background: "var(--paper)", borderRadius: "var(--r-sm)", padding: "8px 14px", fontSize: 13, color: "var(--ink)", cursor: "pointer" },
   topTitle: { flex: 1, fontSize: 15, color: "var(--ink-3)" },
   saveBtn: { border: "none", background: "var(--ink)", color: "var(--paper)", borderRadius: "var(--r-md)", padding: "10px 22px", fontSize: 14, fontWeight: 500, cursor: "pointer" },

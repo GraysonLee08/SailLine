@@ -220,7 +220,11 @@ const styles = {
         display: "flex",
         alignItems: "center",
         gap: 12,
-        padding: "16px 20px",
+        // Safe-area-inset top so the back button isn't hidden behind the
+        // iOS status bar in PWA mode. 2026-06-04 user report (same issue
+        // as the RaceEditor topBar).
+        padding:
+            "calc(env(safe-area-inset-top, 0px) + 16px) calc(env(safe-area-inset-right, 0px) + 20px) 16px calc(env(safe-area-inset-left, 0px) + 20px)",
         borderBottom: "1px solid var(--rule)",
         position: "sticky",
         top: 0,

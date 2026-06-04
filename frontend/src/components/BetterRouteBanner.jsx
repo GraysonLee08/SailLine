@@ -107,7 +107,9 @@ export function BetterRouteBanner({ alternative, onAccept, onDismiss }) {
 const styles = {
   banner: {
     position: "fixed",
-    top: 16,
+    // Anchor below the iOS status bar in PWA mode. See PermissionBanner
+    // for the same pattern. 2026-06-04 user report.
+    top: "calc(env(safe-area-inset-top, 0px) + 16px)",
     left: "50%",
     zIndex: 1000,
     display: "flex",

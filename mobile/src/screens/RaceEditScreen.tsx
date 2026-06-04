@@ -40,6 +40,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import BottomSheet, { BottomSheetView } from "@gorhom/bottom-sheet";
 import { Ionicons } from "@expo/vector-icons";
@@ -403,8 +404,15 @@ export function RaceEditScreen({ raceId }: Props) {
 
   return (
     <View style={[styles.root, { backgroundColor: colors.surface.page }]}>
-      {/* Top bar — Cancel / title / Save. */}
-      <View
+      {/* Top bar — Cancel / title / Save. SafeAreaView from
+          react-native-safe-area-context (not base react-native — that's
+          iOS-only) so the row clears the iOS notch / Android status
+          bar. edges=["top"] only — bottom inset is handled by the
+          scroll content's paddingBottom + the keyboard avoider.
+          2026-06-04 user report: Cancel + Save were hiding behind the
+          iOS clock + battery icons in PWA-like full-screen mode. */}
+      <SafeAreaView
+        edges={["top"]}
         style={[
           styles.topBar,
           {
@@ -458,7 +466,7 @@ export function RaceEditScreen({ raceId }: Props) {
             {saving ? "Saving…" : "Save"}
           </Text>
         </Pressable>
-      </View>
+      </SafeAreaView>
 
       {/* Map — fills the area above the sheet. Tap-to-add-mark active. */}
       <View style={styles.mapWrap}>

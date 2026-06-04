@@ -1294,8 +1294,11 @@ const styles = {
   },
   recenterPill: {
     position: "fixed",
-    bottom: 24,
-    right: 24,
+    // Lift above the iOS home indicator in PWA mode. env() is 0 on
+    // desktop / non-PWA mobile so the visual is unchanged elsewhere.
+    // 2026-06-04 user report.
+    bottom: "calc(env(safe-area-inset-bottom, 0px) + 24px)",
+    right: "calc(env(safe-area-inset-right, 0px) + 24px)",
     zIndex: 1000,
     padding: "10px 14px",
     fontSize: 13,

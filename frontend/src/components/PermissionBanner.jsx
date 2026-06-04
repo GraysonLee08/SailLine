@@ -92,7 +92,11 @@ export function PermissionBanner({ status, recording = true, onDismiss }) {
 const styles = {
   banner: {
     position: "fixed",
-    top: 16,
+    // Anchor below the iOS status bar in PWA mode. env() returns 0 on
+    // desktop / non-PWA mobile, so the visual is unchanged elsewhere.
+    // 2026-06-04 user report — pinned chrome was disappearing under
+    // the notch.
+    top: "calc(env(safe-area-inset-top, 0px) + 16px)",
     left: "50%",
     zIndex: 1001, // above BetterRouteBanner — permission is more urgent
     display: "flex",
