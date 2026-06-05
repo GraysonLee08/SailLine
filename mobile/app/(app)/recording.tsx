@@ -23,6 +23,7 @@ import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 
 import { ActualRouteLayer } from "../../src/components/ActualRouteLayer";
+import { BetterRouteBanner } from "../../src/components/BetterRouteBanner";
 import { LayersPanel } from "../../src/components/LayersPanel";
 import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
@@ -31,12 +32,13 @@ import { MarkPassControls } from "../../src/components/MarkPassControls";
 import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useAutoPassSetting } from "../../src/hooks/useAutoPassSetting";
+import { useAutoRouteSetting } from "../../src/hooks/useAutoRouteSetting";
 import { useLayerSettings } from "../../src/hooks/useLayerSettings";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
 import { useNextMarkGuidance } from "../../src/hooks/useNextMarkGuidance";
 import { useWeather } from "../../src/hooks/useWeather";
-import { useRouting } from "../../src/hooks/useRouting";
+import { useRoute } from "../../src/routing/RoutingContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
 import { useTheme } from "../../src/theme/ThemeProvider";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
@@ -91,12 +93,45 @@ export default function RecordingScreen() {
     return computeBarbFeatures(viewport, windGrid, null);
   }, [windGrid, viewport]);
 
-  // We don't compute a fresh route in the racing screen — the home screen
-  // owns the compute action. We DO render any route that was computed
-  // earlier so the user can compare actual track to plan; we fetch it
-  // from the routing hook scoped to this race id, which will return the
-  // cached route from Redis (same TTL).
-  const routing = useRouting(selectedRace?.id ?? null);
+  // Shared routing state (RoutingProvider). The home screen normally owns
+  // the compute action and the resulting `route` survives navigation here,
+  // so we render exactly the plan the user saw before tapping Start. The
+  // same instance also carries the better-route SSE stream, so "faster
+  // route" alerts surface on this screen too. A mount-effect below covers
+  // the auto-start / crash-recovery paths where the user reaches /recording
+  // without having computed on home.
+  const routing = useRoute();
+
+  // Auto-route preference (per race) drives the banner's auto-accept
+  // countdown — same contract as the home screen.
+  const autoRoute = useAutoRouteSetting(selectedRace?.id ?? null);
+
+  // Compute-on-mount fallback. If we landed here without a computed route
+  // (auto-start armed the recorder and replaced the route to /recording, or
+  // the app crash-recovered into an active session), fetch it once. The
+  // backend POST /api/routing/compute is idempotent + Redis-cached, so this
+  // returns the same route immediately when one already exists. Guards keep
+  // it from re-firing while a request is in flight, after a 425 "too early"
+  // result, or after an error.
+  useEffect(() => {
+    if (!selectedRace) return;
+    if (
+      routing.route ||
+      routing.loading ||
+      routing.pending ||
+      routing.error
+    ) {
+      return;
+    }
+    void routing.compute();
+  }, [
+    selectedRace,
+    routing.route,
+    routing.loading,
+    routing.pending,
+    routing.error,
+    routing.compute,
+  ]);
 
   const guidance = useNextMarkGuidance({
     race: selectedRace,
@@ -324,6 +359,16 @@ export default function RecordingScreen() {
         style={styles.bottomStack}
         pointerEvents="box-none"
       >
+        {/* Faster-route prompt. Same component + auto-accept contract as
+            home; here it sits at the top of the bottom stack (this screen
+            has no bottom sheet to tuck it into). Renders nothing unless an
+            alternative is live. */}
+        <BetterRouteBanner
+          alternative={routing.alternative}
+          onAccept={() => routing.acceptAlternative()}
+          onDismiss={routing.dismissAlternative}
+          autoAcceptSeconds={autoRoute.enabled ? 10 : 0}
+        />
         <MarkPassControls
           marks={selectedRace.marks}
           passes={markPasses.passes}

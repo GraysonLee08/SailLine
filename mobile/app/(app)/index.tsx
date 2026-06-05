@@ -37,8 +37,7 @@ import {
 import { RaceListSheet } from "../../src/components/RaceListSheet";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useLayerSettings } from "../../src/hooks/useLayerSettings";
-import { useRouteNotifications } from "../../src/hooks/useRouteNotifications";
-import { useRouting } from "../../src/hooks/useRouting";
+import { useRoute } from "../../src/routing/RoutingContext";
 import { useAutoStartRecorder } from "../../src/recorder/useAutoStartRecorder";
 import { useWeather } from "../../src/hooks/useWeather";
 import { useOrientationSettings } from "../../src/hooks/useOrientationSettings";
@@ -145,11 +144,11 @@ export default function MapHomeScreen() {
     return computeBarbFeatures(viewport, windGrid, null);
   }, [windGrid, viewport, layers.wind]);
 
-  // Routing.
-  const routing = useRouting(selectedRace?.id ?? null);
-
-  // SSE notifications — only active when a race is selected.
-  const notifications = useRouteNotifications(selectedRace?.id ?? null);
+  // Routing + better-route SSE — shared with /recording via RoutingProvider
+  // so the computed plan survives the Start navigation and live re-route
+  // alerts reach whichever screen is mounted. Keyed internally on the
+  // selected race id.
+  const routing = useRoute();
 
   // Per-race orientation calibration + auto-route preference.
   const orientation = useOrientationSettings(selectedRace?.id ?? null);
@@ -289,13 +288,9 @@ export default function MapHomeScreen() {
           autoStart={auto}
           betterRouteBanner={
             <BetterRouteBanner
-              alternative={notifications.alternative}
-              onAccept={() =>
-                notifications.accept((feature) =>
-                  routing.applyAlternative(feature),
-                )
-              }
-              onDismiss={notifications.dismiss}
+              alternative={routing.alternative}
+              onAccept={() => routing.acceptAlternative()}
+              onDismiss={routing.dismissAlternative}
               autoAcceptSeconds={autoRoute.enabled ? 10 : 0}
             />
           }

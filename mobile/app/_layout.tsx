@@ -16,6 +16,10 @@
 //        AuthProvider           (uses Firebase auth — no React deps)
 //        RecorderProvider       (depends on Firebase auth indirectly via
 //                                the recorder hook's apiFetch)
+//        RoutingProvider        (reads selectedRace from RecorderProvider;
+//                                hoists the computed route + better-route SSE
+//                                so both Home and Recording share one
+//                                instance)
 //        Stack                  (expo-router root navigator)
 //
 //   3. The auth gate. The (auth) and (app) route groups are mounted as
@@ -33,6 +37,7 @@ import * as Notifications from "expo-notifications";
 
 import { AuthProvider, useAuth } from "../src/auth/AuthContext";
 import { RecorderProvider } from "../src/recorder/RecorderContext";
+import { RoutingProvider } from "../src/routing/RoutingContext";
 import { ThemeProvider, useTheme } from "../src/theme/ThemeProvider";
 import { registerHandlers } from "../src/recorder/scheduledAutoStart";
 import { PermissionWelcomeCard } from "../src/components/PermissionWelcomeCard";
@@ -125,15 +130,17 @@ export default function RootLayout() {
         <ThemeProvider>
           <AuthProvider>
             <RecorderProvider>
-              <ThemedStatusBar />
-              <WelcomeGate />
-              <Stack
-                screenOptions={{
-                  headerShown: false,
-                  animation: "fade",
-                  contentStyle: { backgroundColor: "transparent" },
-                }}
-              />
+              <RoutingProvider>
+                <ThemedStatusBar />
+                <WelcomeGate />
+                <Stack
+                  screenOptions={{
+                    headerShown: false,
+                    animation: "fade",
+                    contentStyle: { backgroundColor: "transparent" },
+                  }}
+                />
+              </RoutingProvider>
             </RecorderProvider>
           </AuthProvider>
         </ThemeProvider>
