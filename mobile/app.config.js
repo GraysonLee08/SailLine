@@ -21,21 +21,38 @@
 //                                 BackgroundFetch fallback.
 //   * @rnmapbox/maps            — map canvas.
 //
-// SECRETS — prebuild pivot 2026-06-02
-// -----------------------------------
-// We moved off EAS to local Gradle. Secrets that used to be EAS secrets
-// (MAPBOX_DOWNLOAD_TOKEN, TRANSISTOR_LICENSE) now live in
-// ~/.gradle/gradle.properties (user-global, NOT committed). The Gradle
-// plugins below read them via project.findProperty('NAME') at build
-// time, NOT via process.env here. That decoupling means:
+// SECRETS & LICENSES — prebuild pivot 2026-06-02, license fix 2026-06-05
+// ----------------------------------------------------------------------
+// Three distinct values with DIFFERENT handling — don't conflate them:
 //
-//   * `expo prebuild` does NOT need the env vars set to succeed.
-//   * `gradlew assembleDebug` reads them on every build.
-//   * Forgetting to set them surfaces as a Gradle error, not a silent
-//     "UNDEFINED" baked into the generated config.
+//   * MAPBOX_DOWNLOADS_TOKEN (secret `sk.` token) — a real secret. Read
+//     from ~/.gradle/gradle.properties by the @rnmapbox Gradle plugin at
+//     BUILD time. Never committed, never shipped in the APK.
 //
-// See sailline-docs/2026-06-02_C1-prebuild-runbook.md for the one-time
-// setup of those properties.
+//   * EXPO_PUBLIC_MAPBOX_TOKEN (public `pk.` token) — read by JS at
+//     runtime from .env.local; ships in the APK (restrict it by app/URL
+//     in the Mapbox dashboard).
+//
+//   * TRANSISTOR_LICENSE — NOT a secret. The Transistorsoft license is
+//     bound to this app's applicationId and is embedded in every APK's
+//     AndroidManifest, so it cannot be kept out of a shipped build. It is
+//     injected at PREBUILD time into the manifest via the plugin config
+//     below. The gradle.properties entry is NOT consumed for the license
+//     (that path was a myth — a clean prebuild without it bakes the literal
+//     "UNDEFINED" into the manifest, which fails license validation in
+//     RELEASE builds and silently disables tracking). We therefore commit
+//     the license as a constant below so every prebuild is deterministic.
+//
+// See sailline-docs/2026-06-02_C1-prebuild-runbook.md and
+// sailline-docs/testing-and-deployment-checklist.md.
+
+// Committed Transistorsoft license. Safe to commit (see note above): it is
+// not a credential, only validates against this app's applicationId, and
+// already ships inside every distributed APK. Replace the placeholder with
+// your key. An env var still overrides it for one-off builds.
+const TRANSISTOR_LICENSE =
+  process.env.TRANSISTOR_LICENSE ||
+  "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkMjU1MTktbWFpbi12MSJ9.eyJvcyI6ImFuZHJvaWQiLCJhcHBfaWQiOiJjb20uc2FpbGxpbmUuYXBwIiwib3JkZXJfbnVtYmVyIjoxNjM4NCwicmVuZXdhbF91cmwiOiJodHRwczovL3Nob3AudHJhbnNpc3RvcnNvZnQuY29tL2NhcnQvMTY1MDc4NjE1MDU6MT9ub3RlPTEwODYyIiwiY3VzdG9tZXJfaWQiOjk4NzAsInByb2R1Y3QiOiJyZWFjdC1uYXRpdmUtYmFja2dyb3VuZC1nZW9sb2NhdGlvbiIsImtleV92ZXJzaW9uIjoxLCJhbGxvd2VkX3N1ZmZpeGVzIjpbIi5kZXYiLCIuZGV2ZWxvcG1lbnQiLCIuc3RhZ2luZyIsIi5zdGFnZSIsIi5xYSIsIi51YXQiLCIudGVzdCIsIi5kZWJ1ZyJdLCJtYXhfYnVpbGRfc3RhbXAiOjIwMjcwNjI3LCJncmFjZV9idWlsZHMiOjAsImVudGl0bGVtZW50cyI6WyJjb3JlIl0sImlhdCI6MTc3OTkwMjY3Nn0.cF3q-jT3jKHpNgFOkcrEbkwvZKfXPZuUQiVuwOJXY672JrQacfeVES-oqOUeEAa5rpMJrRtaDBQBDdojUz1WBg";
 
 module.exports = ({ config }) => ({
   ...config,
@@ -73,27 +90,15 @@ module.exports = ({ config }) => ({
     ...(config.plugins || []),
     "expo-router",
     "expo-dev-client",
-    // Transistorsoft react-native-background-geolocation
+    // Transistorsoft react-native-background-geolocation.
     //
-    // Plugin config no longer takes the license here. With this argument
-    // omitted, prebuild does NOT bake a license string into
-    // android/app/src/main/res/values/strings.xml. Instead, the Gradle
-    // companion (expo-gradle-ext-vars below) emits a buildscript hook
-    // that reads `TRANSISTOR_LICENSE` from gradle.properties at build
-    // time and exposes it to the SDK's manifest-placeholder mechanism.
-    //
-    // If you want to override this locally without touching gradle.properties
-    // (e.g., for a quick dev test), set the env var before prebuild:
-    //   $env:TRANSISTOR_LICENSE = "..."
-    //   npx expo prebuild
-    // The conditional below catches that case for parity with the prior
-    // behaviour.
-    [
-      "react-native-background-geolocation",
-      process.env.TRANSISTOR_LICENSE
-        ? { license: process.env.TRANSISTOR_LICENSE }
-        : {},
-    ],
+    // Always inject the license (see the TRANSISTOR_LICENSE constant + note
+    // at the top of this file). Passing it here is what writes the
+    // <meta-data com.transistorsoft.locationmanager.license> value into
+    // AndroidManifest.xml during prebuild. Never let this be empty/omitted
+    // or the manifest gets "UNDEFINED" and RELEASE builds fail license
+    // validation (tracking silently disabled → no recorded points).
+    ["react-native-background-geolocation", { license: TRANSISTOR_LICENSE }],
     "react-native-background-fetch",
     [
       "expo-gradle-ext-vars",

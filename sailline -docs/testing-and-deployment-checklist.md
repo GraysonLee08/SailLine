@@ -127,7 +127,7 @@ One-time prerequisites:
 
 - [ ] JDK 17 (`java -version` → 17.x), Node 20+, `adb` on PATH, `ANDROID_HOME` set.
 - [ ] `~/.gradle/gradle.properties` contains `MAPBOX_DOWNLOADS_TOKEN` (secret `sk.` token) — the @rnmapbox Gradle plugin reads this at build time (never commit it).
-- [ ] Have your `TRANSISTOR_LICENSE` key ready. **It is injected at _prebuild_ time from `$env:TRANSISTOR_LICENSE`, NOT from gradle.properties.** If the env var is unset when you prebuild, the manifest license is written as `UNDEFINED` and a **release** build fails Transistorsoft validation (`license_validation_failure`) → tracking silently disabled → no recorded points / no actual-track line. (Debug builds don't enforce the license, so this only bites release APKs.)
+- [ ] Transistorsoft license is committed as the `TRANSISTOR_LICENSE` constant in `mobile/app.config.js`, so prebuild always bakes it into the manifest — no env var needed. (It's not a secret: bound to the applicationId, ships in every APK.) If that constant is ever left as the `<your license key>` placeholder, the manifest gets `UNDEFINED` and **release** builds fail validation (`license_validation_failure`) → tracking silently disabled → no recorded points. Debug builds don't enforce the license, so this only bites release APKs.
 - [ ] `mobile/.env.local` contains `EXPO_PUBLIC_MAPBOX_TOKEN` (public `pk.` token) and `EXPO_PUBLIC_API_URL`.
 
 Build steps:
@@ -137,16 +137,13 @@ Build steps:
   npm ls expo-updates
   npm uninstall expo-updates expo-eas-client expo-manifests expo-structured-headers expo-updates-interface
   ```
-- [ ] Set the Transistorsoft license in the **current** PowerShell session (replace with your key):
-  ```powershell
-  $env:TRANSISTOR_LICENSE = "<your-transistorsoft-license-key>"
-  ```
-- [ ] Regenerate the native tree (same shell that has the env var set):
+- [ ] (One-time) Confirm the Transistorsoft license constant is filled in `mobile/app.config.js` (`TRANSISTOR_LICENSE`, not the `<your license key>` placeholder). It's committed, so this only needs doing once — no per-build env var.
+- [ ] Regenerate the native tree:
   ```powershell
   cd E:\Personal\Coding\SailLine\mobile
   npx expo prebuild --platform android --clean
   ```
-- [ ] Verify the license baked in — must NOT print `UNDEFINED`:
+- [ ] Verify the license baked in — must print your key, NOT `UNDEFINED`:
   ```powershell
   Select-String -Path .\android\app\src\main\AndroidManifest.xml -Pattern "locationmanager.license"
   ```
