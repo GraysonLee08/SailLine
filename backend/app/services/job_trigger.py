@@ -81,7 +81,15 @@ async def trigger_race_postprocess(
     if token is None:
         return
 
-    args = ["--race-id", str(race_id)]
+    # Cloud Run's containerOverrides.args REPLACES the job's baseline args
+    # (it does not merge them). The job's baked command is `python` with
+    # baseline args `[-m, workers.race_postprocess, --race-id, PLACEHOLDER]`,
+    # so the override MUST re-supply the `-m workers.race_postprocess`
+    # module selector. Sending only `["--race-id", <uuid>]` makes the
+    # container run `python --race-id <uuid>`, and the interpreter exits 2
+    # on the unknown option before the worker's argparse ever runs.
+    # (Diagnosed 2026-06-08 — every live postprocess had been failing.)
+    args = ["-m", "workers.race_postprocess", "--race-id", str(race_id)]
     if force:
         args.append("--force")
     body = {"overrides": {"containerOverrides": [{"args": args}]}}

@@ -24,6 +24,20 @@ the first three auto-detectable marks (SA7 start, Mark 3, Mark 2) and
 Mark 8; the last two are unreachable and stay undetected, matching
 production behaviour.
 
+## dog_walk_20260608.json
+
+Studio export of the 2026-06-08 "Test - Dog Walk 6.8.26" session
+(Chicago, ~41.935°N). 910 GPS points at ~1 Hz on a small inshore loop
+(Start → 1 → 2 → 3 → Finish), walked rather than sailed.
+
+This trace exposed the `mark_passes` off-by-one: the stored passes were
+corrupted because a manual Start tap was merged with the auto detector's
+own emits via two writers with incompatible index arithmetic. The
+manual-pass path was removed in response (2026-06-08), leaving the auto
+detector as the sole writer. `test_dog_walk_auto_detection_is_contiguous_and_in_order`
+replays the trace through the detector and asserts a clean contiguous
+0..4 sequence; see `sailline-docs/2026-06-08_session.md`.
+
 ## colors_bravo_20260530.gpx
 
 Garmin Connect GPX export from the 2026-05-30 Cook County Sailing

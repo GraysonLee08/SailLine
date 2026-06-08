@@ -41,14 +41,8 @@ import { RoutingProvider } from "../src/routing/RoutingContext";
 import { ThemeProvider, useTheme } from "../src/theme/ThemeProvider";
 import { registerHandlers } from "../src/recorder/scheduledAutoStart";
 import { PermissionWelcomeCard } from "../src/components/PermissionWelcomeCard";
-import {
-  ACTION_MARK_AS_PASSED,
-  ACTION_SKIP_MARK,
-  ACTION_STOP_RACE,
-  registerRaceNotificationCategories,
-} from "../src/notifications/raceCategories";
+import { registerRaceNotificationCategories } from "../src/notifications/raceCategories";
 import { dismissMissedMarkNotification } from "../src/notifications/missedMark";
-import { recordManualMarkPass } from "../src/api/races";
 import { GOOGLE_WEB_CLIENT_ID } from "../src/googleAuthConfig";
 
 // ── Module-load side effects ──────────────────────────────────────────
@@ -63,58 +57,23 @@ GoogleSignin.configure({
 void registerHandlers();
 void registerRaceNotificationCategories();
 
-// Route actionable notification responses to the right API call. Runs
-// at module scope so a watch-tap (Apple Watch, supported wearables) is
-// honoured even if the user never opens the app first. We intentionally
-// do NOT need the user to bring the app to foreground for Pass / Skip —
-// those actions were defined with opensAppToForeground=false so the
-// notification dismisses on tap and the API call runs in the
-// background. Stop opens the app since recorder.stop() lives in the
-// React tree.
-//
-// Auth: recordManualMarkPass calls apiFetch which reads the current
-// Firebase ID token. Token must already be present (user signed in
-// during the active recording session, which is when missed-mark
-// notifications can fire). A cold-start tap without an active session
-// is unlikely but would fail at the auth gate — the notification body
-// invites the user to "tap to open" as a fallback.
+// Route actionable notification responses. The missed-mark notification
+// is informational only (2026-06-08): there is no "mark as passed"
+// action — the mark-rounding detector is the sole writer of mark_passes
+// and a racer doesn't hand-confirm marks on the phone. The only action
+// left is "Stop race", which opens the app (recorder.stop() lives in the
+// React tree). Any tap — action or body — dismisses the notification.
 Notifications.addNotificationResponseReceivedListener((response) => {
   const data = response.notification.request.content.data as
     | { kind?: string; raceId?: string; markIndex?: number }
     | undefined;
   if (!data || data.kind !== "missedMark") return;
-  if (typeof data.raceId !== "string" || typeof data.markIndex !== "number") {
-    return;
-  }
-  const { raceId, markIndex } = data;
-  switch (response.actionIdentifier) {
-    case ACTION_MARK_AS_PASSED:
-    case ACTION_SKIP_MARK:
-      // Both actions record a manual pass at the mark index. The
-      // semantic difference (you actually rounded vs you're skipping
-      // ahead) is captured by which button the user tapped — we could
-      // distinguish via a separate API field later if it becomes
-      // useful for the AI summary. For tonight: both result in the
-      // detector advancing.
-      void recordManualMarkPass(raceId, markIndex)
-        .catch(() => {
-          /* swallow — notification is best-effort */
-        })
-        .finally(() => {
-          void dismissMissedMarkNotification(raceId);
-        });
-      break;
-    case ACTION_STOP_RACE:
-      // Stop opens the app; the Recording screen surfaces the Stop
-      // button which the user taps. (We can't call recorder.stop()
-      // here because the recorder lives inside React state.)
-      void dismissMissedMarkNotification(raceId);
-      break;
-    default:
-      // Default tap (no action button) just opens the app.
-      void dismissMissedMarkNotification(raceId);
-      break;
-  }
+  if (typeof data.raceId !== "string") return;
+  const { raceId } = data;
+  // Stop opens the app (opensAppToForeground on the action surfaces the
+  // Recording screen's Stop button); every other tap is just an
+  // acknowledgement. Both paths simply dismiss the notification.
+  void dismissMissedMarkNotification(raceId);
 });
 
 export default function RootLayout() {

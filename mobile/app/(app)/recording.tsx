@@ -28,7 +28,6 @@ import { LayersPanel } from "../../src/components/LayersPanel";
 import { MapCanvas, type MapCanvasHandle } from "../../src/components/MapCanvas";
 import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
-import { MarkPassControls } from "../../src/components/MarkPassControls";
 import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
 import { useAutoPassSetting } from "../../src/hooks/useAutoPassSetting";
@@ -139,22 +138,14 @@ export default function RecordingScreen() {
     lastPoint: recorder.lastPoint,
   });
 
-  // Mark-pass list — both auto-detected (server) and manual.
-  // Always shown during recording per 2026-05-30 spec: each mark has a
-  // "Pass" button so the sailor can confirm anything the detector misses.
+  // Auto-detected mark passes (server-authoritative, read-only). Drives
+  // the missed-mark notifier's "next expected mark" logic. There is no
+  // in-race mark UI and no manual tap-to-pass — the detector is the sole
+  // writer (manual-pass path removed 2026-06-08).
   const markPasses = useMarkPasses({
     raceId: selectedRace?.id ?? null,
     recording: recorder.recording,
   });
-
-  // Reuse the recorder's last GPS fix as the boat-position-at-tap.
-  // Returns null if no fix yet so the API call omits lat/lon (server
-  // falls back to the mark's nominal position).
-  const getCurrentPosition = useCallback(() => {
-    const p = recorder.lastPoint;
-    if (!p) return null;
-    return { lat: p.lat, lon: p.lon };
-  }, [recorder.lastPoint]);
 
   // Global auto-pass preference (B2 — 2026-06-03). Default ON; users can
   // disable in the Settings screen if they prefer to mark passes only
@@ -349,11 +340,9 @@ export default function RecordingScreen() {
         showActualRouteRow
       />
 
-      {/* Bottom action stack: marks row + guidance card + Stop button.
-          MarkPassControls sits above the GuidanceCard so the "what's
-          confirmed" picture is immediately visible without obscuring
-          the next-mark guidance. edges=["bottom"] keeps the stack above
-          the home-indicator / nav bar without padding the top. */}
+      {/* Bottom action stack: guidance card + Stop button.
+          edges=["bottom"] keeps the stack above the home-indicator /
+          nav bar without padding the top. */}
       <SafeAreaView
         edges={["bottom"]}
         style={styles.bottomStack}
@@ -368,14 +357,6 @@ export default function RecordingScreen() {
           onAccept={() => routing.acceptAlternative()}
           onDismiss={routing.dismissAlternative}
           autoAcceptSeconds={autoRoute.enabled ? 10 : 0}
-        />
-        <MarkPassControls
-          marks={selectedRace.marks}
-          passes={markPasses.passes}
-          disabled={!recorder.recording}
-          getCurrentPosition={getCurrentPosition}
-          onMarkPass={markPasses.markManualPass}
-          pending={markPasses.loading && markPasses.passes.length === 0}
         />
         <GuidanceCard
           guidance={guidance}

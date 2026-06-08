@@ -150,11 +150,18 @@ async def test_happy_path_posts_run_endpoint(
     assert _FakeAsyncClient.last_headers["Authorization"] == "Bearer fake-bearer-token"
     assert _FakeAsyncClient.last_headers["Content-Type"] == "application/json"
 
-    # Body: containerOverrides.args has --race-id <uuid>, no --force.
+    # Body: containerOverrides.args MUST include the `-m
+    # workers.race_postprocess` module selector before --race-id. Cloud
+    # Run REPLACES the job's baseline args with this list (it does not
+    # merge), so omitting the module path makes the container run
+    # `python --race-id <uuid>` → interpreter exit 2. Regression guard for
+    # the 2026-06-08 bug; do not "simplify" this back to just --race-id.
     assert _FakeAsyncClient.last_json is not None
     overrides = _FakeAsyncClient.last_json["overrides"]
     container = overrides["containerOverrides"][0]
-    assert container["args"] == ["--race-id", str(RACE_ID)]
+    assert container["args"] == [
+        "-m", "workers.race_postprocess", "--race-id", str(RACE_ID),
+    ]
 
 
 async def test_force_flag_appended_to_args(monkeypatch: pytest.MonkeyPatch):
@@ -168,7 +175,9 @@ async def test_force_flag_appended_to_args(monkeypatch: pytest.MonkeyPatch):
     await trigger_race_postprocess(RACE_ID, force=True)
 
     container = _FakeAsyncClient.last_json["overrides"]["containerOverrides"][0]
-    assert container["args"] == ["--race-id", str(RACE_ID), "--force"]
+    assert container["args"] == [
+        "-m", "workers.race_postprocess", "--race-id", str(RACE_ID), "--force",
+    ]
 
 
 # ── trigger_race_postprocess: failure paths must not raise ────────────

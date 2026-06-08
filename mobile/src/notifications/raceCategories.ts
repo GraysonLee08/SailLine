@@ -35,15 +35,12 @@ import * as Notifications from "expo-notifications";
 
 // ── Category + action identifiers (stable strings — do not rename) ─
 
-/** Fired when CPA detector likely missed a mark — see useMissedMarkNotifier. */
+/** Fired when CPA detector likely missed a mark — see useMissedMarkNotifier.
+ *  Informational only (2026-06-08): the notification tells the sailor a
+ *  mark may not have registered, but there is no "mark as passed" action.
+ *  The mark-rounding detector is the sole writer of mark_passes; manual
+ *  confirmation was removed. The single remaining action is "Stop race". */
 export const CATEGORY_MISSED_MARK = "sailline.missed-mark";
-
-/** Action: mark the next-expected mark as passed (calls /mark-passes). */
-export const ACTION_MARK_AS_PASSED = "mark-as-passed";
-
-/** Action: skip the mark (advance the detector by writing a manual pass
- *  with a synthetic timestamp + lat/lon = mark's nominal position). */
-export const ACTION_SKIP_MARK = "skip-mark";
 
 /** Action: stop the current recording (treats race as DNF). */
 export const ACTION_STOP_RACE = "stop-race";
@@ -60,16 +57,6 @@ export async function registerRaceNotificationCategories(): Promise<void> {
   try {
     await Notifications.setNotificationCategoryAsync(CATEGORY_MISSED_MARK, [
       {
-        identifier: ACTION_MARK_AS_PASSED,
-        buttonTitle: "Mark as passed",
-        options: { opensAppToForeground: false },
-      },
-      {
-        identifier: ACTION_SKIP_MARK,
-        buttonTitle: "Skip",
-        options: { opensAppToForeground: false },
-      },
-      {
         identifier: ACTION_STOP_RACE,
         buttonTitle: "Stop race",
         options: { opensAppToForeground: true, isDestructive: true },
@@ -79,6 +66,6 @@ export async function registerRaceNotificationCategories(): Promise<void> {
     // Category registration can fail on Expo Go (which we don't ship
     // anyway — see CLAUDE.md mobile section). Surface no error; the
     // missed-mark notifier degrades to a no-action notification, which
-    // is still useful (the user opens the app and taps Pass manually).
+    // is still useful (the sailor sees the heads-up and can open the app).
   }
 }

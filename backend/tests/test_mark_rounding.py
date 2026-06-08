@@ -741,3 +741,106 @@ def test_beer_can_4_streaming_one_sample_batches_without_state_misses_marks():
         "Without cross-batch state, the streaming cadence cannot accumulate "
         "the depart-confirm count and most marks are missed."
     )
+
+
+# ─── Dog Walk (2026-06-08) — single-writer off-by-one regression ─────────
+#
+# This trace is the one that exposed the mark_passes off-by-one: the
+# stored passes were corrupted because a manual Start tap was mixed with
+# the auto detector's own emits through two writers with incompatible
+# index arithmetic. The manual-pass path has since been removed, leaving
+# the auto detector as the SOLE writer. These tests pin the guarantee:
+# fed the real trace, the detector emits a clean, contiguous,
+# correctly-indexed 0..N-1 sequence — no shift, no dropped index.
+# See sailline-docs/2026-06-08_session.md for the diagnosis.
+
+_DOG_WALK_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "dog_walk_20260608.json"
+)
+
+# Course as stored on the race row (Start → 1 → 2 → 3 → Finish). Finish
+# shares the Start coordinate — a real "return to the line" close.
+_DOG_WALK_MARKS = [
+    Mark(lat=41.93504, lon=-87.67391),                          # 0 Start
+    Mark(lat=41.93510419063665, lon=-87.67758189483345),        # 1 Mark 1
+    Mark(lat=41.93585925555956, lon=-87.67759868232766),        # 2 Mark 2
+    Mark(lat=41.93588667813313, lon=-87.6742746154837),         # 3 Mark 3
+    Mark(lat=41.93504, lon=-87.67391),                          # 4 Finish
+]
+
+
+def _load_dog_walk_points() -> list[Point]:
+    """Load the Dog Walk trace. Same shape + tolerant ts parse as the
+    Beer Can loader (studio export mixes Z and truncated fractions)."""
+    import json as _json
+    import re as _re
+
+    raw = _json.loads(_DOG_WALK_FIXTURE.read_text())
+    out: list[Point] = []
+    for p in raw["points"]:
+        ts_str = p["ts"].replace("Z", "+00:00")
+        m = _re.match(r"(.+?)\.(\d+)([+-]\d{2}:\d{2})", ts_str)
+        if m:
+            frac = (m.group(2) + "000000")[:6]
+            ts_str = f"{m.group(1)}.{frac}{m.group(3)}"
+        out.append(
+            Point(
+                lat=float(p["lat"]),
+                lon=float(p["lon"]),
+                ts=datetime.fromisoformat(ts_str),
+                speed_kts=float(p["sog_kts"]) if p.get("sog_kts") else 0.0,
+            )
+        )
+    return out
+
+
+@pytest.mark.skipif(
+    not _DOG_WALK_FIXTURE.exists(),
+    reason="Dog Walk fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_dog_walk_auto_detection_is_contiguous_and_in_order():
+    """The whole trace, inshore mode, single writer → exactly the five
+    marks in order, indices 0..4 with no gap and no shift.
+
+    Regression for the 2026-06-08 off-by-one: the stored data had the
+    auto Start emit pushed to index 1 (a manual Start tap occupied 0),
+    dropping a downstream index. With manual passes removed the detector
+    is the only writer and MarkPass.mark_index == its position, so this
+    sequence must stay contiguous."""
+    points = _load_dog_walk_points()
+    thresholds = thresholds_for_course(len(_DOG_WALK_MARKS), mode="inshore")
+    passes = compute_passes(_DOG_WALK_MARKS, points, threshold_m=thresholds)
+    assert [p.mark_index for p in passes] == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.skipif(
+    not _DOG_WALK_FIXTURE.exists(),
+    reason="Dog Walk fixture not checked in — see backend/tests/fixtures/README.md",
+)
+def test_dog_walk_passes_land_near_their_marks():
+    """Each emitted pass's closest-approach point sits within the inshore
+    capture distance of the mark it is indexed to — i.e. index N really
+    is mark N, not a neighbour. Guards against a silent re-introduction
+    of the index/position mismatch the off-by-one produced."""
+    points = _load_dog_walk_points()
+    thresholds = thresholds_for_course(len(_DOG_WALK_MARKS), mode="inshore")
+    passes = compute_passes(_DOG_WALK_MARKS, points, threshold_m=thresholds)
+    for p in passes:
+        mark = _DOG_WALK_MARKS[p.mark_index]
+        d = _haversine_check(p.lat, p.lon, mark.lat, mark.lon)
+        assert d <= thresholds[p.mark_index], (
+            f"pass {p.mark_index} CPA {d:.0f} m exceeds its mark's "
+            f"threshold {thresholds[p.mark_index]:.0f} m — index/position "
+            f"mismatch"
+        )
+
+
+def _haversine_check(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Local haversine for the assertion above (the detector's own is
+    private; this keeps the test independent of its internals)."""
+    R = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))

@@ -5,24 +5,17 @@
 // posting + cancellation API (one notification per race, replaced if
 // already shown so we never stack duplicates).
 //
-// The notification body carries `data` the response listener uses to
-// route actions to the right race + mark:
+// The notification is informational (2026-06-08): it tells the sailor a
+// mark may not have registered, but offers no "mark as passed" action —
+// the mark-rounding detector is the sole writer of mark_passes. The
+// body carries `data` so the response listener can dismiss it:
 //   { kind: "missedMark", raceId, markIndex, markName }
 //
-// Response routing: App.tsx (or wherever the global
-// addNotificationResponseReceivedListener lives) checks data.kind, then
-// dispatches one of:
-//   ACTION_MARK_AS_PASSED  → POST /api/races/{raceId}/mark-passes
-//                            with markIndex (backfills if needed).
-//   ACTION_SKIP_MARK       → same POST but we treat it as "advance
-//                            past this mark without claiming you
-//                            rounded it" — server still records a
-//                            manual pass at the mark's nominal point
-//                            because the detector needs to advance.
-//                            UI distinguishes via the "manual" label.
-//   ACTION_STOP_RACE       → opens the app (we set
-//                            opensAppToForeground), Recording screen
-//                            handles the rest.
+// Response routing: the global addNotificationResponseReceivedListener
+// (app/_layout.tsx) checks data.kind and dismisses. The only action
+// button is ACTION_STOP_RACE, which opens the app (opensAppToForeground)
+// so the Recording screen's Stop button is reachable; any other tap is
+// just an acknowledgement.
 
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
@@ -65,7 +58,7 @@ export async function postMissedMarkNotification(
       identifier: tagFor(payload.raceId),
       content: {
         title: "Missed a mark?",
-        body: `It looks like you passed ${payload.markName} but it didn't register. Confirm from the watch or tap to open SailLine.`,
+        body: `It looks like you passed ${payload.markName} but it didn't auto-register. It'll still be picked up from your track after the race.`,
         data: {
           kind: "missedMark",
           raceId: payload.raceId,

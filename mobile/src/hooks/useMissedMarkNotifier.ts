@@ -23,9 +23,11 @@
 //   * Next-expected mark advances (a pass was recorded, auto or manual).
 //   * Race id changes.
 //
-// Watch reach: the notification uses CATEGORY_MISSED_MARK so action
-// buttons appear on supported wearables. The response listener in
-// App.tsx routes button taps back to the manual-pass API.
+// Watch reach: the notification uses CATEGORY_MISSED_MARK so it relays
+// to supported wearables. It is informational (2026-06-08) — the sailor
+// is told a mark may not have registered, but there is no "mark as
+// passed" action; the detector picks the mark up from the track. The
+// only action button is "Stop race".
 
 import { useEffect, useMemo, useRef } from "react";
 
@@ -87,7 +89,7 @@ export function useMissedMarkNotifier({
   lastPoint,
   enabled = true,
 }: Options): void {
-  // Next-expected mark index. Same logic as MarkPassControls.
+  // Next-expected mark index = lowest index without a recorded pass.
   const nextIdx = useMemo(() => {
     const seen = new Set<number>(passes.map((p) => p.mark_index));
     for (let i = 0; i < marks.length; i += 1) {
