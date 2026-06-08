@@ -126,7 +126,8 @@ Auto-deploys on push to `main` via `infra/cloudbuild.frontend.yaml` (→ Firebas
 One-time prerequisites:
 
 - [ ] JDK 17 (`java -version` → 17.x), Node 20+, `adb` on PATH, `ANDROID_HOME` set.
-- [ ] `~/.gradle/gradle.properties` contains `MAPBOX_DOWNLOADS_TOKEN` (secret `sk.` token) and `TRANSISTOR_LICENSE` (never commit these).
+- [ ] `~/.gradle/gradle.properties` contains `MAPBOX_DOWNLOADS_TOKEN` (secret `sk.` token) — the @rnmapbox Gradle plugin reads this at build time (never commit it).
+- [ ] Have your `TRANSISTOR_LICENSE` key ready. **It is injected at _prebuild_ time from `$env:TRANSISTOR_LICENSE`, NOT from gradle.properties.** If the env var is unset when you prebuild, the manifest license is written as `UNDEFINED` and a **release** build fails Transistorsoft validation (`license_validation_failure`) → tracking silently disabled → no recorded points / no actual-track line. (Debug builds don't enforce the license, so this only bites release APKs.)
 - [ ] `mobile/.env.local` contains `EXPO_PUBLIC_MAPBOX_TOKEN` (public `pk.` token) and `EXPO_PUBLIC_API_URL`.
 
 Build steps:
@@ -136,10 +137,18 @@ Build steps:
   npm ls expo-updates
   npm uninstall expo-updates expo-eas-client expo-manifests expo-structured-headers expo-updates-interface
   ```
-- [ ] Regenerate the native tree:
+- [ ] Set the Transistorsoft license in the **current** PowerShell session (replace with your key):
+  ```powershell
+  $env:TRANSISTOR_LICENSE = "<your-transistorsoft-license-key>"
+  ```
+- [ ] Regenerate the native tree (same shell that has the env var set):
   ```powershell
   cd E:\Personal\Coding\SailLine\mobile
   npx expo prebuild --platform android --clean
+  ```
+- [ ] Verify the license baked in — must NOT print `UNDEFINED`:
+  ```powershell
+  Select-String -Path .\android\app\src\main\AndroidManifest.xml -Pattern "locationmanager.license"
   ```
 - [ ] Build the release APK:
   ```powershell
