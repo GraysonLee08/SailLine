@@ -62,6 +62,7 @@ while shrinking 1-Hz tracks (~7 k points over a 2 h race) by 30×+.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -362,6 +363,45 @@ def pick_handicap(
         return (None, None)
 
 
+def coerce_jsonb_list(value) -> list:
+    """Normalise a JSONB column value to a list of dicts.
+
+    Defensive against the JSONB *double-encoding* bug: some writers
+    ``json.dumps()`` a value before the ``::jsonb`` cast while the global
+    asyncpg codec (``app/db.py``) also json-encodes, so the column ends
+    up holding a JSON *string* of an array rather than a native array.
+    On read the codec then decodes it back to a Python ``str``, and any
+    consumer that iterates it as a list of dicts blows up
+    (``TypeError: string indices must be integers``). This mirrors the
+    same str→list shim already used by ``races.py::_decode_marks`` and
+    ``track_ingest.load_race_for_ingest``; it also tolerates an extra
+    layer of nesting if a value was triple-encoded.
+
+    Returns ``[]`` for None/empty. Non-list, non-string inputs are
+    returned wrapped defensively rather than raising.
+
+    NOTE: this is a read-side band-aid. The real fix is to stop the
+    writers double-encoding (pass plain Python objects to ``::jsonb``,
+    per CLAUDE.md) and backfill existing rows — tracked separately.
+    """
+    seen = 0
+    while isinstance(value, (bytes, str)) and seen < 3:
+        s = value.decode() if isinstance(value, bytes) else value
+        if not s:
+            return []
+        try:
+            value = json.loads(s)
+        except (ValueError, TypeError):
+            return []
+        seen += 1
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    # A single dict (or anything else) — wrap so callers iterate cleanly.
+    return [value]
+
+
 def compute_stats(
     track_points: list[TrackPoint],
     marks: list[dict],
@@ -382,7 +422,16 @@ def compute_stats(
                              race_sessions.mode). Picks HCP vs DHCP.
       * ``uses_spinnaker`` — per-race choice. Picks HCP vs NSHCP
                              (and DHCP vs DNSHCP for distance).
+
+    ``marks`` and ``mark_passes`` are coerced from a possibly
+    double-encoded JSONB string back to a list of dicts (see
+    ``coerce_jsonb_list``) so a serialisation-bugged row produces
+    correct stats instead of crashing the postprocess job / stats
+    endpoint.
     """
+    marks = coerce_jsonb_list(marks)
+    mark_passes = coerce_jsonb_list(mark_passes)
+
     if not track_points:
         return None
 

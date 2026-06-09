@@ -60,6 +60,7 @@ from app.services.heel_stats import compute_heel_summary
 from app.services.performance import compute_performance_summary
 from app.services.polars import load_polar_for_class
 from app.services.race_stats import (
+    coerce_jsonb_list,
     compute_stats,
     track_points_from_rows,
 )
@@ -346,8 +347,12 @@ async def process_race(
         return 0
 
     track_points = track_points_from_rows(track_rows)
-    marks = race["marks"] or []
-    mark_passes = race["mark_passes"] or []
+    # Coerce marks/mark_passes from a possibly double-encoded JSONB string
+    # back to a list of dicts before they reach compute_stats, the wind
+    # snapshot, heel, and performance steps — all of which iterate them as
+    # dicts. See race_stats.coerce_jsonb_list for the bug background.
+    marks = coerce_jsonb_list(race["marks"])
+    mark_passes = coerce_jsonb_list(race["mark_passes"])
     race_start_at = race["start_at"]
 
     boat_for_math = None

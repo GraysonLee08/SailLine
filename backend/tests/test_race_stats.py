@@ -6,6 +6,7 @@ latitudes (~42.05°N) so the haversine math matches production.
 """
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,7 @@ from app.services.race_stats import (
     _douglas_peucker,
     _haversine_m,
     _track_distance_in_window,
+    coerce_jsonb_list,
     compute_stats,
     pick_handicap,
     track_points_from_rows,
@@ -484,3 +486,64 @@ def test_track_points_from_rows_handles_iso_and_dt():
     assert len(out) == 2
     assert out[0].speed_kts == pytest.approx(3.2)
     assert out[1].speed_kts is None
+
+
+# ─── Double-encoded JSONB (serialisation-bug) tolerance ────────────────
+#
+# Some JSONB writers json.dumps() before the ::jsonb cast while the global
+# asyncpg codec also json-encodes, so the column ends up holding a JSON
+# *string* of the array. On read the codec decodes it back to a Python
+# str, and compute_stats / the postprocess worker used to crash with
+# "TypeError: string indices must be integers" (race-postprocess
+# exit(1), 2026-06-08). compute_stats now coerces defensively.
+
+
+def test_coerce_jsonb_list_handles_every_shape():
+    payload = [{"mark_index": 0, "ts": "x", "lat": 1.0, "lon": 2.0}]
+    # Native list — passthrough.
+    assert coerce_jsonb_list(payload) == payload
+    # Single json.dumps — the common double-encode case.
+    assert coerce_jsonb_list(json.dumps(payload)) == payload
+    # Triple-encoded — tolerated up to the recursion cap.
+    assert coerce_jsonb_list(json.dumps(json.dumps(payload))) == payload
+    # bytes from a raw connection.
+    assert coerce_jsonb_list(json.dumps(payload).encode()) == payload
+    # Empty / null / garbage → [].
+    assert coerce_jsonb_list(None) == []
+    assert coerce_jsonb_list("") == []
+    assert coerce_jsonb_list("not json at all") == []
+    # A bare dict (not a list) gets wrapped so callers iterate cleanly.
+    assert coerce_jsonb_list({"mark_index": 0}) == [{"mark_index": 0}]
+
+
+def test_compute_stats_survives_double_encoded_marks_and_passes():
+    """A double-encoded mark_passes/marks (string, not list) must produce
+    the same stats as the properly-decoded inputs — not raise."""
+    pts = straight_line_track(
+        n_points=20, spacing_m=20.0, dt_s=2.0, speed_kts=4.0
+    )
+    marks = [{"name": "Mark 1", "lat": REF_LAT, "lon": REF_LON}]
+    passes = [
+        {
+            "mark_index": 0,
+            "ts": (BASE_T + timedelta(seconds=20)).isoformat(),
+            "lat": REF_LAT,
+            "lon": REF_LON,
+        }
+    ]
+
+    clean = compute_stats(pts, marks=marks, mark_passes=passes)
+    # Simulate the column decoding to a Python str (json.dumps of the list).
+    encoded = compute_stats(
+        pts, marks=json.dumps(marks), mark_passes=json.dumps(passes)
+    )
+
+    assert clean is not None
+    assert encoded is not None
+    # Identical leg structure + labels + elapsed — proof the coercion
+    # restored the real shape rather than silently dropping the passes.
+    assert len(encoded.legs) == len(clean.legs) == 1
+    assert encoded.legs[0].from_label == clean.legs[0].from_label
+    assert encoded.legs[0].to_label == clean.legs[0].to_label
+    assert encoded.legs[0].to_label == "Finish"  # 1 mark, 1 pass = final
+    assert encoded.elapsed_s == pytest.approx(clean.elapsed_s)
