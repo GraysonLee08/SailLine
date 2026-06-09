@@ -635,3 +635,35 @@ async def test_performance_backfill_when_column_null_but_ai_current(monkeypatch,
     assert spy.persist_calls[0]["wind_snapshot"] is None
     assert spy.persist_calls[0]["performance_summary"] is not None
     assert spy.persist_calls[0]["performance_summary"]["sample_count"] == 3
+
+
+# ─── Cold-import regression (circular import guard) ────────────────────
+
+
+def test_worker_imports_in_a_fresh_interpreter():
+    """The worker must import cleanly from a COLD interpreter.
+
+    workers/race_postprocess.py imports app.services.weather first, which
+    on 2026-06-09 closed a circular import (weather → routing → weather)
+    and crashed every job at load with ImportError. The in-process test
+    suite masks this: by the time this file's top-level
+    ``from workers import race_postprocess`` runs, conftest/other tests
+    have already imported those packages in a safe order, so the module
+    is cached and the cycle never re-triggers. A subprocess reproduces
+    the worker's real cold-start import order, so a re-introduced cycle
+    fails here instead of only in production.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c", "import workers.race_postprocess"],
+        cwd=str(backend_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        "worker failed to cold-import (circular import?):\n" + result.stderr
+    )

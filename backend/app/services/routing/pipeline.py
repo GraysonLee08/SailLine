@@ -104,7 +104,16 @@ from app.services.routing.navigability import (
     DEFAULT_SAFETY_FACTOR,
     make_navigable_predicate,
 )
-from app.services.weather import ForecastNotAvailable, load_forecast_for_race
+# NB: `from app.services.weather import load_forecast_for_race` is imported
+# LAZILY inside compute_route (below), not at module scope, to break a
+# circular import. The worker entrypoint workers/race_postprocess.py
+# imports app.services.weather FIRST; weather/__init__ → forecast_loader →
+# routing.isochrone → routing/__init__ → routing.pipeline. A module-level
+# import of weather here closes that cycle while weather is only partially
+# initialised → ImportError("cannot import name 'ForecastNotAvailable' …")
+# and the worker dies at load (diagnosed 2026-06-09). The API service
+# imports in a different order, which masked it. Only load_forecast_for_race
+# is used at runtime here; ForecastNotAvailable just propagates from it.
 
 log = logging.getLogger(__name__)
 
@@ -341,7 +350,11 @@ async def compute_route(
     polar = load_polar(f"app/services/polars/{spec.polar_csv}")
     min_depth_m = spec.draft_m * req.safety_factor
 
-    # Forecast first — its cycle ids feed the cache key.
+    # Forecast first — its cycle ids feed the cache key. Imported here,
+    # not at module scope, to break the weather↔routing circular import
+    # (see the note by the imports at the top of this module).
+    from app.services.weather import load_forecast_for_race
+
     forecast = await load_forecast_for_race(
         region=region,
         race_start=req.race_start,
