@@ -67,7 +67,16 @@ async def startup() -> None:
         return
 
     try:
-        _connector = Connector()
+        # refresh_strategy="lazy": refresh the ephemeral client cert
+        # on-demand in the calling event loop, NOT in a background
+        # thread+loop. The default "background" strategy creates its
+        # key/refresh Futures on a separate loop; under a short-lived
+        # asyncio.run() (the Cloud Run Jobs / worker entrypoint) the first
+        # pool.acquire() then raises "got Future attached to a different
+        # loop" and crashes the worker (diagnosed 2026-06-09). Lazy is
+        # fine for the long-lived API too — it just refreshes on the next
+        # connect when the cert is near expiry.
+        _connector = Connector(refresh_strategy="lazy")
         # min_size=0 → no connection is opened during pool creation;
         # the first acquire() triggers the lazy connect.
         _pool = await asyncpg.create_pool(
