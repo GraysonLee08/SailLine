@@ -167,9 +167,15 @@ export default function MapHomeScreen() {
     start: startRecording,
   });
 
-  // When the user picks a race, fit the map to its bounds.
+  // When the user picks a race: a FINISHED race (ended_at set) opens the
+  // read-only Review screen (AI recap + stats); an unraced race drops into
+  // the pre-race / Start flow on the map as before.
   const handleSelectRace = useCallback(
     (race: Race) => {
+      if (race.ended_at) {
+        router.push(`/race-review/${race.id}`);
+        return;
+      }
       if (!setSelectedRace(race)) return;
       mapRef.current?.fitToRace(race);
     },

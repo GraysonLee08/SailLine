@@ -36,6 +36,8 @@ from app.auth import get_current_user, require_pro
 from app.auth_helpers import race_owner_predicate, race_read_predicate
 from app.services.job_trigger import trigger_race_postprocess
 from app.services.race_stats import (
+    coerce_jsonb_list,
+    coerce_jsonb_obj,
     compute_stats,
     track_points_from_rows,
 )
@@ -262,7 +264,20 @@ async def _load_race_row(
     )
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
-    return dict(row)
+    d = dict(row)
+    # Normalise the JSONB columns against legacy double-encoded rows (a
+    # value stored as a JSON string of its array/object — see the
+    # 2026-06-08 serialisation bug). Without this a legacy row sends a
+    # str into StatsResponse.marks (list[dict]) → Pydantic 500, or into
+    # AiSummaryOut(**ai_summary) → TypeError. New rows already write
+    # native JSON, so this is a no-op for them.
+    d["marks"] = coerce_jsonb_list(d.get("marks"))
+    d["mark_passes"] = coerce_jsonb_list(d.get("mark_passes"))
+    for _col in (
+        "ai_summary", "wind_snapshot", "heel_summary", "performance_summary",
+    ):
+        d[_col] = coerce_jsonb_obj(d.get(_col))
+    return d
 
 
 async def _load_track_rows(

@@ -25,6 +25,7 @@ from app.services.race_stats import (
     _haversine_m,
     _track_distance_in_window,
     coerce_jsonb_list,
+    coerce_jsonb_obj,
     compute_stats,
     pick_handicap,
     track_points_from_rows,
@@ -514,6 +515,25 @@ def test_coerce_jsonb_list_handles_every_shape():
     assert coerce_jsonb_list("not json at all") == []
     # A bare dict (not a list) gets wrapped so callers iterate cleanly.
     assert coerce_jsonb_list({"mark_index": 0}) == [{"mark_index": 0}]
+
+
+def test_coerce_jsonb_obj_handles_every_shape():
+    """Object-valued sibling for the summary columns (ai_summary, etc.):
+    decodes a double-encoded string to its dict WITHOUT list-wrapping, so
+    AiSummaryOut(**value) works instead of raising. Guards the
+    GET /stats 500 on legacy double-encoded rows (2026-06-08)."""
+    payload = {"recap": "nice race", "tips": ["foot less"]}
+    # Native dict — passthrough.
+    assert coerce_jsonb_obj(payload) == payload
+    # Single + triple json.dumps (double-encode and worse).
+    assert coerce_jsonb_obj(json.dumps(payload)) == payload
+    assert coerce_jsonb_obj(json.dumps(json.dumps(payload))) == payload
+    # bytes from a raw connection.
+    assert coerce_jsonb_obj(json.dumps(payload).encode()) == payload
+    # Empty / null / garbage → None (not a wrapped value).
+    assert coerce_jsonb_obj(None) is None
+    assert coerce_jsonb_obj("") is None
+    assert coerce_jsonb_obj("not json") is None
 
 
 def test_compute_stats_survives_double_encoded_marks_and_passes():

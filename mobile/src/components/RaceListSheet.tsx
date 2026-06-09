@@ -261,8 +261,14 @@ export function RaceListSheet({
 
 function RaceRow({ race, onPress }: { race: Race; onPress: () => void }) {
   const { colors, font, size } = useTheme();
+  // A race is "raced" once it has a recorded finish (ended_at). The list
+  // endpoint returns ended_at but NOT stats_available / mark_passes, so we
+  // key off ended_at here (those two stay as fallbacks for callers that do
+  // hydrate them, e.g. a single-race fetch).
   const raced =
-    !!race.stats_available || (race.mark_passes?.length ?? 0) > 0;
+    !!race.ended_at ||
+    !!race.stats_available ||
+    (race.mark_passes?.length ?? 0) > 0;
 
   return (
     <Pressable

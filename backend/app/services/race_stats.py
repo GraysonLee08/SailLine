@@ -402,6 +402,29 @@ def coerce_jsonb_list(value) -> list:
     return [value]
 
 
+def coerce_jsonb_obj(value):
+    """Decode a possibly double-encoded JSONB *object* column to a Python
+    object (dict), or None for null/empty.
+
+    The object-valued sibling of :func:`coerce_jsonb_list` — used for the
+    single-object summary columns (``ai_summary``, ``wind_snapshot``,
+    ``heel_summary``, ``performance_summary``). Same double-encoding
+    tolerance, but does NOT list-wrap: a legacy double-encoded row decodes
+    back to its dict so ``SomeModel(**value)`` works instead of raising.
+    """
+    seen = 0
+    while isinstance(value, (bytes, str)) and seen < 3:
+        s = value.decode() if isinstance(value, bytes) else value
+        if not s:
+            return None
+        try:
+            value = json.loads(s)
+        except (ValueError, TypeError):
+            return None
+        seen += 1
+    return value
+
+
 def compute_stats(
     track_points: list[TrackPoint],
     marks: list[dict],
