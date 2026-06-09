@@ -509,6 +509,51 @@ async def _amain(race_id: UUID, force: bool) -> int:
         await db.shutdown()
 
 
+async def _amain_all(force: bool) -> int:
+    """Backfill EVERY finished race (``ended_at IS NOT NULL``) in one run.
+
+    A one-shot maintenance path — far cheaper than firing one Cloud Run
+    execution per race from the client. One bad race never aborts the
+    rest (each is wrapped). Bounded by the job's container timeout, so for
+    a very large backlog run it in batches. Returns non-zero if any race
+    failed so the execution surfaces as failed.
+    """
+    await db.startup()
+    await redis_client.startup()
+    try:
+        pool = db.get_pool()
+    except Exception as e:  # noqa: BLE001
+        log.error("DB pool unavailable: %s", e)
+        return 1
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM race_sessions "
+                "WHERE ended_at IS NOT NULL ORDER BY ended_at"
+            )
+        race_ids = [r["id"] for r in rows]
+        total = len(race_ids)
+        log.info("backfill --all: %d finished race(s) to process", total)
+        failures = 0
+        for i, rid in enumerate(race_ids, 1):
+            try:
+                rc = await process_race(pool, rid, force=force)
+                if rc != 0:
+                    failures += 1
+                    log.warning("[%d/%d] race %s exit %d", i, total, rid, rc)
+                else:
+                    log.info("[%d/%d] race %s done", i, total, rid)
+            except Exception as e:  # noqa: BLE001 - one race must not abort the rest
+                failures += 1
+                log.exception("[%d/%d] race %s failed: %s", i, total, rid, e)
+        log.info(
+            "backfill --all complete: %d ok, %d failed", total - failures, failures
+        )
+        return 1 if failures else 0
+    finally:
+        await db.shutdown()
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -522,8 +567,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--race-id",
-        required=True,
+        required=False,
         help="UUID of the race_sessions row to process.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Process EVERY finished race (ended_at set). Mutually "
+            "exclusive with --race-id. Bounded by the job timeout — run "
+            "in batches for a very large backlog."
+        ),
     )
     parser.add_argument(
         "--force",
@@ -534,6 +588,16 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    if args.all:
+        if args.race_id:
+            log.error("--all and --race-id are mutually exclusive")
+            return 2
+        return asyncio.run(_amain_all(force=args.force))
+
+    if not args.race_id:
+        log.error("one of --race-id or --all is required")
+        return 2
     try:
         race_id = UUID(args.race_id)
     except ValueError:
