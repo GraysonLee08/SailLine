@@ -147,7 +147,11 @@ def _pipeline_patches(forecast=None, result=None):
     forecast = forecast if forecast is not None else _fake_forecast()
     result = result if result is not None else _fake_result()
     return [
-        patch("app.services.routing.pipeline.load_forecast_for_race",
+        # load_forecast_for_race is imported lazily inside compute_route
+        # (to break the weather↔routing circular import that crashed the
+        # postprocess worker), so it lives on the weather module, not on
+        # pipeline's namespace — patch it at the source.
+        patch("app.services.weather.load_forecast_for_race",
               new=AsyncMock(return_value=forecast)),
         patch("app.services.routing.pipeline.load_currents_optional",
               new=AsyncMock(return_value=None)),
@@ -230,7 +234,7 @@ async def test_compute_route_forecast_not_available_propagates(
     """Pipeline doesn't wrap the exception; transports decide what to do."""
     available_at = datetime.now(timezone.utc) + timedelta(hours=4)
     with patch(
-        "app.services.routing.pipeline.load_forecast_for_race",
+        "app.services.weather.load_forecast_for_race",
         new=AsyncMock(side_effect=ForecastNotAvailable(available_at=available_at)),
     ):
         with pytest.raises(ForecastNotAvailable):
