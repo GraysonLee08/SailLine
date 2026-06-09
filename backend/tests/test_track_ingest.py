@@ -229,7 +229,10 @@ async def test_detect_and_persist_emits_passes(conn):
     # detector_state is part of the same UPDATE; emit case resets it to
     # NULL because _reset_traversal_state ran inside feed().
     assert "detector_state" in sql
-    persisted_passes = json.loads(conn.execute.await_args.args[1])
+    # Writers now pass the plain Python object to the ::jsonb param (the
+    # asyncpg codec encodes once) — NOT a json.dumps string. So the arg is
+    # the list itself, not a string to re-parse.
+    persisted_passes = conn.execute.await_args.args[1]
     assert persisted_passes == new_p
     # The second positional arg is the new detector_state JSONB. After
     # an emit the state should be None (the traversal is done for this

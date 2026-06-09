@@ -145,13 +145,19 @@ def _row_to_race(row: asyncpg.Record) -> dict:
     }
 
 
-def _marks_json(marks: list[Mark] | list[dict]) -> str:
-    """Serialize marks to a JSON string for the ::jsonb cast.
+def _marks_payload(marks: list[Mark] | list[dict]) -> list[dict]:
+    """Normalise marks to a list of plain dicts for a ::jsonb param.
+
+    Returns the list itself (NOT a json string) — the global asyncpg
+    codec (app/db.py) json-encodes it exactly once when bound to the
+    ::jsonb parameter. Passing json.dumps(...) here would double-encode
+    the column into a JSON string of an array (the 2026-06-08 bug).
 
     `exclude_none=True` keeps the JSONB compact when description is unset."""
-    return json.dumps(
-        [m.model_dump(exclude_none=True) if isinstance(m, Mark) else m for m in marks]
-    )
+    return [
+        m.model_dump(exclude_none=True) if isinstance(m, Mark) else m
+        for m in marks
+    ]
 
 
 # ─── Endpoints ───────────────────────────────────────────────────────────
@@ -201,7 +207,7 @@ async def create_race(
             payload.name,
             payload.mode,
             payload.boat_class,
-            _marks_json(payload.marks),
+            _marks_payload(payload.marks),
             payload.start_at,
             payload.auto_start_enabled,
             payload.boat_id,
@@ -256,7 +262,7 @@ async def update_race(
         idx = len(args) + 1
         if key == "marks":
             set_parts.append(f"marks = ${idx}::jsonb")
-            args.append(_marks_json(value))
+            args.append(_marks_payload(value))
         elif key == "ended_at":
             # Manual-stop fallback PATCH (DNF / abandoned race) must NOT
             # overwrite an authoritative ``ended_at`` already written by

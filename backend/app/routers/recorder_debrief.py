@@ -59,7 +59,6 @@ than store junk).
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Optional
 from uuid import UUID
@@ -253,7 +252,7 @@ async def post_recorder_debrief(
             RETURNING id, created_at
             """,
             race_id,
-            json.dumps(payload),
+            payload,
         )
 
     assert row is not None  # INSERT with RETURNING always returns a row

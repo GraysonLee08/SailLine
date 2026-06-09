@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
@@ -216,21 +215,24 @@ async def _persist(
     sets: list[str] = []
     args: list = [race_id]
     i = 2
+    # Pass plain dicts to the ::jsonb params — the global asyncpg codec
+    # (app/db.py) json-encodes once. json.dumps here would double-encode
+    # the column into a JSON string (the 2026-06-08 serialisation bug).
     if ai_summary is not None:
         sets.append(f"ai_summary = ${i}::jsonb")
-        args.append(json.dumps(ai_summary))
+        args.append(ai_summary)
         i += 1
     if wind_snapshot is not None:
         sets.append(f"wind_snapshot = ${i}::jsonb")
-        args.append(json.dumps(wind_snapshot))
+        args.append(wind_snapshot)
         i += 1
     if heel_summary is not None:
         sets.append(f"heel_summary = ${i}::jsonb")
-        args.append(json.dumps(heel_summary))
+        args.append(heel_summary)
         i += 1
     if performance_summary is not None:
         sets.append(f"performance_summary = ${i}::jsonb")
-        args.append(json.dumps(performance_summary))
+        args.append(performance_summary)
         i += 1
     if not sets:
         return

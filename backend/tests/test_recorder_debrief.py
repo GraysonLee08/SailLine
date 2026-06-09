@@ -16,7 +16,6 @@ Coverage:
 """
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -289,9 +288,11 @@ def test_post_debrief_inserts_and_returns_row(
     assert "payload" in insert_sql
     assert "RETURNING id, created_at" in insert_sql
 
-    # Args: race_id (UUID), payload (json-string).
+    # Args: race_id (UUID), payload (plain dict — the asyncpg JSONB codec
+    # encodes it; the writer no longer json.dumps it).
     assert len(insert_args) == 2
-    stored = json.loads(insert_args[1])
+    stored = insert_args[1]
+    assert isinstance(stored, dict)
     assert stored["schema_version"] == 1
     assert stored["capture"]["points_captured"] == 1000
     assert stored["uploads"]["longest_success_gap_s"] == 27.4

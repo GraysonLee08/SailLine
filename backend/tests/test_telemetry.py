@@ -578,7 +578,8 @@ def test_post_telemetry_emits_mark_pass(
     update_call = fake_conn.execute.await_args.args
     assert "UPDATE race_sessions" in update_call[0]
     assert "mark_passes" in update_call[0]
-    persisted = json.loads(update_call[1])
+    # Plain list to the ::jsonb param (codec encodes once) — not a string.
+    persisted = update_call[1]
     assert len(persisted) == 1
     assert persisted[0]["mark_index"] == 0
 

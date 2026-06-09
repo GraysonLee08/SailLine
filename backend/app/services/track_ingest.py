@@ -351,9 +351,13 @@ async def detect_and_persist_new_passes(
         "detector_state = $2::jsonb",
         "updated_at = NOW()",
     ]
+    # Pass plain Python objects to the ::jsonb params — the global asyncpg
+    # codec (app/db.py) json-encodes them exactly once. Do NOT json.dumps
+    # here or the value gets double-encoded into a JSON string of an array
+    # (the 2026-06-08 serialisation bug). None → SQL NULL.
     args: list = [
-        json.dumps(all_passes),
-        json.dumps(new_state) if new_state is not None else None,
+        all_passes,
+        new_state,
     ]
     if needs_started_at_write:
         args.append(start_at)
@@ -401,8 +405,10 @@ async def _persist_quiet_state(
         "detector_state = $1::jsonb",
         "updated_at = NOW()",
     ]
+    # Plain object to the ::jsonb param — the codec encodes once. None →
+    # SQL NULL. (No json.dumps — see detect_and_persist_new_passes.)
     args: list = [
-        json.dumps(new_detector_state) if new_detector_state is not None else None,
+        new_detector_state,
     ]
     if backfill_start_at is not None:
         args.append(backfill_start_at)
