@@ -7,7 +7,10 @@ a small stub :class:`SnapshotSource` to verify the orchestration:
 
 * Walks the fhour range, calling fetch_snapshot for each.
 * Stops cleanly on a 404 (cycle not fully published yet).
-* Raises if the FIRST fhour fails (cycle isn't published at all).
+* Skips (does not abort on) per-fhour non-404 failures — partial cycle
+  beats no cycle; consumers interpolate across manifest gaps.
+* Raises only when ZERO fhours land (cycle isn't published at all, or
+  every fetch failed).
 * Persists snapshots to Redis at the source's key.
 * Mirrors snapshots to any aliases the source declares per-fhour.
 * Uploads to the GCS archive at the source's path, with gzip encoding.
@@ -47,6 +50,7 @@ class _StubSource:
     first_snapshot_extras_call_count: int = 0
     raise_404_at: Optional[int] = None
     raise_500_at: Optional[int] = None
+    raise_value_error_at: Optional[int] = None
     aliases: dict[int, list[str]] = field(default_factory=dict)
     cycle_iso: str = "20260603T1200Z"
 
@@ -67,6 +71,8 @@ class _StubSource:
             raise urllib.error.HTTPError(
                 "url", 500, "Server Error", hdrs=None, fp=None,  # type: ignore[arg-type]
             )
+        if fhour == self.raise_value_error_at:
+            raise ValueError(f"parse failure at fhour {fhour}")
         return SnapshotResult(
             blob_gz=f"blob-fh{fhour}".encode(),
             cycle_iso=self.cycle_iso,
@@ -187,14 +193,52 @@ def test_run_cycle_raises_on_404_for_first_fhour():
         pipeline.run_cycle()
 
 
-def test_run_cycle_propagates_5xx_errors():
-    """5xx must not be silently treated as 'cycle not published'. The
-    fetch_snapshot's own retry policy gave up — we want loud failure."""
-    src = _StubSource(fhours=[0, 1], raise_500_at=1)
+def test_run_cycle_skips_fhour_on_5xx_and_continues():
+    """5xx mid-cycle (source's own retries already gave up): skip just
+    that fhour, keep walking, finalise the manifest without it. The
+    conus HRRR outage showed that aborting the cycle on one bad file
+    out of 19 nulls wind data for hours — partial beats none. Consumers
+    interpolate across the gap from the manifest's fhour list."""
+    src = _StubSource(fhours=[0, 1, 2], raise_500_at=1)
     redis_client = MagicMock()
     pipeline = CyclicalIngestPipeline(src, redis_client=redis_client, archive=None)
-    with pytest.raises(urllib.error.HTTPError):
+    manifest = pipeline.run_cycle()
+
+    # All fhours attempted; only the failed one is absent from the manifest.
+    assert src.fetched == [0, 1, 2]
+    assert manifest.fields["fhours"] == [0, 2]
+    # The skipped fhour was never persisted.
+    setex_keys = [c.args[0] for c in redis_client.setex.call_args_list]
+    assert "stub:20260603T1200Z:f001" not in setex_keys
+    assert "stub:20260603T1200Z:f000" in setex_keys
+    assert "stub:20260603T1200Z:f002" in setex_keys
+
+
+def test_run_cycle_skips_fhour_on_non_http_exception():
+    """Parse/serialisation failures get the same skip treatment as HTTP
+    errors — a corrupt GRIB for one fhour must not cost the cycle."""
+    src = _StubSource(fhours=[0, 1, 2], raise_value_error_at=0)
+    redis_client = MagicMock()
+    pipeline = CyclicalIngestPipeline(src, redis_client=redis_client, archive=None)
+    manifest = pipeline.run_cycle()
+
+    assert src.fetched == [0, 1, 2]
+    assert manifest.fields["fhours"] == [1, 2]
+    # First *successful* fhour drives the once-per-cycle extras hook.
+    assert src.first_snapshot_extras_call_count == 1
+
+
+def test_run_cycle_raises_when_every_fhour_fails():
+    """All-fail is the loud-failure case: no manifest, non-zero exit so
+    Scheduler retries on the next cadence."""
+    src = _StubSource(fhours=[0], raise_500_at=0)
+    redis_client = MagicMock()
+    pipeline = CyclicalIngestPipeline(src, redis_client=redis_client, archive=None)
+    with pytest.raises(RuntimeError, match="no fhours ingested"):
         pipeline.run_cycle()
+    # Nothing persisted, no manifest, no cycles-index touch.
+    redis_client.setex.assert_not_called()
+    redis_client.zadd.assert_not_called()
 
 
 # ─── Hooks ──────────────────────────────────────────────────────────────

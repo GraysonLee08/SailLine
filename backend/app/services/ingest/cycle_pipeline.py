@@ -6,7 +6,9 @@ based worker (WaveWatch III, ECMWF wind, SST, …) — share this dance:
 
     1. Walk the source's fhour range.
     2. Fetch each fhour. Stop on the first 404 (cycle not fully published
-       yet — keep what we have).
+       yet — keep what we have). Any OTHER failure skips just that fhour
+       and continues — one bad download out of 19 must not cost the
+       whole cycle.
     3. Per fhour:
         a. Persist the snapshot blob to Redis under the per-fhour key.
         b. Archive the same blob to GCS at the per-fhour object path.
@@ -282,11 +284,18 @@ class CyclicalIngestPipeline:
     def run_cycle(self) -> CycleManifest:
         """Ingest the full forecast sequence for the source's latest cycle.
 
-        Returns the :class:`CycleManifest` (fields + raw blob). Raises
-        :class:`RuntimeError` if the first fhour fails — that means
-        the cycle isn't published at all, which is a different signal
-        from "partially published" (the latter just stops the loop
-        and keeps what arrived).
+        Returns the :class:`CycleManifest` (fields + raw blob).
+
+        Failure policy per fhour:
+
+        * **404** — cycle not fully published yet. Stop the walk, keep
+          what arrived (NOAA publishes fhours incrementally).
+        * **Anything else** (5xx after the source's own retries,
+          connection drops, parse errors) — log and SKIP that fhour,
+          keep walking. Consumers interpolate across gaps from the
+          manifest's fhour list, so a partial cycle beats no cycle.
+        * **Zero fhours landed** — raise :class:`RuntimeError` so the
+          job exits non-zero and Scheduler retries on the next cadence.
         """
         fhours = self.source.fhour_range()
         log.info(
@@ -296,6 +305,7 @@ class CyclicalIngestPipeline:
 
         cycle_iso: Optional[str] = None
         valid_times: dict[int, str] = {}
+        skipped: list[int] = []
         first_persisted = False
 
         for fh in fhours:
@@ -308,7 +318,19 @@ class CyclicalIngestPipeline:
                         self.source.name, fh,
                     )
                     break
-                raise
+                log.warning(
+                    "[%s] fhour %s: HTTP %s — skipping this fhour",
+                    self.source.name, fh, e.code,
+                )
+                skipped.append(fh)
+                continue
+            except Exception as e:  # noqa: BLE001 — one fhour must not kill the cycle
+                log.warning(
+                    "[%s] fhour %s: %s: %s — skipping this fhour",
+                    self.source.name, fh, type(e).__name__, e,
+                )
+                skipped.append(fh)
+                continue
 
             cycle_iso = result.cycle_iso
             valid_times[fh] = result.valid_time_iso
@@ -327,6 +349,13 @@ class CyclicalIngestPipeline:
         if cycle_iso is None:
             raise RuntimeError(
                 f"[{self.source.name}] no fhours ingested — even the first failed"
+                + (f" (skipped after errors: {skipped})" if skipped else "")
+            )
+
+        if skipped:
+            log.warning(
+                "[%s] cycle completed with %s skipped fhour(s): %s",
+                self.source.name, len(skipped), skipped,
             )
 
         ordered_fhours = sorted(valid_times)

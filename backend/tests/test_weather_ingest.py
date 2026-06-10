@@ -2,7 +2,8 @@
 """Tests for the weather ingestion worker (rolling-forecast variant).
 
 Covers:
-  - URL builders for HRRR/GFS
+  - URL builders for HRRR/GFS — NODD S3 mirror primary, NOMADS fallback
+  - host fallback in _fetch_one (mirror fails → NOMADS tried)
   - .idx parsing + range extraction
   - retry behaviour (5xx retry, 404 fast-fail)
   - clip_and_serialize shape + empty-bbox guard
@@ -10,7 +11,10 @@ Covers:
   - per-region resolution propagation to the parser
   - single-fhour ingest() — per-fhour key + alias on default_fhour only
   - ingest_cycle() — full sequence write, manifest, cycles sorted set, 404 stop
-  - ingest_cycle() — 500/503 propagates, F00-only-404 raises RuntimeError
+  - ingest_cycle() — 500/503 skips the fhour (pipeline continues),
+    all-fhours-404 raises RuntimeError
+  - ingest_cycle() — (date, cycle) resolved once per run, not per fhour
+  - manifest reference_time derives from cycle_iso (F00 may be skipped)
   - Optional live NOAA smoke test, gated by SAILLINE_NOAA_SMOKE=1
 """
 from __future__ import annotations
@@ -33,7 +37,9 @@ from workers.weather_ingest import (
     clip_and_serialize,
     fetch_ranges,
     gfs_url,
+    gfs_url_nomads,
     hrrr_url,
+    hrrr_url_nomads,
     ingest,
     ingest_cycle,
     latest_cycle,
@@ -91,16 +97,40 @@ def _http_error(code: int) -> HTTPError:
 # ─── URL builders ────────────────────────────────────────────────────────
 
 
-def test_gfs_url_format():
+def test_gfs_url_is_nodd_mirror():
+    """Primary GFS host is the NODD S3 mirror — NOMADS throttling was
+    timing out the conus jobs."""
     url = gfs_url("20260429", 6, 12)
+    assert url.startswith("https://noaa-gfs-bdp-pds.s3.amazonaws.com/")
     assert url.endswith("gfs.t06z.pgrb2.0p25.f012")
     assert "/gfs.20260429/06/atmos/" in url
 
 
-def test_hrrr_url_format():
+def test_gfs_url_nomads_fallback_format():
+    url = gfs_url_nomads("20260429", 6, 12)
+    assert url.startswith("https://nomads.ncep.noaa.gov/")
+    assert url.endswith("gfs.t06z.pgrb2.0p25.f012")
+    assert "/gfs.20260429/06/atmos/" in url
+
+
+def test_hrrr_url_is_nodd_mirror():
     url = hrrr_url("20260429", 12, 1)
+    assert url.startswith("https://noaa-hrrr-bdp-pds.s3.amazonaws.com/")
     assert url.endswith("hrrr.t12z.wrfsfcf01.grib2")
     assert "/hrrr.20260429/conus/" in url
+
+
+def test_hrrr_url_nomads_fallback_format():
+    url = hrrr_url_nomads("20260429", 12, 1)
+    assert url.startswith("https://nomads.ncep.noaa.gov/")
+    assert url.endswith("hrrr.t12z.wrfsfcf01.grib2")
+    assert "/hrrr.20260429/conus/" in url
+
+
+def test_sources_try_mirror_before_nomads():
+    """url_fns order IS the fallback order — mirror first."""
+    assert SOURCES["hrrr"].url_fns == (hrrr_url, hrrr_url_nomads)
+    assert SOURCES["gfs"].url_fns == (gfs_url, gfs_url_nomads)
 
 
 # ─── latest_cycle math ───────────────────────────────────────────────────
@@ -167,6 +197,58 @@ def test_fetch_ranges_gives_up_after_max_attempts(mock_urlopen, _mock_sleep):
         fetch_ranges("http://x/y.idx", WIND_FIELDS)
     assert exc.value.code == 503
     assert mock_urlopen.call_count == 3
+
+
+# ─── Host fallback (mirror → NOMADS) ────────────────────────────────────
+
+
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_fetch_one_falls_back_to_nomads_when_mirror_fails(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+):
+    """A network failure on the NODD mirror moves on to NOMADS for the
+    same fhour — host order comes from Source.url_fns."""
+    mock_latest.return_value = ("20260429", 12)
+
+    idx_urls: list[str] = []
+
+    def _fetch_side_effect(idx_url, fields):
+        idx_urls.append(idx_url)
+        if len(idx_urls) == 1:
+            raise urllib.error.URLError("mirror unreachable")
+        return [(0, 999)]
+    mock_fetch.side_effect = _fetch_side_effect
+    mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
+
+    ingest("hrrr", region_name="conus", fhour=1, dry_run=True)
+
+    assert idx_urls[0].startswith("https://noaa-hrrr-bdp-pds.s3.amazonaws.com/")
+    assert idx_urls[1].startswith("https://nomads.ncep.noaa.gov/")
+    assert idx_urls[0].endswith(".grib2.idx")
+    assert idx_urls[1].endswith(".grib2.idx")
+
+
+@patch("workers.weather_ingest.time.sleep")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_fetch_one_404_tries_both_hosts_then_raises_404(
+    mock_latest, mock_fetch, mock_download, mock_parse, _mock_sleep,
+):
+    """404 also falls through to the next host (the mirror can lag
+    publication by minutes), but when EVERY host 404s the original 404
+    propagates so the pipeline's 'not yet published' branch still fires."""
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.side_effect = _http_error(404)
+
+    with pytest.raises(HTTPError) as exc:
+        ingest("hrrr", region_name="conus", fhour=1, dry_run=True)
+    assert exc.value.code == 404
+    assert mock_fetch.call_count == 2  # mirror, then NOMADS
 
 
 # ─── clip + serialize ───────────────────────────────────────────────────
@@ -480,7 +562,7 @@ def test_ingest_cycle_stops_on_404_and_writes_partial_manifest(
     assert "weather:hrrr:conus:20260429T1200Z:manifest" in setex_keys
 
 
-# --- NEW: non-404 errors should propagate, not graceful-stop ---
+# --- non-404 errors skip the fhour; the cycle survives ---
 
 
 @patch("workers.weather_ingest.time.sleep")  # collapse retry backoff
@@ -490,42 +572,102 @@ def test_ingest_cycle_stops_on_404_and_writes_partial_manifest(
 @patch("workers.weather_ingest.download_grib")
 @patch("workers.weather_ingest.fetch_ranges")
 @patch("workers.weather_ingest.latest_cycle")
-def test_ingest_cycle_propagates_non_404_http_errors(
+def test_ingest_cycle_skips_fhours_on_5xx_and_finalises_manifest(
     mock_latest, mock_fetch, mock_download, mock_parse,
     mock_redis_cls, mock_storage_cls, _mock_sleep, monkeypatch,
 ):
-    """500/503 mid-cycle should crash the job — Cloud Run will retry the run.
-
-    Only 404 ("not yet published") triggers the graceful-stop branch.
-    Other HTTP errors mean something's actually broken (NOAA partial outage,
-    our URL pattern wrong, network issue) and we want a loud failure rather
-    than a half-cycle manifest that downstream consumers will trust.
+    """5xx mid-cycle (after fetch_ranges' own 3 retries AND the NOMADS
+    host fallback) skips just that fhour. The manifest is finalised with
+    the fhours that landed — the conus outage showed that one bad file
+    out of 19 must not null wind data for the whole cycle. The loader
+    interpolates across manifest gaps.
 
     Companion to test_ingest_cycle_stops_on_404_and_writes_partial_manifest —
-    together they pin both branches of the except clause in ingest_cycle().
+    together they pin both error branches of the pipeline walk.
     """
     monkeypatch.setenv("REDIS_HOST", "fake-redis")
     monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
 
     mock_latest.return_value = ("20260429", 12)
 
-    # First 3 fhours succeed, fourth returns 500 (which fetch_ranges
-    # will retry 3x then re-raise per the retry contract).
-    def _fetch_side_effect(*args, **kwargs):
-        _fetch_side_effect.calls += 1
-        if _fetch_side_effect.calls > 3:
+    # Key the failure off the fhour in the URL (each failing fhour hits
+    # BOTH hosts via the fallback, so a call counter would be ambiguous).
+    def _fetch_side_effect(idx_url, fields):
+        fh = int(idx_url.split("wrfsfcf")[1][:2])
+        if fh in (3, 7):
             raise _http_error(500)
         return [(0, 999)]
-    _fetch_side_effect.calls = 0
     mock_fetch.side_effect = _fetch_side_effect
 
+    mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
+    mock_redis_inst = MagicMock()
+    mock_redis_cls.return_value = mock_redis_inst
+    mock_storage_cls.return_value.bucket.return_value = MagicMock()
+
+    manifest = ingest_cycle("hrrr", region_name="conus", dry_run=False)
+
+    expected = [fh for fh in range(0, 19) if fh not in (3, 7)]
+    assert manifest["fhours"] == expected
+    setex_keys = [c.args[0] for c in mock_redis_inst.setex.call_args_list]
+    assert "weather:hrrr:conus:20260429T1200Z:manifest" in setex_keys
+    assert "weather:hrrr:conus:20260429T1200Z:f003" not in setex_keys
+    assert "weather:hrrr:conus:20260429T1200Z:f004" in setex_keys
+
+
+@patch("workers.weather_ingest.storage.Client")
+@patch("workers.weather_ingest.redis.Redis")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_cycle_resolves_cycle_once_per_run(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+    mock_redis_cls, mock_storage_cls, monkeypatch,
+):
+    """(date, cycle) is pinned at the first fetch — recomputing it per
+    fhour let a slow run flip cycles at an hour boundary and mix two
+    cycles into one manifest."""
+    monkeypatch.setenv("REDIS_HOST", "fake-redis")
+    monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
+
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.return_value = [(0, 999)]
     mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
     mock_redis_cls.return_value = MagicMock()
     mock_storage_cls.return_value.bucket.return_value = MagicMock()
 
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        ingest_cycle("hrrr", region_name="conus", dry_run=False)
-    assert exc.value.code == 500
+    ingest_cycle("hrrr", region_name="conus", dry_run=False)
+
+    assert mock_latest.call_count == 1
+
+
+@patch("workers.weather_ingest.storage.Client")
+@patch("workers.weather_ingest.redis.Redis")
+@patch("workers.weather_ingest.parse_grib_to_wind_grid")
+@patch("workers.weather_ingest.download_grib")
+@patch("workers.weather_ingest.fetch_ranges")
+@patch("workers.weather_ingest.latest_cycle")
+def test_ingest_cycle_manifest_reference_time_derives_from_cycle(
+    mock_latest, mock_fetch, mock_download, mock_parse,
+    mock_redis_cls, mock_storage_cls, monkeypatch,
+):
+    """reference_time comes from cycle_iso, not valid_times[0] — with
+    skip-and-continue F00 may be absent, and the first available fhour's
+    valid_time is not the cycle reference."""
+    monkeypatch.setenv("REDIS_HOST", "fake-redis")
+    monkeypatch.setenv("GCS_WEATHER_BUCKET", "fake-bucket")
+
+    mock_latest.return_value = ("20260429", 12)
+    mock_fetch.return_value = [(0, 999)]
+    # Synthetic grid: reference 12:00Z, valid_time 13:00Z for every fhour.
+    mock_parse.return_value = _synthetic_grid_conus(source="hrrr", ref_hour=12)
+    mock_redis_cls.return_value = MagicMock()
+    mock_storage_cls.return_value.bucket.return_value = MagicMock()
+
+    manifest = ingest_cycle("hrrr", region_name="conus", dry_run=False)
+
+    assert manifest["cycle"] == "20260429T1200Z"
+    assert manifest["reference_time"] == "2026-04-29T12:00:00+00:00"
 
 
 # --- NEW: F00 missing must raise, not silently publish an empty cycle ---

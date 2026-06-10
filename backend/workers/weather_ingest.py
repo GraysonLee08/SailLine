@@ -5,6 +5,13 @@ ingests the full forecast sequence for the latest cycle (HRRR F00-F18,
 GFS F000-F120 at 3h step) and writes per-fhour keys to Redis + GCS.
 Local: --dry-run writes JSON to ./ingest_output/ instead.
 
+Downloads are mirror-first: NOAA's NODD S3 buckets (noaa-hrrr-bdp-pds /
+noaa-gfs-bdp-pds) serve the same files + .idx as NOMADS with no
+rate-limiting — NOMADS throttling was timing out the conus jobs at the
+1200 s Cloud Run task limit. NOMADS remains the ordered fallback per
+fhour; a 404 on the mirror also falls through to NOMADS because the
+mirror can lag publication by a few minutes.
+
 After Phase 4 of the architecture review, the per-cycle orchestration
 (fhour walk → Redis → GCS → manifest → cycles index) lives in
 ``app.services.ingest.cycle_pipeline.CyclicalIngestPipeline``. This
@@ -63,25 +70,47 @@ WIND_FIELDS = (":UGRD:10 m above ground:", ":VGRD:10 m above ground:")
 # ---------------------------------------------------------------------------
 # Source configuration
 
+# NOAA Open Data Dissemination (NODD) S3 mirrors. Same directory layout
+# and .idx sidecars as NOMADS, no rate-limiting, and NOAA explicitly
+# directs high-volume consumers here. Primary download host.
+NODD_HRRR_BASE = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
+NODD_GFS_BASE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+# NOMADS: heavily throttled, kept as ordered fallback only.
+NOMADS_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com"
+
+
+def gfs_path(date: str, cycle: int, fhour: int) -> str:
+    return f"gfs.{date}/{cycle:02d}/atmos/gfs.t{cycle:02d}z.pgrb2.0p25.f{fhour:03d}"
+
+
+def hrrr_path(date: str, cycle: int, fhour: int) -> str:
+    return f"hrrr.{date}/conus/hrrr.t{cycle:02d}z.wrfsfcf{fhour:02d}.grib2"
+
 
 def gfs_url(date: str, cycle: int, fhour: int) -> str:
-    return (
-        f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/"
-        f"gfs.{date}/{cycle:02d}/atmos/gfs.t{cycle:02d}z.pgrb2.0p25.f{fhour:03d}"
-    )
+    """Primary (NODD S3 mirror) GFS URL."""
+    return f"{NODD_GFS_BASE}/{gfs_path(date, cycle, fhour)}"
+
+
+def gfs_url_nomads(date: str, cycle: int, fhour: int) -> str:
+    """Fallback NOMADS GFS URL."""
+    return f"{NOMADS_BASE}/gfs/prod/{gfs_path(date, cycle, fhour)}"
 
 
 def hrrr_url(date: str, cycle: int, fhour: int) -> str:
-    return (
-        f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod/"
-        f"hrrr.{date}/conus/hrrr.t{cycle:02d}z.wrfsfcf{fhour:02d}.grib2"
-    )
+    """Primary (NODD S3 mirror) HRRR URL."""
+    return f"{NODD_HRRR_BASE}/{hrrr_path(date, cycle, fhour)}"
+
+
+def hrrr_url_nomads(date: str, cycle: int, fhour: int) -> str:
+    """Fallback NOMADS HRRR URL."""
+    return f"{NOMADS_BASE}/hrrr/prod/{hrrr_path(date, cycle, fhour)}"
 
 
 @dataclass(frozen=True)
 class Source:
     name: str
-    url_fn: Callable[[str, int, int], str]
+    url_fns: tuple[Callable[[str, int, int], str], ...]  # tried in order per fhour
     cycle_step_hours: int
     publish_lag_hours: int
     default_fhour: int           # the fhour written to `:latest` for backwards compat
@@ -97,14 +126,14 @@ class Source:
 SOURCES: dict[str, Source] = {
     # HRRR: F00-F18 hourly. 19 files per cycle.
     "hrrr": Source(
-        "hrrr", hrrr_url, 1, 2, 1,
+        "hrrr", (hrrr_url, hrrr_url_nomads), 1, 2, 1,
         cache_ttl_seconds=2 * 3600,    # cycle TTL longer than cycle interval
         fhour_min=0, fhour_max=18, fhour_step=1,
     ),
     # GFS: F000-F120 every 3h. 41 files per cycle. Plenty for Mac-length races.
     # Past 120h GFS shifts to 3h native anyway and is rarely worth the bandwidth.
     "gfs":  Source(
-        "gfs", gfs_url, 6, 5, 6,
+        "gfs", (gfs_url, gfs_url_nomads), 6, 5, 6,
         cache_ttl_seconds=12 * 3600,
         fhour_min=0, fhour_max=120, fhour_step=3,
     ),
@@ -209,15 +238,13 @@ def clip_and_serialize(grid, bbox: tuple[float, float, float, float]) -> dict:
 # Fetch one fhour — used by both single-fhour ``ingest()`` and the pipeline
 
 
-def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes, str]:
-    """Download + parse + serialize one fhour. Returns (payload, gzip blob, cycle_iso)."""
-    bbox = region.bbox
-    target_resolution = region.resolution_for(source.name)
-    date, cycle = latest_cycle(source)
-    grib_url = source.url_fn(date, cycle, fhour)
-    tag = f"{source.name}/{region.name}@{target_resolution}° f{fhour:03d}"
-    print(f"[{tag}] cycle={date} {cycle:02d}Z", flush=True)
-
+def _fetch_via(
+    grib_url: str,
+    source: Source,
+    region: Region,
+    target_resolution: float,
+) -> tuple[dict, bytes, str]:
+    """Download + parse + serialize one fhour from one host."""
     ranges = fetch_ranges(f"{grib_url}.idx", WIND_FIELDS)
     if not ranges:
         raise RuntimeError(f"No matching wind fields in {grib_url}.idx")
@@ -230,7 +257,7 @@ def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes,
         grid = parse_grib_to_wind_grid(
             tmp_path,
             source=source.name,
-            target_bbox=bbox,
+            target_bbox=region.bbox,
             target_resolution_deg=target_resolution,
         )
     finally:
@@ -239,11 +266,52 @@ def _fetch_one(source: Source, region: Region, fhour: int) -> tuple[dict, bytes,
         except PermissionError:
             pass
 
-    payload = clip_and_serialize(grid, bbox)
+    payload = clip_and_serialize(grid, region.bbox)
     payload_json = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_gz = gzip.compress(payload_json)
     cycle_iso = grid.reference_time.strftime("%Y%m%dT%H%MZ")
     return payload, payload_gz, cycle_iso
+
+
+def _fetch_one(
+    source: Source,
+    region: Region,
+    fhour: int,
+    date: str,
+    cycle: int,
+) -> tuple[dict, bytes, str]:
+    """Fetch one fhour, trying each of the source's hosts in order.
+
+    The (date, cycle) pair is resolved ONCE by the caller and threaded
+    through — recomputing it per fhour let a slow run flip cycles at an
+    hour boundary and mix two cycles into one manifest.
+
+    Fallback policy: network-class failures (URLError incl. HTTPError,
+    TimeoutError) on one host move on to the next. A 404 also falls
+    through — the NODD mirror can lag NOMADS by a few minutes near
+    publication. Only when EVERY host fails does the last error
+    propagate, so a 404 from all hosts still reaches the pipeline's
+    "cycle not fully published" branch intact.
+    """
+    target_resolution = region.resolution_for(source.name)
+    tag = f"{source.name}/{region.name}@{target_resolution}° f{fhour:03d}"
+    print(f"[{tag}] cycle={date} {cycle:02d}Z", flush=True)
+
+    last_err: Exception | None = None
+    for url_fn in source.url_fns:
+        grib_url = url_fn(date, cycle, fhour)
+        try:
+            return _fetch_via(grib_url, source, region, target_resolution)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            print(f"[{tag}] HTTP {e.code} from {grib_url} — trying next host",
+                  flush=True)
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            print(f"[{tag}] {type(e).__name__} from {grib_url} — trying next host",
+                  flush=True)
+    assert last_err is not None  # source.url_fns is never empty
+    raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -258,9 +326,14 @@ class WeatherSnapshotSource:
     :class:`~app.services.ingest.SnapshotSource` Protocol so the
     pipeline can drive a full-cycle ingest without knowing about
     GRIB or NOMADS.
+
+    The (date, cycle) pair is resolved lazily on the first fetch and
+    pinned for the lifetime of the adapter — one pipeline run ingests
+    exactly one cycle, even if it straddles an hour boundary.
     """
     source: Source
     region: Region
+    _pinned_cycle: Optional[tuple[str, int]] = None
 
     @property
     def name(self) -> str:
@@ -277,8 +350,16 @@ class WeatherSnapshotSource:
     def fhour_range(self) -> list[int]:
         return self.source.fhour_range()
 
+    def _cycle(self) -> tuple[str, int]:
+        if self._pinned_cycle is None:
+            self._pinned_cycle = latest_cycle(self.source)
+        return self._pinned_cycle
+
     def fetch_snapshot(self, fhour: int) -> SnapshotResult:
-        payload, payload_gz, cycle_iso = _fetch_one(self.source, self.region, fhour)
+        date, cycle = self._cycle()
+        payload, payload_gz, cycle_iso = _fetch_one(
+            self.source, self.region, fhour, date, cycle,
+        )
         return SnapshotResult(
             blob_gz=payload_gz,
             cycle_iso=cycle_iso,
@@ -320,11 +401,19 @@ class WeatherSnapshotSource:
     def build_manifest_fields(
         self, *, cycle_iso: str, fhours: list[int], valid_times: list[str],
     ) -> dict:
+        # reference_time derives from the cycle itself, NOT valid_times[0]:
+        # with skip-and-continue in the pipeline, F00 may be absent and the
+        # first available fhour's valid_time is not the cycle reference.
+        reference_time = (
+            datetime.strptime(cycle_iso, "%Y%m%dT%H%MZ")
+            .replace(tzinfo=timezone.utc)
+            .isoformat()
+        )
         return {
             "source": self.source.name,
             "region": self.region.name,
             "cycle": cycle_iso,
-            "reference_time": valid_times[0] if valid_times else None,  # F00 == cycle ref
+            "reference_time": reference_time,
             "fhours": fhours,
             "valid_times": valid_times,
         }
@@ -389,7 +478,8 @@ def ingest(
     if fhour is None:
         fhour = source.default_fhour
 
-    payload, payload_gz, cycle_iso = _fetch_one(source, region, fhour)
+    date, cycle = latest_cycle(source)
+    payload, payload_gz, cycle_iso = _fetch_one(source, region, fhour, date, cycle)
 
     if dry_run:
         out_dir = Path(__file__).parent.parent / "ingest_output"
@@ -426,9 +516,9 @@ def ingest_cycle(
     """Ingest the FULL forecast sequence for the latest cycle.
 
     Delegates to :class:`CyclicalIngestPipeline`. The orchestration
-    (fhour walk, 404 stop, manifest write, cycles index update) lives
-    there; this function only chooses the source/region and wires the
-    Redis client + archive.
+    (fhour walk, 404 stop, skip-and-continue on transient errors,
+    manifest write, cycles index update) lives there; this function
+    only chooses the source/region and wires the Redis client + archive.
 
     Returns the manifest dict so existing tests keep working.
     """
