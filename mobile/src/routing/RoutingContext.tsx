@@ -21,6 +21,12 @@
 // accept() is wired internally: the SSE accept handler feeds the alternative
 // Feature straight into useRouting.applyAlternative, so consumers just call
 // acceptAlternative() and read the updated `route`.
+//
+// Auto-compute on race select (step "2.5", 2026-06-11): when the selected
+// race changes to a pre-race candidate (>= 2 marks, not finished), the
+// route computes itself in quiet mode — failures log but never surface
+// error UI; the 425 forecast-pending state still shows (the sheet renders
+// it as a friendly message, and the manual Compute button stays available).
 
 import {
   createContext,
@@ -28,6 +34,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
 } from "react";
 import type { ReactNode } from "react";
 
@@ -35,6 +42,7 @@ import { useRecorder } from "../recorder/RecorderContext";
 import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
 import type { AlternativePayload } from "../hooks/useRouteNotifications";
+import type { ComputeOptions } from "../hooks/useRouting";
 import type { RouteFeature, RouteMeta } from "../api/routing";
 
 type Pending = {
@@ -50,7 +58,7 @@ type RoutingCtx = {
   pending: Pending | null;
   loading: boolean;
   error: string | null;
-  compute: () => Promise<void>;
+  compute: (opts?: ComputeOptions) => Promise<void>;
   clear: () => void;
   // ── better-route SSE (/api/routing/notifications/{raceId}) ──
   alternative: AlternativePayload | null;
@@ -70,15 +78,35 @@ export function RoutingProvider({ children }: { children: ReactNode }) {
   const routing = useRouting(raceId);
   const notifications = useRouteNotifications(raceId);
 
+  // The auto-compute effect below must key on raceId, not the race object:
+  // a list refresh can replace the object with an identical race, and
+  // refiring on identity change would clear (and needlessly recompute) a
+  // plan the user is looking at. The ref gives the effect the current
+  // race fields without adding the object to its dependency array.
+  const selectedRaceRef = useRef(selectedRace);
+  selectedRaceRef.current = selectedRace;
+
   // Clear any stale route when the selected race changes so a newly picked
-  // race never briefly shows the previous race's polyline. Navigation
-  // between Home and Recording does NOT change raceId (both read the same
-  // selectedRace from RecorderContext), so the computed plan is preserved
-  // across that transition — only an actual race switch clears it.
-  const { clear } = routing;
+  // race never briefly shows the previous race's polyline, then quietly
+  // auto-compute for the new race. Navigation between Home and Recording
+  // does NOT change raceId (both read the same selectedRace from
+  // RecorderContext), so the computed plan is preserved across that
+  // transition — only an actual race switch clears and recomputes.
+  //
+  // Skips:
+  //   * no race selected (clear only),
+  //   * finished races (ended_at set — those open the Review screen),
+  //   * races with < 2 marks (the backend would 400 with "at least
+  //     2 marks"; skipping avoids a guaranteed-failure request).
+  const { clear, compute } = routing;
   useEffect(() => {
     clear();
-  }, [raceId, clear]);
+    if (!raceId) return;
+    const race = selectedRaceRef.current;
+    if (!race || race.ended_at) return;
+    if (!Array.isArray(race.marks) || race.marks.length < 2) return;
+    void compute({ quiet: true });
+  }, [raceId, clear, compute]);
 
   // Bridge SSE -> routing state: applying an alternative rehydrates meta from
   // the Feature's properties (see useRouting.applyAlternative).

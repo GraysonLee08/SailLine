@@ -5,6 +5,10 @@
 //   - applyAlternative receives the SSE payload's `route` Feature directly
 //     and rehydrates meta from its properties — matches the web version's
 //     contract so the same backend payload format works in both clients.
+//   - compute() accepts { quiet: true } for auto-triggered runs (route
+//     auto-compute on race select, 2026-06-11): failures log to console
+//     but never set the user-facing error state. The 425 pending state is
+//     still surfaced in quiet mode — it's informative, not an error.
 
 import { useCallback, useState } from "react";
 
@@ -20,6 +24,18 @@ type Pending = {
   hoursUntilAvailable: number;
 };
 
+export type ComputeOptions = {
+  /**
+   * Suppress the user-facing error state on failure. Used by the
+   * auto-compute-on-select path so a race with a bad course or an
+   * unavailable forecast fails silently; the manual Compute button
+   * stays loud. Must be exactly `true` to engage — RN Pressable
+   * handlers pass a press-event object as the first arg, and we don't
+   * want that to accidentally read as quiet mode.
+   */
+  quiet?: boolean;
+};
+
 export function useRouting(raceId: string | null) {
   const [route, setRoute] = useState<RouteFeature | null>(null);
   const [meta, setMeta] = useState<RouteMeta | null>(null);
@@ -27,39 +43,43 @@ export function useRouting(raceId: string | null) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const compute = useCallback(async () => {
-    if (!raceId) {
-      setError("No active race");
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    setPending(null);
-    try {
-      const result = await computeRoute(raceId);
-      if (result.kind === "pending") {
-        setPending({
-          detail: result.detail,
-          availableAt: result.availableAt,
-          hoursUntilAvailable: result.hoursUntilAvailable,
-        });
+  const compute = useCallback(
+    async (opts?: ComputeOptions) => {
+      const quiet = opts?.quiet === true;
+      if (!raceId) {
+        if (!quiet) setError("No active race");
+        return;
+      }
+      setLoading(true);
+      setError(null);
+      setPending(null);
+      try {
+        const result = await computeRoute(raceId);
+        if (result.kind === "pending") {
+          setPending({
+            detail: result.detail,
+            availableAt: result.availableAt,
+            hoursUntilAvailable: result.hoursUntilAvailable,
+          });
+          setRoute(null);
+          setMeta(null);
+        } else {
+          setRoute(result.route);
+          setMeta(result.meta);
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        // eslint-disable-next-line no-console
+        console.error("[useRouting] compute failed:", msg);
+        if (!quiet) setError(msg);
         setRoute(null);
         setMeta(null);
-      } else {
-        setRoute(result.route);
-        setMeta(result.meta);
+      } finally {
+        setLoading(false);
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // eslint-disable-next-line no-console
-      console.error("[useRouting] compute failed:", msg);
-      setError(msg);
-      setRoute(null);
-      setMeta(null);
-    } finally {
-      setLoading(false);
-    }
-  }, [raceId]);
+    },
+    [raceId],
+  );
 
   const clear = useCallback(() => {
     setRoute(null);
