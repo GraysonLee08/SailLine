@@ -3,6 +3,27 @@
 GFS arrives on a regular grid (1D lat/lon coords) and is used as-is.
 HRRR arrives on a Lambert Conformal Conic grid (2D coords) and is
 regridded here so all downstream consumers see the same shape.
+
+Regridding performance
+----------------------
+``scipy.interpolate.griddata`` rebuilds a Delaunay triangulation of the
+source points on EVERY call — ~1.9M points for conus HRRR, twice per
+fhour (u, v) plus nearest-neighbour passes for NaN fill. That cost made
+the conus ingest job CPU-bound at ~60 s/fhour and pushed full-cycle runs
+into the Cloud Run task timeout.
+
+The source LCC grid is identical in every HRRR file and the target grid
+is fixed per (region, resolution), so the geometry work is done ONCE per
+process and cached: triangulate, locate each target point's simplex,
+precompute barycentric weights, and precompute nearest-source indices
+for points outside the convex hull. Per fhour, regridding is then a
+pure-numpy gather + weighted sum (sub-second). The numerics are the
+same linear barycentric interpolation + nearest fill ``griddata``
+performs — outputs are equivalent, no ENGINE_VERSION implications.
+
+Only the small index/weight arrays are retained (a few MB); the
+Delaunay object and KD-tree are released after the build, so steady-
+state memory matches the old per-call approach.
 """
 from __future__ import annotations
 
@@ -102,21 +123,47 @@ def parse_grib_to_wind_grid(
     )
 
 
-def _regrid_curvilinear(
+# ---------------------------------------------------------------------------
+# Curvilinear regridding — precomputed, cached per (grid, bbox, resolution)
+
+
+@dataclass(frozen=True)
+class _CurvilinearRegridder:
+    """Precomputed interpolation from one fixed curvilinear grid onto one
+    fixed regular target grid.
+
+    ``regrid(values)`` performs the same linear barycentric interpolation
+    (inside the source convex hull) + nearest-neighbour fill (outside)
+    that ``scipy.interpolate.griddata`` would, but with all geometry —
+    triangulation, point location, weights, nearest indices — done once
+    at build time. Per call it's a numpy gather + weighted sum.
+    """
+    tgt_lats: np.ndarray          # 1D float64
+    tgt_lons: np.ndarray          # 1D float64
+    src_idx: np.ndarray           # flat indices into the source arrays (bbox clip)
+    vertices: np.ndarray          # (n_inside, 3) int32 — into clipped source values
+    weights: np.ndarray           # (n_inside, 3) float64 — barycentric
+    inside: np.ndarray            # (n_tgt,) bool — target pts inside convex hull
+    nearest_idx: np.ndarray       # (n_outside,) — into clipped source values
+    out_shape: tuple[int, int]    # (len(tgt_lats), len(tgt_lons))
+
+    def regrid(self, values: np.ndarray) -> np.ndarray:
+        vals = np.asarray(values, dtype=np.float64).ravel()[self.src_idx]
+        out = np.empty(self.inside.shape[0], dtype=np.float64)
+        out[self.inside] = np.einsum(
+            "nj,nj->n", vals[self.vertices], self.weights,
+        )
+        out[~self.inside] = vals[self.nearest_idx]
+        return out.reshape(self.out_shape).astype(np.float32)
+
+
+def _build_regridder(
     src_lats: np.ndarray,
     src_lons: np.ndarray,
-    src_u: np.ndarray,
-    src_v: np.ndarray,
     bbox: tuple[float, float, float, float],
     resolution: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Resample HRRR/LCC wind onto a regular lat/lon grid.
-
-    1. Clip source cells to bbox + buffer (keeps interpolation cheap)
-    2. Linear interp onto the target grid
-    3. Fill any NaN (outside convex hull) with nearest-neighbor
-    """
-    from scipy.interpolate import griddata  # lazy: heavy import
+) -> _CurvilinearRegridder:
+    from scipy.spatial import Delaunay, cKDTree  # lazy: heavy import
 
     min_lat, max_lat, min_lon, max_lon = bbox
     buffer = 0.5  # degrees; ensures interp has data on bbox edges
@@ -128,35 +175,95 @@ def _regrid_curvilinear(
     if not in_bbox.any():
         raise ValueError(f"bbox {bbox} doesn't overlap source grid")
 
-    pts = np.column_stack([src_lons[in_bbox], src_lats[in_bbox]])
-    u_flat = src_u[in_bbox]
-    v_flat = src_v[in_bbox]
+    src_idx = np.flatnonzero(in_bbox.ravel())
+    pts = np.column_stack([src_lons.ravel()[src_idx], src_lats.ravel()[src_idx]])
 
     tgt_lats = np.arange(min_lat, max_lat + resolution / 2, resolution)
     tgt_lons = np.arange(min_lon, max_lon + resolution / 2, resolution)
     tgt_lon_mesh, tgt_lat_mesh = np.meshgrid(tgt_lons, tgt_lats)
     tgt_pts = np.column_stack([tgt_lon_mesh.ravel(), tgt_lat_mesh.ravel()])
 
-    u_grid = griddata(pts, u_flat, tgt_pts, method="linear")
-    v_grid = griddata(pts, v_flat, tgt_pts, method="linear")
+    # One-time geometry: triangulate, locate, weight. This is the work
+    # griddata used to redo on every call.
+    tri = Delaunay(pts)
+    simplex = tri.find_simplex(tgt_pts)
+    inside = simplex >= 0
 
-    # Fill any NaNs at convex-hull edges with nearest-neighbor
-    if np.isnan(u_grid).any():
-        u_grid = np.where(
-            np.isnan(u_grid),
-            griddata(pts, u_flat, tgt_pts, method="nearest"),
-            u_grid,
-        )
-    if np.isnan(v_grid).any():
-        v_grid = np.where(
-            np.isnan(v_grid),
-            griddata(pts, v_flat, tgt_pts, method="nearest"),
-            v_grid,
-        )
+    trans = tri.transform[simplex[inside]]            # (n_in, 3, 2)
+    delta = tgt_pts[inside] - trans[:, 2]             # (n_in, 2)
+    bary = np.einsum("nij,nj->ni", trans[:, :2, :], delta)
+    weights = np.column_stack([bary, 1.0 - bary.sum(axis=1)])
+    vertices = tri.simplices[simplex[inside]].astype(np.int32)
 
-    u_grid = u_grid.reshape(tgt_lat_mesh.shape).astype(np.float32)
-    v_grid = v_grid.reshape(tgt_lat_mesh.shape).astype(np.float32)
-    return tgt_lats.astype(np.float64), tgt_lons.astype(np.float64), u_grid, v_grid
+    # Degenerate simplices yield non-finite transforms; route those target
+    # points through the nearest-neighbour path so outputs stay finite.
+    bad = ~np.isfinite(weights).all(axis=1)
+    if bad.any():
+        inside_idx = np.flatnonzero(inside)
+        inside[inside_idx[bad]] = False
+        weights = weights[~bad]
+        vertices = vertices[~bad]
+
+    tree = cKDTree(pts)
+    _, nearest_idx = tree.query(tgt_pts[~inside])
+
+    # tri and tree go out of scope here — only the small index/weight
+    # arrays are retained in the cache.
+    return _CurvilinearRegridder(
+        tgt_lats=tgt_lats.astype(np.float64),
+        tgt_lons=tgt_lons.astype(np.float64),
+        src_idx=src_idx,
+        vertices=vertices,
+        weights=weights,
+        inside=inside,
+        nearest_idx=nearest_idx,
+        out_shape=tgt_lat_mesh.shape,
+    )
+
+
+def _grid_fingerprint(src_lats: np.ndarray, src_lons: np.ndarray) -> tuple:
+    """Cheap identity for a curvilinear grid: shape + corner/center coords.
+
+    HRRR's LCC grid is byte-identical across files/cycles; comparing the
+    full 1.9M-point arrays per call would defeat the point of caching.
+    """
+    i, j = src_lats.shape[0] // 2, src_lats.shape[1] // 2
+    return (
+        src_lats.shape,
+        round(float(src_lats[0, 0]), 6), round(float(src_lons[0, 0]), 6),
+        round(float(src_lats[-1, -1]), 6), round(float(src_lons[-1, -1]), 6),
+        round(float(src_lats[i, j]), 6), round(float(src_lons[i, j]), 6),
+    )
+
+
+# One worker process ingests one (source, region) pair, so this holds at
+# most a couple of entries. Module-level so all fhours of a cycle share it.
+_REGRIDDER_CACHE: dict[tuple, _CurvilinearRegridder] = {}
+
+
+def _regrid_curvilinear(
+    src_lats: np.ndarray,
+    src_lons: np.ndarray,
+    src_u: np.ndarray,
+    src_v: np.ndarray,
+    bbox: tuple[float, float, float, float],
+    resolution: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Resample HRRR/LCC wind onto a regular lat/lon grid.
+
+    Geometry (clip → triangulate → locate → weights → nearest-fill
+    indices) is built once per (grid, bbox, resolution) and cached;
+    per-call work is two numpy weighted gathers.
+    """
+    key = (_grid_fingerprint(src_lats, src_lons), bbox, float(resolution))
+    regridder = _REGRIDDER_CACHE.get(key)
+    if regridder is None:
+        regridder = _build_regridder(src_lats, src_lons, bbox, resolution)
+        _REGRIDDER_CACHE[key] = regridder
+
+    u_grid = regridder.regrid(src_u)
+    v_grid = regridder.regrid(src_v)
+    return regridder.tgt_lats, regridder.tgt_lons, u_grid, v_grid
 
 
 def _to_datetime(np_dt) -> datetime:
