@@ -23,6 +23,7 @@ Lifecycle:
 """
 from __future__ import annotations
 
+import json
 import logging
 from uuid import UUID
 
@@ -35,6 +36,7 @@ from app.auth import get_current_user
 from app.services.redis_keys import (
     route_alternative_key,
     route_notifications_channel,
+    tactics_latest_key,
 )
 
 log = logging.getLogger(__name__)
@@ -42,34 +44,63 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/routing", tags=["routing"])
 
 
+def _event_name_for(data: str) -> str:
+    """Map a channel message to its SSE event name.
+
+    The channel originally carried only better-route payloads (no type
+    field) — those remain event 'alternative' so existing handlers keep
+    working. The in-race tactician publishes payloads with
+    ``"type": "tactics"`` (2026-06-11); anything else with an explicit
+    type gets its own event name so future producers don't masquerade
+    as alternatives.
+    """
+    try:
+        parsed = json.loads(data)
+    except (ValueError, TypeError):
+        return "alternative"
+    if isinstance(parsed, dict):
+        t = parsed.get("type")
+        if isinstance(t, str) and t:
+            return t
+    return "alternative"
+
+
 async def _event_publisher(race_id: UUID):
     """Generator that yields SSE events for one race's notification channel.
 
     Yields dicts in the shape sse-starlette expects:
-        {"event": "alternative", "data": "<json blob>"}
+        {"event": "alternative" | "tactics", "data": "<json blob>"}
 
-    Frontend listens with addEventListener('alternative', handler). Using
-    a named event (rather than the default 'message') means we can later
-    add 'cycle_updated', 'route_invalidated', etc. without breaking
-    existing handlers.
+    Frontend listens with addEventListener('alternative', handler) and
+    addEventListener('tactics', handler). Named events mean adding a
+    producer never breaks existing handlers.
     """
     redis = redis_client.get_client()
     channel = route_notifications_channel(race_id)
     alt_key = route_alternative_key(race_id)
+    tactics_key = tactics_latest_key(race_id)
 
     pubsub = redis.pubsub()
     await pubsub.subscribe(channel)
     log.info("sse subscribed race=%s channel=%s", race_id, channel)
 
     try:
-        # Replay the most recent stored alternative on connect. A user
-        # reopening the tab or a reconnecting EventSource would otherwise
+        # Replay the most recent stored state on connect. A user
+        # reopening the app or a reconnecting EventSource would otherwise
         # have to wait for the next pub/sub message - by replaying the
-        # last-known state we make reconnection seamless.
+        # last-known state we make reconnection seamless. Tactics replay
+        # mirrors the alternative replay (same pattern, its own key).
         alt_blob = await redis.get(alt_key)
         if alt_blob is not None:
             data = alt_blob.decode() if isinstance(alt_blob, bytes) else alt_blob
             yield {"event": "alternative", "data": data}
+        tactics_blob = await redis.get(tactics_key)
+        if tactics_blob is not None:
+            data = (
+                tactics_blob.decode()
+                if isinstance(tactics_blob, bytes) else tactics_blob
+            )
+            yield {"event": "tactics", "data": data}
 
         # Tail the channel. pubsub.listen() yields messages indefinitely;
         # sse-starlette's ping (default 15s) keeps the connection alive
@@ -81,7 +112,7 @@ async def _event_publisher(race_id: UUID):
             data = message["data"]
             if isinstance(data, bytes):
                 data = data.decode()
-            yield {"event": "alternative", "data": data}
+            yield {"event": _event_name_for(data), "data": data}
     finally:
         try:
             await pubsub.unsubscribe(channel)

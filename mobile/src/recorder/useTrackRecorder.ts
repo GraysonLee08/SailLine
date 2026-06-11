@@ -52,6 +52,7 @@ import {
   gatherDeviceInfo,
   type LiveStats,
 } from "./debrief";
+import { startImuCapture, type ImuCaptureHandle } from "./imuRecorder";
 import { getFlag } from "./featureFlags";
 import { clearQueue, loadQueue, saveQueue } from "./queue";
 import {
@@ -153,6 +154,10 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   // loop. JS mode updates it in onPosition; native mode updates it in
   // the poll + after onHttp success.
   const nativeModeRef = useRef<boolean>(false);
+  // IMU capture handle (v1a, 2026-06-11). Lives alongside — never in —
+  // the GPS pipeline: startImuCapture runs its own queue + flush and
+  // POSTs IMU-only batches, so a sensor problem can't touch the track.
+  const imuHandleRef = useRef<ImuCaptureHandle | null>(null);
   const nativeHttpSubRef = useRef<{ remove: () => void } | null>(null);
   const nativeQueueIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
     null,
@@ -599,6 +604,20 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       );
     }
 
+    // ── IMU capture (v1a, 2026-06-11) — best-effort sidecar ──────────
+    // Null on devices without a usable IMU. Failure here must never
+    // affect GPS recording, hence the catch-all.
+    try {
+      imuHandleRef.current = await startImuCapture(id);
+      recordLog({
+        kind: "lifecycle",
+        status: "info",
+        message: `imu ${imuHandleRef.current ? "on" : "unavailable"}`,
+      });
+    } catch {
+      imuHandleRef.current = null;
+    }
+
     // 2026-06-03 A3 — clear the synchronous re-entry guard now that
     // start() is fully wired up. A later call may retry without being
     // rejected for "already starting." If the watcher promise rejected
@@ -632,6 +651,15 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     if (flushTimerRef.current) {
       clearInterval(flushTimerRef.current);
       flushTimerRef.current = null;
+    }
+    // ── IMU teardown (final flush inside stop) — best-effort ──────────
+    if (imuHandleRef.current) {
+      try {
+        await imuHandleRef.current.stop();
+      } catch {
+        /* best effort */
+      }
+      imuHandleRef.current = null;
     }
     // ── Phase 4 cleanup — native subscriptions + poll ─────────────────
     if (nativeHttpSubRef.current) {
@@ -703,6 +731,10 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       if (watcherRef.current) {
         void watcherRef.current.stop();
         watcherRef.current = null;
+      }
+      if (imuHandleRef.current) {
+        void imuHandleRef.current.stop();
+        imuHandleRef.current = null;
       }
       if (flushTimerRef.current) {
         clearInterval(flushTimerRef.current);

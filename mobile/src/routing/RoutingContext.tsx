@@ -41,7 +41,10 @@ import type { ReactNode } from "react";
 import { useRecorder } from "../recorder/RecorderContext";
 import { useRouting } from "../hooks/useRouting";
 import { useRouteNotifications } from "../hooks/useRouteNotifications";
-import type { AlternativePayload } from "../hooks/useRouteNotifications";
+import type {
+  AlternativePayload,
+  TacticsPayload,
+} from "../hooks/useRouteNotifications";
 import type { ComputeOptions } from "../hooks/useRouting";
 import type { RouteFeature, RouteMeta } from "../api/routing";
 
@@ -66,6 +69,9 @@ type RoutingCtx = {
   acceptAlternative: () => void;
   /** Discard the current alternative without applying it. */
   dismissAlternative: () => void;
+  // ── AI tactician calls (same SSE stream, 2026-06-11) ──
+  tactics: TacticsPayload | null;
+  dismissTactics: () => void;
   notificationsError: string | null;
 };
 
@@ -128,6 +134,8 @@ export function RoutingProvider({ children }: { children: ReactNode }) {
       alternative: notifications.alternative,
       acceptAlternative,
       dismissAlternative: notifications.dismiss,
+      tactics: notifications.tactics,
+      dismissTactics: notifications.dismissTactics,
       notificationsError: notifications.error,
     }),
     [
@@ -140,6 +148,8 @@ export function RoutingProvider({ children }: { children: ReactNode }) {
       routing.clear,
       notifications.alternative,
       notifications.dismiss,
+      notifications.tactics,
+      notifications.dismissTactics,
       notifications.error,
       acceptAlternative,
     ],

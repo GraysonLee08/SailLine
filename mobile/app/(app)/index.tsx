@@ -42,6 +42,7 @@ import { useAutoStartRecorder } from "../../src/recorder/useAutoStartRecorder";
 import { useWeather } from "../../src/hooks/useWeather";
 import { useOrientationSettings } from "../../src/hooks/useOrientationSettings";
 import { useAutoRouteSetting } from "../../src/hooks/useAutoRouteSetting";
+import { useTacticianSetting } from "../../src/hooks/useTacticianSetting";
 import { useTheme } from "../../src/theme/ThemeProvider";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
 import { listRaces } from "../../src/api/races";
@@ -150,9 +151,10 @@ export default function MapHomeScreen() {
   // selected race id.
   const routing = useRoute();
 
-  // Per-race orientation calibration + auto-route preference.
+  // Per-race orientation calibration + auto-route + tactician prefs.
   const orientation = useOrientationSettings(selectedRace?.id ?? null);
   const autoRoute = useAutoRouteSetting(selectedRace?.id ?? null);
+  const tactician = useTacticianSetting(selectedRace?.id ?? null);
 
   // Auto-start arming (mirrors what the legacy RecorderScreen did). When
   // the race has a scheduled start, arms the foreground timer + the
@@ -310,6 +312,10 @@ export default function MapHomeScreen() {
           autoRoute={{
             enabled: autoRoute.enabled,
             onToggle: autoRoute.setEnabled,
+          }}
+          tactician={{
+            enabled: tactician.enabled,
+            onToggle: tactician.setEnabled,
           }}
           onExpandedChange={setSheetExpanded}
         />

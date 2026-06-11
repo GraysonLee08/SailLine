@@ -237,4 +237,21 @@ async def compute_route_endpoint(
     # inside save_last_request and the user's response still ships.
     await save_last_request(req, redis=redis)
 
+    # Store the plan the user is now looking at, for the in-race
+    # tactician's plan-based detectors (planned-maneuver countdown,
+    # plan divergence). Non-fatal: tactician detectors degrade to
+    # plan-less calls when this key is missing.
+    try:
+        from app.services.redis_keys import (
+            ROUTE_NOTIFICATION_TTL_S,
+            route_current_key,
+        )
+        await redis.setex(
+            route_current_key(payload.race_id),
+            ROUTE_NOTIFICATION_TTL_S,
+            json.dumps(outcome.feature).encode(),
+        )
+    except Exception:  # noqa: BLE001
+        log.warning("route:current store failed race=%s", payload.race_id)
+
     return {"route": outcome.feature, "meta": outcome.meta}

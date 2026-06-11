@@ -69,6 +69,11 @@ type Props = {
     enabled: boolean;
     onToggle: (next: boolean) => void;
   };
+  /** AI tactician calls (Pro) — per-race display toggle, 2026-06-11. */
+  tactician?: {
+    enabled: boolean;
+    onToggle: (next: boolean) => void;
+  };
   /** Called when the sheet's snap index changes. `true` means expanded
       (75% snap), `false` means peeked (32%). Used by the parent to show
       the Minimize FAB only while expanded. */
@@ -90,6 +95,7 @@ export const RaceDetailSheet = forwardRef<RaceDetailSheetHandle, Props>(function
   betterRouteBanner,
   orientation,
   autoRoute,
+  tactician,
   onExpandedChange,
 }, ref) {
   const { colors, font, size, tabularVariant } = useTheme();
@@ -417,6 +423,68 @@ export const RaceDetailSheet = forwardRef<RaceDetailSheetHandle, Props>(function
                     {
                       backgroundColor: colors.surface.sheet,
                       transform: [{ translateX: autoRoute.enabled ? 18 : 2 }],
+                    },
+                  ]}
+                />
+              </View>
+            </Pressable>
+          ) : null}
+
+          {/* AI Tactician toggle — same row pattern as auto-route.
+              Gates the in-race call card + notification (2026-06-11). */}
+          {tactician ? (
+            <Pressable
+              onPress={() => tactician.onToggle(!tactician.enabled)}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: tactician.enabled }}
+              style={({ pressed }) => [
+                styles.toggleRow,
+                {
+                  borderColor: colors.border.divider,
+                  backgroundColor: pressed
+                    ? colors.surface.elevated
+                    : "transparent",
+                },
+              ]}
+            >
+              <View style={{ flex: 1 }}>
+                <Text
+                  style={{
+                    color: colors.text.primary,
+                    fontFamily: font.bodySemibold,
+                    fontSize: size.body,
+                  }}
+                >
+                  AI Tactician
+                </Text>
+                <Text
+                  style={{
+                    color: colors.text.muted,
+                    fontFamily: font.body,
+                    fontSize: size.caption,
+                    marginTop: 2,
+                  }}
+                >
+                  In-race calls — laylines, wind ahead, trim. Quiet by
+                  default; speaks only when something changes.
+                </Text>
+              </View>
+              <View
+                style={[
+                  styles.toggleTrack,
+                  {
+                    backgroundColor: tactician.enabled
+                      ? colors.accent.primary
+                      : colors.border.divider,
+                  },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.toggleThumb,
+                    {
+                      backgroundColor: colors.surface.sheet,
+                      transform: [{ translateX: tactician.enabled ? 18 : 2 }],
                     },
                   ]}
                 />

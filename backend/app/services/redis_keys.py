@@ -217,6 +217,41 @@ def route_notifications_channel(race_id: Union[UUID, str]) -> str:
     return f"route:notifications:{race_id}"
 
 
+def route_current_key(race_id: Union[UUID, str]) -> str:
+    """The route Feature the user most recently computed (the plan they
+    are looking at). Written by the /compute endpoint on success; read
+    by the tactician's plan-based detectors (planned-maneuver countdown,
+    plan divergence). TTL = ROUTE_NOTIFICATION_TTL_S.
+    """
+    return f"route:current:{race_id}"
+
+
+# ---------------------------------------------------------------------------
+# In-race tactician (spec: sailline -docs/2026-06-11_ai-tactician-spec.md)
+
+
+# 6 hours — long enough for any race; a stale call should not replay
+# onto tomorrow's session.
+TACTICS_LATEST_TTL_S: int = 6 * 3600
+
+
+def tactics_latest_key(race_id: Union[UUID, str]) -> str:
+    """Most recent tactician call payload. SSE clients replay it on
+    connect (same pattern as ``route_alternative_key``)."""
+    return f"tactics:latest:{race_id}"
+
+
+def tactics_cooldown_key(
+    race_id: Union[UUID, str], call_type: Optional[str] = None,
+) -> str:
+    """Cooldown sentinels (SET NX EX). Without ``call_type``: the
+    global quiet-cockpit gate. With it: the per-type repeat gate.
+    """
+    if call_type:
+        return f"tactics:cooldown:{race_id}:{call_type}"
+    return f"tactics:cooldown:{race_id}"
+
+
 def route_last_request_key(race_id: Union[UUID, str]) -> str:
     """The user's most recent ``RouteRequest`` JSON. The endpoint
     writes this on every successful compute; the background recompute

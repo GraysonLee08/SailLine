@@ -37,16 +37,32 @@ export type AlternativePayload = {
   computed_at: string;
 };
 
-// Listen for the server's custom "alternative" event type. The backend
-// publishes both standard "message" frames (when proxies require them)
-// and named "alternative" events; the named event is what carries the
-// payload we care about. Match the web client.
-type AlternativeEventType = "alternative";
+/** AI tactician call (2026-06-11) — published by the backend tactics
+ *  pipeline on the same per-race channel, surfaced as its own named
+ *  SSE event. Shape mirrors backend pipeline._evaluate's payload. */
+export type TacticsPayload = {
+  type: "tactics";
+  race_id: string;
+  call_type: string;
+  call_class: "maneuver" | "coaching";
+  message: string;
+  eta: string | null;
+  diagnosis: Record<string, unknown>;
+  model: string;
+  prompt_version: number;
+  created_at: string;
+};
+
+// Named events the server emits on this stream. "alternative" carries
+// better-route payloads (legacy shape, no type field); "tactics"
+// carries AI tactician calls.
+type StreamEventType = "alternative" | "tactics";
 
 export function useRouteNotifications(raceId: string | null) {
   const [alternative, setAlternative] = useState<AlternativePayload | null>(null);
+  const [tactics, setTactics] = useState<TacticsPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource<AlternativeEventType> | null>(null);
+  const esRef = useRef<EventSource<StreamEventType> | null>(null);
 
   useEffect(() => {
     if (!raceId) return;
@@ -75,7 +91,7 @@ export function useRouteNotifications(raceId: string | null) {
       // react-native-sse's EventSource exposes the standard "open" /
       // "message" / "error" / "close" lifecycle PLUS any named events
       // we register via the generic type parameter ("alternative").
-      const es = new EventSource<AlternativeEventType>(
+      const es = new EventSource<StreamEventType>(
         `${API_URL}/api/routing/notifications/${raceId}`,
         {
           headers: { Authorization: `Bearer ${token}` },
@@ -108,6 +124,22 @@ export function useRouteNotifications(raceId: string | null) {
         } catch (e) {
           // eslint-disable-next-line no-console
           console.error("[useRouteNotifications] bad payload", e);
+        }
+      });
+
+      // AI tactician calls (2026-06-11). Same stream, own named event;
+      // latest-call-wins (mid-race only the newest call matters — the
+      // server's cooldowns guarantee they're minutes apart).
+      es.addEventListener("tactics", (event) => {
+        if (cancelled) return;
+        const raw = typeof event.data === "string" ? event.data : "";
+        if (!raw) return;
+        try {
+          const payload = JSON.parse(raw) as TacticsPayload;
+          setTactics(payload);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error("[useRouteNotifications] bad tactics payload", e);
         }
       });
 
@@ -146,6 +178,8 @@ export function useRouteNotifications(raceId: string | null) {
 
   const dismiss = useCallback(() => setAlternative(null), []);
 
+  const dismissTactics = useCallback(() => setTactics(null), []);
+
   const accept = useCallback(
     (onAccept: (route: RouteFeature) => void) => {
       if (!alternative) return;
@@ -155,5 +189,5 @@ export function useRouteNotifications(raceId: string | null) {
     [alternative],
   );
 
-  return { alternative, accept, dismiss, error };
+  return { alternative, accept, dismiss, tactics, dismissTactics, error };
 }

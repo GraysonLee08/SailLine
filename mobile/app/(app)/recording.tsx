@@ -17,7 +17,7 @@
 // when recording stops.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { AppState, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
@@ -30,8 +30,14 @@ import { GuidanceCard } from "../../src/components/GuidanceCard";
 import { MapFabs } from "../../src/components/MapFabs";
 import { UploadStatusBadge } from "../../src/components/UploadStatusBadge";
 import { WindBarbLayer } from "../../src/components/WindBarbLayer";
+import { TacticianCard } from "../../src/components/TacticianCard";
 import { useAutoPassSetting } from "../../src/hooks/useAutoPassSetting";
 import { useAutoRouteSetting } from "../../src/hooks/useAutoRouteSetting";
+import { useTacticianSetting } from "../../src/hooks/useTacticianSetting";
+import {
+  dismissTacticsNotification,
+  postTacticsNotification,
+} from "../../src/notifications/tactics";
 import { useLayerSettings } from "../../src/hooks/useLayerSettings";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
@@ -104,6 +110,38 @@ export default function RecordingScreen() {
   // Auto-route preference (per race) drives the banner's auto-accept
   // countdown — same contract as the home screen.
   const autoRoute = useAutoRouteSetting(selectedRace?.id ?? null);
+
+  // AI tactician display toggle (per race, default ON). The backend
+  // only evaluates for Pro users; this gates the client surfaces.
+  const tactician = useTacticianSetting(selectedRace?.id ?? null);
+
+  // Tactics call → local notification when the app is backgrounded /
+  // screen-locked (the cockpit-mount case). On-screen the TacticianCard
+  // in the bottom stack is the surface; the OS notification covers the
+  // pocket-or-locked case where a card the user can't see is useless.
+  // created_at-keyed so a re-render never re-posts the same call.
+  const lastNotifiedCallRef = useRef<string | null>(null);
+  useEffect(() => {
+    const call = routing.tactics;
+    const id = selectedRace?.id;
+    if (!call || !id || !tactician.enabled) return;
+    if (call.created_at === lastNotifiedCallRef.current) return;
+    lastNotifiedCallRef.current = call.created_at;
+    if (AppState.currentState !== "active") {
+      void postTacticsNotification({
+        raceId: id,
+        message: call.message,
+        callType: call.call_type,
+      });
+    }
+  }, [routing.tactics, selectedRace?.id, tactician.enabled]);
+
+  // Clear any lingering tactics notification when recording stops.
+  useEffect(() => {
+    const id = selectedRace?.id;
+    if (!id || recorder.recording) return;
+    void dismissTacticsNotification(id);
+  }, [recorder.recording, selectedRace?.id]);
 
   // Compute-on-mount fallback. If we landed here without a computed route
   // (auto-start armed the recorder and replaced the route to /recording, or
@@ -358,6 +396,16 @@ export default function RecordingScreen() {
           onDismiss={routing.dismissAlternative}
           autoAcceptSeconds={autoRoute.enabled ? 10 : 0}
         />
+        {/* AI tactician call — most recent call, dismissible, auto-
+            expires. Sits above the guidance card so a fresh call is
+            the first thing the eye lands on. Renders nothing when no
+            call is live or the per-race toggle is off. */}
+        {tactician.enabled ? (
+          <TacticianCard
+            call={routing.tactics}
+            onDismiss={routing.dismissTactics}
+          />
+        ) : null}
         <GuidanceCard
           guidance={guidance}
           totalMarks={selectedRace.marks.length}

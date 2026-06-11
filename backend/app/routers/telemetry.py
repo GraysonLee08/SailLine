@@ -49,6 +49,7 @@ is genuinely useful for the at-rest / low-speed heading cross-check.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -422,6 +423,17 @@ async def post_telemetry(
     # transaction) so a job failure can't roll back pass persistence.
     # The trigger itself is fully tolerant of every failure mode.
     await maybe_trigger_postprocess(race_id, marks, all_passes, new_passes)
+
+    # In-race tactician (Pro): fire-and-forget evaluation over the data
+    # that just landed. Gated cheaply here (tier + fresh GPS) so free
+    # users and IMU-only heartbeats never spawn the task; everything
+    # else (cooldowns, settings opt-out, detection) is gated inside the
+    # pipeline, which swallows all failures — a tactician bug can never
+    # affect telemetry ingestion. Lazy import keeps the heavy
+    # forecast/polar dependency chain off this router's import path.
+    if batch.gps and user.get("tier") in ("pro", "hardware"):
+        from app.services.tactics.pipeline import evaluate_tactics_safe
+        asyncio.create_task(evaluate_tactics_safe(race_id, user["uid"]))
 
     log.info(
         "telemetry race=%s gps=%d imu=%d cal=%s new_passes=%d",
