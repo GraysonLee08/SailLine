@@ -248,6 +248,28 @@ const NORMALIZE_LOG_EVERY = 10; // one log per ~10 fixes ≈ once per 10 s
  *   - distanceFilter: 0          → don't gate on movement
  *   - locationUpdateInterval     → ~1 s cadence (Android)
  *   - disableElasticity: true    → keep cadence steady (no auto back-off)
+ *   - disableStopDetection: true → never auto-pause into the stationary
+ *                                  state (see the 2026-06-15 note below)
+ *   - changePace(true) post-start → force the MOVING state immediately
+ *
+ * 2026-06-15 — stationary-state fix (the "recorder ran 81 min, captured
+ * ZERO points" on-water failure). Transistorsoft boots into a STATIONARY
+ * state and only begins emitting locations once its motion-activity
+ * detector decides the device is "moving". Nothing here used to force
+ * that transition, so on a sailboat — whose smooth, slow motion the
+ * Android activity classifier does not reliably label as moving — the
+ * plugin could sit stationary for the whole race and never record a
+ * fix (no error: it was "working as configured", just waiting for
+ * motion that never registered). distanceFilter:0 /
+ * pausesLocationUpdatesAutomatically:false do NOT help — they govern
+ * behaviour *while already moving*. The deterministic fix is two-fold:
+ *   1. disableStopDetection:true — the plugin never auto-pauses back to
+ *      stationary on a low-motion lull (head-to-wind, pre-start drift).
+ *   2. changePace(true) right after start() — force the moving state so
+ *      capture begins on the first fix instead of on a motion-detector
+ *      transition that may never fire.
+ * Tradeoff: continuous GPS = higher battery. Acceptable for a bounded,
+ * foreground-service race recording, and the behaviour we actually want.
  *
  * Note on desiredAccuracy: v4's DESIRED_ACCURACY_NAVIGATION was
  * cross-platform but accepted as an alias for HIGH on Android. In v5,
@@ -288,6 +310,11 @@ export async function startWatcher({
       locationUpdateInterval: 1000,
       fastestLocationUpdateInterval: 1000,
       disableElasticity: true,
+      // 2026-06-15 stationary-state fix (see startWatcher docstring). Keep
+      // the plugin out of the motion-detector-gated stationary state for
+      // the whole session — a sailboat's low-motion lulls must not pause
+      // capture. Paired with changePace(true) after start().
+      disableStopDetection: true,
       locationAuthorizationRequest: "Always",
       pausesLocationUpdatesAutomatically: false,
       showsBackgroundLocationIndicator: true,
@@ -377,6 +404,19 @@ export async function startWatcher({
   });
 
   await BackgroundGeolocation.start();
+
+  // 2026-06-15 — force the MOVING state immediately (see the startWatcher
+  // docstring). Without this the plugin waits for a motion-activity
+  // transition that, on a sailboat, may never fire — the 81-minute
+  // zero-point race. Best-effort: tracking has already started by this
+  // point, so a transient changePace failure should not tear down an
+  // otherwise-live watcher. If it throws, we are no worse off than the
+  // pre-fix behaviour; the no-first-fix watchdog (fix 3) is the backstop.
+  try {
+    await BackgroundGeolocation.changePace(true);
+  } catch (e) {
+    onError?.(e instanceof Error ? e : new Error(String(e)));
+  }
 
   return {
     stop: async () => {
