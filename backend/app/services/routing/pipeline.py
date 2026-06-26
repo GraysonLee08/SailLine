@@ -98,6 +98,7 @@ from app.services.redis_keys import (
 )
 from app.services.routing.isochrone import (
     compute_isochrone_route_multileg,
+    haversine_m,
     route_to_geojson,
 )
 from app.services.routing.navigability import (
@@ -140,6 +141,20 @@ DEFAULT_POLAR_MARGIN: float = 0.97
 DEFAULT_HS_M: float = 0.0
 DEFAULT_DENSITY_FACTOR: float = 1.0
 DEFAULT_MAX_TWS_KT: Optional[float] = None
+
+
+# Forecast-window auto-sizing. The route ETA isn't known until *after* the
+# forecast loads (the engine needs the wind to compute it), so we can't use
+# the real duration to decide how much forecast to load — chicken/egg. Instead
+# we size the load window from rhumb-line course distance and a deliberately
+# slow nominal passage speed. Erring long costs only a few extra GFS grid
+# loads; erring short truncates the route at the forecast horizon (the 6h-cap
+# bug this replaces). NOT a route ETA — purely a load-window estimate.
+NOMINAL_PASSAGE_SPEED_KT: float = 5.0       # conservative avg SOG for sizing
+FORECAST_WINDOW_MARGIN_FRAC: float = 0.15   # proportional cushion on estimate
+FORECAST_WINDOW_MARGIN_MIN_H: float = 1.0   # floor on the cushion
+GFS_MAX_HORIZON_HOURS: float = 120.0        # hard ceiling — GFS forecast limit
+METRES_PER_NM: float = 1852.0
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +328,36 @@ def _sample_start_wind(
 
 
 # ---------------------------------------------------------------------------
+# Forecast-window sizing
+
+
+def estimate_load_window_hours(marks: list[dict], floor_hours: float) -> float:
+    """Hours of forecast to load so the window spans the whole course.
+
+    Sums the rhumb-line legs between consecutive marks and divides by a
+    conservative nominal passage speed, then adds a margin. The result is
+    clamped to ``[floor_hours, GFS_MAX_HORIZON_HOURS]``:
+
+    * never below ``floor_hours`` — the caller's explicit (or default 6h)
+      request is a floor, so a buoy race still loads its usual short window;
+    * never above the GFS horizon — beyond 120h there is simply no forecast
+      to load, so a longer estimate would only mislead.
+
+    A long course (e.g. a ~290 nm Mac) lands around 60-70h here, replacing
+    the old fixed 6h window that truncated any race over ~6h. Erring long is
+    the safe direction: a few extra GFS grids vs. a route that stops mid-lake.
+    """
+    if len(marks) < 2:
+        return floor_hours
+    total_m = 0.0
+    for a, b in zip(marks, marks[1:]):
+        total_m += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
+    est_h = (total_m / METRES_PER_NM) / NOMINAL_PASSAGE_SPEED_KT
+    est_h += max(FORECAST_WINDOW_MARGIN_MIN_H, FORECAST_WINDOW_MARGIN_FRAC * est_h)
+    return max(floor_hours, min(est_h, GFS_MAX_HORIZON_HOURS))
+
+
+# ---------------------------------------------------------------------------
 # The pipeline
 
 
@@ -355,10 +400,17 @@ async def compute_route(
     # (see the note by the imports at the top of this module).
     from app.services.weather import load_forecast_for_race
 
+    # Size the forecast window to the whole course. req.duration_hours is the
+    # floor (explicit caller request / 6h default); a long course bumps it up
+    # so the route doesn't truncate at the old fixed-6h horizon.
+    effective_duration_hours = estimate_load_window_hours(
+        req.marks, req.duration_hours,
+    )
+
     forecast = await load_forecast_for_race(
         region=region,
         race_start=req.race_start,
-        duration_hours=req.duration_hours,
+        duration_hours=effective_duration_hours,
     )
 
     # Currents — optional. Same race window as the forecast so the
@@ -366,7 +418,7 @@ async def compute_route(
     currents = await load_currents_optional(
         marks=req.marks,
         race_start=req.race_start,
-        duration_hours=req.duration_hours,
+        duration_hours=effective_duration_hours,
         race_id=req.race_id,
     )
 

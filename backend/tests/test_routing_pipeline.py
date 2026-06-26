@@ -43,10 +43,13 @@ from app.services.routing.pipeline import (
     DEFAULT_SAFETY_FACTOR,
     ENGINE_VERSION,
     DeratingProfile,
+    GFS_MAX_HORIZON_HOURS,
+    NOMINAL_PASSAGE_SPEED_KT,
     RouteOutcome,
     RouteRequest,
     RouteRequestKnobs,
     compute_route,
+    estimate_load_window_hours,
     load_last_request,
     request_with_knobs,
     resolve_region,
@@ -80,6 +83,60 @@ def test_resolve_region_hawaii_marks_pick_hawaii_base():
     ]
     base, _ = resolve_region(marks)
     assert base == "hawaii"
+
+
+# ─── estimate_load_window_hours ──────────────────────────────────────────
+
+
+def test_estimate_window_short_course_uses_floor():
+    """A short buoy course estimates well under the 6h floor, so the
+    floor (the caller's explicit/default request) wins."""
+    marks = [
+        {"lat": 41.8881, "lon": -87.6132},
+        {"lat": 41.9000, "lon": -87.6000},  # ~1.5 nm away
+    ]
+    assert estimate_load_window_hours(marks, DEFAULT_DURATION_HOURS) == DEFAULT_DURATION_HOURS
+
+
+def test_estimate_window_long_course_exceeds_floor():
+    """A Chicago→Mackinac-scale course (~290 nm) bumps the window well
+    past the 6h floor so the route doesn't truncate mid-lake."""
+    marks = [
+        {"lat": 41.8881, "lon": -87.6132},   # Chicago
+        {"lat": 45.8492, "lon": -84.6189},   # Mackinac Island
+    ]
+    window = estimate_load_window_hours(marks, DEFAULT_DURATION_HOURS)
+    assert window > DEFAULT_DURATION_HOURS
+    # ~290 nm / 5 kt ≈ 58h + 15% margin ≈ 67h — comfortably long, under cap.
+    assert 55.0 < window < GFS_MAX_HORIZON_HOURS
+
+
+def test_estimate_window_clamped_to_gfs_horizon():
+    """An ocean-crossing-scale course can't exceed the GFS horizon —
+    there is no forecast past 120h to load."""
+    marks = [
+        {"lat": 37.8, "lon": -122.4},   # San Francisco
+        {"lat": 21.3, "lon": -157.9},   # Honolulu (~2070 nm)
+    ]
+    assert estimate_load_window_hours(marks, DEFAULT_DURATION_HOURS) == GFS_MAX_HORIZON_HOURS
+
+
+def test_estimate_window_sums_intermediate_legs():
+    """The window is sized off the full course (all legs), not the
+    straight start→finish line — a triangle course counts every side."""
+    marks = [
+        {"lat": 43.0, "lon": -87.9},
+        {"lat": 43.5, "lon": -87.4},
+        {"lat": 43.0, "lon": -87.9},  # back to start: out-and-back > 0
+    ]
+    window = estimate_load_window_hours(marks, 0.5)
+    # Two legs of real distance must produce > the 0.5h floor.
+    assert window > 0.5
+
+
+def test_estimate_window_degenerate_single_mark_returns_floor():
+    assert estimate_load_window_hours([{"lat": 43.0, "lon": -87.9}], 6.0) == 6.0
+    assert NOMINAL_PASSAGE_SPEED_KT > 0  # guard against a div-by-zero regression
 
 
 # ─── compute_route fixtures ─────────────────────────────────────────────
