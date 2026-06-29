@@ -42,7 +42,16 @@ import { ThemeProvider, useTheme } from "../src/theme/ThemeProvider";
 import { registerHandlers } from "../src/recorder/scheduledAutoStart";
 import { PermissionWelcomeCard } from "../src/components/PermissionWelcomeCard";
 import { registerRaceNotificationCategories } from "../src/notifications/raceCategories";
-import { dismissMissedMarkNotification } from "../src/notifications/missedMark";
+import {
+  ACTION_MARK_MISSED,
+  ACTION_MARK_NOT_MISSED,
+  ACTION_STOP_RACE,
+} from "../src/notifications/raceCategories";
+import {
+  dismissMissedMarkNotification,
+  suppressMark,
+} from "../src/notifications/missedMark";
+import { manualMarkPass } from "../src/api/races";
 import { GOOGLE_WEB_CLIENT_ID } from "../src/googleAuthConfig";
 
 // ── Module-load side effects ──────────────────────────────────────────
@@ -58,22 +67,53 @@ void registerHandlers();
 void registerRaceNotificationCategories();
 
 // Route actionable notification responses. The missed-mark notification
-// is informational only (2026-06-08): there is no "mark as passed"
-// action — the mark-rounding detector is the sole writer of mark_passes
-// and a racer doesn't hand-confirm marks on the phone. The only action
-// left is "Stop race", which opens the app (recorder.stop() lives in the
-// React tree). Any tap — action or body — dismisses the notification.
+// (2026-06-29) is now actionable with three buttons:
+//   * "Yes, missed it"  → POST /api/races/{id}/mark-pass to manually
+//     insert a mark pass so the detector advances to the next mark.
+//   * "No, rounded it"  → suppress further notifications for this mark
+//     for the rest of the race.
+//   * "Stop race"       → opens the app (opensAppToForeground) so the
+//     Recording screen's Stop button is reachable.
+// Any body tap (no action) is just an acknowledgement — dismiss only.
 Notifications.addNotificationResponseReceivedListener((response) => {
   const data = response.notification.request.content.data as
-    | { kind?: string; raceId?: string; markIndex?: number }
+    | { kind?: string; raceId?: string; markIndex?: number; markName?: string }
     | undefined;
   if (!data || data.kind !== "missedMark") return;
   if (typeof data.raceId !== "string") return;
   const { raceId } = data;
-  // Stop opens the app (opensAppToForeground on the action surfaces the
-  // Recording screen's Stop button); every other tap is just an
-  // acknowledgement. Both paths simply dismiss the notification.
-  void dismissMissedMarkNotification(raceId);
+  const markIndex = typeof data.markIndex === "number" ? data.markIndex : -1;
+
+  const actionId = response.actionIdentifier;
+
+  if (actionId === ACTION_MARK_MISSED) {
+    // Sailor confirmed they missed the mark — manually insert a pass
+    // so the detector can advance. Best-effort: errors log but don't
+    // crash the notification handler. The notification is dismissed
+    // regardless (a failure here just means the sailor will see the
+    // next missed-mark prompt on the next cooldown cycle).
+    if (markIndex >= 0) {
+      void manualMarkPass(raceId, markIndex).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error("[missedMark] manual pass failed:", e);
+      });
+    }
+    void dismissMissedMarkNotification(raceId);
+  } else if (actionId === ACTION_MARK_NOT_MISSED) {
+    // Sailor says they rounded it — suppress further prompts for this
+    // mark for the rest of the race.
+    if (markIndex >= 0) {
+      suppressMark(raceId, markIndex);
+    }
+    void dismissMissedMarkNotification(raceId);
+  } else if (actionId === ACTION_STOP_RACE) {
+    // Stop opens the app — the Recording screen's Stop button is
+    // reachable once the app surfaces. Just dismiss the notification.
+    void dismissMissedMarkNotification(raceId);
+  } else {
+    // Body tap or unknown action — dismiss only.
+    void dismissMissedMarkNotification(raceId);
+  }
 });
 
 export default function RootLayout() {

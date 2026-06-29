@@ -140,7 +140,7 @@ def test_tight_pass_detected_in_inshore_mode():
 
 
 def test_wide_pass_detected_in_distance_mode():
-    """The v3 win: 200 m pass detected with the distance-mode 250 m
+    """The v3 win: 200 m pass detected with the distance-mode 400 m
     threshold. This is the failure mode that motivated v3 — see
     ``sailline-docs/2026-05-30_session.md`` (Harrison-Dever Crib was
     passed at 208 m and the old detector missed it entirely)."""
@@ -171,7 +171,7 @@ def test_wide_pass_not_detected_in_inshore_mode():
 
 
 def test_very_wide_pass_never_detected():
-    """800 m pass with a 250 m distance threshold — well outside. No emit."""
+    """800 m pass with a 400 m distance threshold — well outside. No emit."""
     mark = Mark(REF_LAT, REF_LON)
     track = line_through(mark, closest_m=800.0)
 
@@ -407,7 +407,7 @@ def test_radii_for_course_back_compat_returns_distance_thresholds():
 def test_threshold_constants_tripwire():
     """Surfaces accidental constant changes. Bump these only with a
     matching docstring / migration plan."""
-    assert DEFAULT_DISTANCE_THRESHOLD_M == 250.0
+    assert DEFAULT_DISTANCE_THRESHOLD_M == 400.0
     assert DEFAULT_INSHORE_THRESHOLD_M == 100.0
     assert FINAL_MARK_BONUS_M == 50.0
     assert DEPART_CONFIRM_SAMPLES == 3

@@ -81,6 +81,45 @@ export async function updateRace(
   return normaliseRace(data);
 }
 
+/**
+ * Manually record a mark pass for a race. Used when the auto-detection
+ * missed a mark and the sailor confirms via the "Yes, missed it"
+ * notification action. The backend inserts the pass at the current
+ * GPS position (or the mark position if no GPS is available) and
+ * advances the detector so subsequent marks can be detected.
+ *
+ * Returns the updated race row with the new mark_passes array.
+ */
+export async function manualMarkPass(
+  raceId: string,
+  markIndex: number,
+): Promise<Race> {
+  const data = await apiFetch<Race>(`/api/races/${raceId}/mark-pass`, {
+    method: "POST",
+    body: { mark_index: markIndex },
+  });
+  if (!data) {
+    throw new Error(`POST /api/races/${raceId}/mark-pass returned no body`);
+  }
+  return normaliseRace(data);
+}
+
+/**
+ * Mark a race as ended and trigger the AI post-race summary.
+ * Called from the recording screen's Stop button after recorder.stop()
+ * completes. Ensures the AI summary is generated even when marks were
+ * missed and the auto-detector never crossed the final mark.
+ */
+export async function endRace(raceId: string): Promise<Race> {
+  const data = await apiFetch<Race>(`/api/races/${raceId}/end`, {
+    method: "POST",
+  });
+  if (!data) {
+    throw new Error(`POST /api/races/${raceId}/end returned no body`);
+  }
+  return normaliseRace(data);
+}
+
 /** A persisted mark-rounding event — matches the JSONB shape on
  *  race_sessions.mark_passes and the backend's track-ingest output.
  *  All passes are auto-detected: the manual-pass path was removed

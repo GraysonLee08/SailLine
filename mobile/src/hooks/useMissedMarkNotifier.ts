@@ -34,6 +34,7 @@ import { useEffect, useMemo, useRef } from "react";
 import type { MarkPass } from "../api/races";
 import {
   dismissMissedMarkNotification,
+  isMarkSuppressed,
   postMissedMarkNotification,
 } from "../notifications/missedMark";
 import type { RaceMark } from "../types";
@@ -147,6 +148,12 @@ export function useMissedMarkNotifier({
     }
 
     if (armedMarkRef.current !== nextIdx) return;
+
+    // Suppression check (2026-06-29): if the sailor tapped "No, rounded
+    // it" on a prior missed-mark notification for this mark, skip firing.
+    // Prevents the repeated prompting the user reported during the
+    // Silly Race when the detector couldn't register Mark 1.
+    if (isMarkSuppressed(raceId, nextIdx)) return;
 
     const min = runningMinRef.current ?? Number.POSITIVE_INFINITY;
     const recedingClear = d > RECEDE_M && d > min + RECEDE_BUFFER_M;

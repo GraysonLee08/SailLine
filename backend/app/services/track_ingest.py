@@ -269,7 +269,7 @@ async def detect_and_persist_new_passes(
 
     Per-mark thresholds: the detector is constructed with
     :func:`thresholds_for_course(n, mode)`. Distance-mode races get
-    250 m (intermediate) / 300 m (final), inshore-mode races get
+    400 m (intermediate) / 450 m (final), inshore-mode races get
     100 m / 150 m. The wider distance thresholds are required for
     races past passage marks the boat doesn't actually round (cribs,
     met buoys) — see ``sailline-docs/2026-05-30_session.md`` for the

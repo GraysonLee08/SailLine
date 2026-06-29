@@ -36,11 +36,21 @@ import * as Notifications from "expo-notifications";
 // ── Category + action identifiers (stable strings — do not rename) ─
 
 /** Fired when CPA detector likely missed a mark — see useMissedMarkNotifier.
- *  Informational only (2026-06-08): the notification tells the sailor a
- *  mark may not have registered, but there is no "mark as passed" action.
- *  The mark-rounding detector is the sole writer of mark_passes; manual
- *  confirmation was removed. The single remaining action is "Stop race". */
+ *  Actionable (2026-06-29): the notification now offers "Yes" (confirm
+ *  missed — manually insert a mark pass) and "No" (dismiss and suppress
+ *  further notifications for this mark). A third "Stop race" action
+ *  remains for abandoning the race entirely. */
 export const CATEGORY_MISSED_MARK = "sailline.missed-mark";
+
+/** Action: sailor confirms they DID miss the mark — triggers a manual
+ *  mark pass entry via POST /api/races/{id}/mark-pass so the detector
+ *  can advance to the next mark. */
+export const ACTION_MARK_MISSED = "mark-missed";
+
+/** Action: sailor says they did NOT miss the mark (or already rounded
+ *  it) — dismisses the notification and suppresses re-fires for this
+ *  mark index for the rest of the race. */
+export const ACTION_MARK_NOT_MISSED = "mark-not-missed";
 
 /** Action: stop the current recording (treats race as DNF). */
 export const ACTION_STOP_RACE = "stop-race";
@@ -56,6 +66,16 @@ export const ACTION_STOP_RACE = "stop-race";
 export async function registerRaceNotificationCategories(): Promise<void> {
   try {
     await Notifications.setNotificationCategoryAsync(CATEGORY_MISSED_MARK, [
+      {
+        identifier: ACTION_MARK_MISSED,
+        buttonTitle: "Yes, missed it",
+        options: { opensAppToForeground: false },
+      },
+      {
+        identifier: ACTION_MARK_NOT_MISSED,
+        buttonTitle: "No, rounded it",
+        options: { opensAppToForeground: false },
+      },
       {
         identifier: ACTION_STOP_RACE,
         buttonTitle: "Stop race",

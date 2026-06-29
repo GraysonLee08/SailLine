@@ -5,17 +5,14 @@
 // posting + cancellation API (one notification per race, replaced if
 // already shown so we never stack duplicates).
 //
-// The notification is informational (2026-06-08): it tells the sailor a
-// mark may not have registered, but offers no "mark as passed" action —
-// the mark-rounding detector is the sole writer of mark_passes. The
-// body carries `data` so the response listener can dismiss it:
-//   { kind: "missedMark", raceId, markIndex, markName }
+// Actionable (2026-06-29): the notification now offers "Yes, missed it"
+// (manually insert a mark pass so the detector advances) and "No, rounded
+// it" (suppress further notifications for this mark). The response handler
+// in app/_layout.tsx dispatches these actions.
 //
-// Response routing: the global addNotificationResponseReceivedListener
-// (app/_layout.tsx) checks data.kind and dismisses. The only action
-// button is ACTION_STOP_RACE, which opens the app (opensAppToForeground)
-// so the Recording screen's Stop button is reachable; any other tap is
-// just an acknowledgement.
+// Suppression: when the sailor taps "No, rounded it", the mark index is
+// added to a module-scoped Set so useMissedMarkNotifier can skip re-firing
+// for that mark for the rest of the race. Cleared on race id change.
 
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
@@ -27,6 +24,36 @@ const NOTIF_TAG_PREFIX = "sailline-missedmark-";
 // Channel used by scheduledAutoStart — reuse so we only have to
 // configure one Android channel. Importance HIGH gets heads-up.
 const ANDROID_CHANNEL_ID = "race-start";
+
+// ── Mark-level suppression ──────────────────────────────────────────────
+//
+// When the sailor taps "No, rounded it" we suppress further missed-mark
+// notifications for that (raceId, markIndex) pair for the rest of the
+// race. Without this the notifier would re-fire every 3 min (its cooldown)
+// for a mark the sailor has already acknowledged.
+const suppressedMarks = new Map<string, Set<number>>();
+
+/** Record that the sailor dismissed a missed-mark prompt for a specific
+ *  mark — suppresses re-firing until the race changes or the app restarts. */
+export function suppressMark(raceId: string, markIndex: number): void {
+  let set = suppressedMarks.get(raceId);
+  if (!set) {
+    set = new Set();
+    suppressedMarks.set(raceId, set);
+  }
+  set.add(markIndex);
+}
+
+/** Check whether a mark has been suppressed for this race. */
+export function isMarkSuppressed(raceId: string, markIndex: number): boolean {
+  const set = suppressedMarks.get(raceId);
+  return set ? set.has(markIndex) : false;
+}
+
+/** Clear all suppressions for a race (called on race change or stop). */
+export function clearSuppressions(raceId: string): void {
+  suppressedMarks.delete(raceId);
+}
 
 function tagFor(raceId: string): string {
   return `${NOTIF_TAG_PREFIX}${raceId}`;
@@ -58,7 +85,7 @@ export async function postMissedMarkNotification(
       identifier: tagFor(payload.raceId),
       content: {
         title: "Missed a mark?",
-        body: `It looks like you passed ${payload.markName} but it didn't auto-register. It'll still be picked up from your track after the race.`,
+        body: `You passed ${payload.markName} but it didn't auto-register. Tap "Yes" to record it manually, or "No" if you already rounded it.`,
         data: {
           kind: "missedMark",
           raceId: payload.raceId,

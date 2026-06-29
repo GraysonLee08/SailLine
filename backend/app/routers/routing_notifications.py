@@ -74,33 +74,53 @@ async def _event_publisher(race_id: UUID):
     Frontend listens with addEventListener('alternative', handler) and
     addEventListener('tactics', handler). Named events mean adding a
     producer never breaks existing handlers.
+
+    Redis timeout resilience (2026-06-29): the initial replay (alt_key
+    + tactics_key reads) and the pubsub subscribe are now wrapped in
+    try/except. A Redis TimeoutError during replay logs a warning and
+    continues with an empty replay (the client will still receive live
+    events as they arrive). A timeout during subscribe is fatal for
+    this connection — the generator yields nothing and exits, which
+    sse-starlette handles as a clean stream end (the client reconnects
+    via EventSource's auto-reconnect). This prevents the "Truncated
+    response body" crashes that killed every SSE connection during the
+    Silly Race.
     """
     redis = redis_client.get_client()
     channel = route_notifications_channel(race_id)
     alt_key = route_alternative_key(race_id)
     tactics_key = tactics_latest_key(race_id)
 
+    # Subscribe first — if this fails, the connection is toast anyway.
     pubsub = redis.pubsub()
-    await pubsub.subscribe(channel)
-    log.info("sse subscribed race=%s channel=%s", race_id, channel)
+    try:
+        await pubsub.subscribe(channel)
+        log.info("sse subscribed race=%s channel=%s", race_id, channel)
+    except Exception as exc:
+        log.warning("sse subscribe failed race=%s: %s — stream will end", race_id, exc)
+        return
 
     try:
-        # Replay the most recent stored state on connect. A user
-        # reopening the app or a reconnecting EventSource would otherwise
-        # have to wait for the next pub/sub message - by replaying the
-        # last-known state we make reconnection seamless. Tactics replay
-        # mirrors the alternative replay (same pattern, its own key).
-        alt_blob = await redis.get(alt_key)
-        if alt_blob is not None:
-            data = alt_blob.decode() if isinstance(alt_blob, bytes) else alt_blob
-            yield {"event": "alternative", "data": data}
-        tactics_blob = await redis.get(tactics_key)
-        if tactics_blob is not None:
-            data = (
-                tactics_blob.decode()
-                if isinstance(tactics_blob, bytes) else tactics_blob
-            )
-            yield {"event": "tactics", "data": data}
+        # Replay the most recent stored state on connect. Tolerate Redis
+        # timeouts here — a failed replay is better than a crashed stream.
+        try:
+            alt_blob = await redis.get(alt_key)
+            if alt_blob is not None:
+                data = alt_blob.decode() if isinstance(alt_blob, bytes) else alt_blob
+                yield {"event": "alternative", "data": data}
+        except Exception as exc:
+            log.warning("sse replay alt failed race=%s: %s", race_id, exc)
+
+        try:
+            tactics_blob = await redis.get(tactics_key)
+            if tactics_blob is not None:
+                data = (
+                    tactics_blob.decode()
+                    if isinstance(tactics_blob, bytes) else tactics_blob
+                )
+                yield {"event": "tactics", "data": data}
+        except Exception as exc:
+            log.warning("sse replay tactics failed race=%s: %s", race_id, exc)
 
         # Tail the channel. pubsub.listen() yields messages indefinitely;
         # sse-starlette's ping (default 15s) keeps the connection alive
