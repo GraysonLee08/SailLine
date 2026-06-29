@@ -46,6 +46,7 @@ import { useWeather } from "../../src/hooks/useWeather";
 import { useRoute } from "../../src/routing/RoutingContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
 import { useTheme } from "../../src/theme/ThemeProvider";
+import { endRace } from "../../src/api/races";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
 import {
   baseRegionForPoint,
@@ -232,6 +233,19 @@ export default function RecordingScreen() {
 
   const handleStop = useCallback(async () => {
     await recorder.stop();
+    // Mark the race as ended and trigger the AI post-race summary.
+    // This ensures a summary is generated even when the auto-detector
+    // missed marks and the final mark was never crossed — the root
+    // cause of the missing AI summary from the Silly Race.
+    if (selectedRace?.id) {
+      try {
+        await endRace(selectedRace.id);
+      } catch {
+        // Best-effort — the recorder already stopped; a failure here
+        // just means the user can hit "Regenerate" from the Review
+        // screen later. Don't block navigation.
+      }
+    }
     // After stopping, drop back to the map home so the race detail sheet
     // re-appears with the same race still selected (handy for reviewing
     // what just happened).

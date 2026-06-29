@@ -40,9 +40,13 @@ Why this changed from v2:
     watching one mark at a time.
 
 Thresholds:
-  * ``DEFAULT_DISTANCE_THRESHOLD_M`` = 250 m for distance racing —
-    chosen empirically against the 2026-05-30 Garmin track which had a
-    worst-case 208 m pass at Harrison-Dever Crib.
+  * ``DEFAULT_DISTANCE_THRESHOLD_M`` = 400 m for distance racing —
+    bumped from 250 m after the 2026-06-26 Silly Race where the phone's
+    GPS CPA to Mark 1 (4 Mile Crib) was 342 m — outside the old 250 m
+    threshold but a legitimate rounding distance for a crib mark on
+    a distance race. The Garmin track showed a 62 m CPA, confirming
+    the mark was actually rounded; the phone's worse GPS fix during a
+    telemetry gap caused the miss.
   * ``DEFAULT_INSHORE_THRESHOLD_M`` = 100 m for inshore racing where
     boats actually round buoys.
   * ``FINAL_MARK_BONUS_M`` = 50 m added to the threshold of the LAST
@@ -92,7 +96,7 @@ from typing import Iterable, Optional, Sequence, Union
 
 
 # Per-mark threshold defaults — see module docstring for rationale.
-DEFAULT_DISTANCE_THRESHOLD_M = 250.0
+DEFAULT_DISTANCE_THRESHOLD_M = 400.0
 DEFAULT_INSHORE_THRESHOLD_M = 100.0
 FINAL_MARK_BONUS_M = 50.0
 

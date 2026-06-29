@@ -314,7 +314,7 @@ async def delete_race(
     pred = race_owner_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
         allowed = await conn.fetchrow(
-            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
+            f"""SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}""",
             race_id, user["uid"],
         )
         if allowed is None:
@@ -323,3 +323,195 @@ async def delete_race(
             "DELETE FROM race_sessions WHERE id = $1", race_id,
         )
     return None
+
+
+# ─── Manual mark pass ────────────────────────────────────────────────────
+
+class ManualMarkPass(BaseModel):
+    """Request body for POST /api/races/{race_id}/mark-pass.
+
+    The sailor confirms via a notification action button that they
+    rounded a mark the auto-detector missed. ``mark_index`` is the
+    0-based index into the race's ``marks`` array; the backend inserts
+    a pass at the mark's coordinates with the current timestamp and
+    resets the detector so subsequent marks can be detected.
+    """
+    mark_index: int = Field(ge=0)
+
+
+@router.post("/{race_id}/mark-pass", response_model=RaceOut)
+async def manual_mark_pass(
+    race_id: UUID,
+    payload: ManualMarkPass,
+    user: dict = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool),
+):
+    """Manually record a mark pass and advance the detector.
+
+    Called from the mobile app's "Yes, missed it" notification action.
+    Reads the current race row (FOR UPDATE to serialize against
+    concurrent telemetry batches), appends a pass entry at the mark's
+    coordinates with ``now()`` as the timestamp, resets
+    ``detector_state`` to NULL (fresh traversal for the next mark), and
+    writes ``started_at`` if still NULL (idempotent — same pattern as
+    track_ingest).
+
+    If the mark index is already present in ``mark_passes`` the request
+    is a no-op (200 with the current row — idempotent on retries).
+
+    If this pass closes the course (mark_index == len(marks) - 1),
+    ``ended_at`` is written and the postprocess job is triggered —
+    matching the track_ingest behaviour for auto-detected passes.
+    """
+    from app.services.job_trigger import trigger_race_postprocess
+
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                f"""
+                SELECT r.marks, r.mark_passes, r.started_at, r.start_at,
+                       r.ended_at
+                FROM race_sessions r
+                WHERE r.id = $1 AND {pred}
+                FOR UPDATE OF r
+                """,
+                race_id, user["uid"],
+            )
+            if row is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+
+            marks_raw = row["marks"]
+            if isinstance(marks_raw, (bytes, str)):
+                marks = json.loads(marks_raw) if marks_raw else []
+            else:
+                marks = marks_raw or []
+
+            passes_raw = row["mark_passes"]
+            if isinstance(passes_raw, (bytes, str)):
+                passes = json.loads(passes_raw) if passes_raw else []
+            else:
+                passes = passes_raw or []
+
+            # Validate mark_index is within range
+            if payload.mark_index >= len(marks):
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    f"mark_index {payload.mark_index} out of range "
+                    f"(course has {len(marks)} marks)",
+                )
+
+            # Idempotent: if this mark already has a pass, no-op
+            existing_indices = {p["mark_index"] for p in passes}
+            if payload.mark_index in existing_indices:
+                # Return current row — no changes needed
+                row2 = await conn.fetchrow(
+                    f"""SELECT {_SELECT_COLS} FROM race_sessions WHERE id = $1""",
+                    race_id,
+                )
+                return _row_to_race(row2)
+
+            # Build the pass entry at the mark's coordinates
+            mark = marks[payload.mark_index]
+            new_pass = {
+                "mark_index": payload.mark_index,
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "lat": float(mark["lat"]),
+                "lon": float(mark["lon"]),
+            }
+            passes.append(new_pass)
+
+            # Build the UPDATE — always write mark_passes + detector_state
+            set_parts = [
+                "mark_passes = $2::jsonb",
+                "detector_state = NULL",
+                "updated_at = NOW()",
+            ]
+            args: list[Any] = [race_id, passes]
+
+            # Backfill started_at if NULL and start_at is set
+            started_at = row["started_at"]
+            start_at = row["start_at"]
+            if started_at is None and start_at is not None:
+                set_parts.append("started_at = COALESCE(started_at, $3)")
+                args.append(start_at)
+
+            # If this is the final mark, write ended_at
+            is_final = payload.mark_index == len(marks) - 1
+            ended_at = row["ended_at"]
+            if is_final and ended_at is None:
+                set_parts.append(
+                    "ended_at = COALESCE(ended_at, $"
+                    + str(len(args) + 1)
+                    + ")"
+                )
+                args.append(datetime.utcnow())
+
+            sql = f"""
+                UPDATE race_sessions
+                SET {", ".join(set_parts)}
+                WHERE id = $1
+                RETURNING {_SELECT_COLS}
+            """
+            updated = await conn.fetchrow(sql, *args)
+
+    # Trigger postprocess if the final mark was just passed
+    if is_final and updated and updated["ended_at"] is not None:
+        # Reconstruct marks + passes for the trigger check
+        all_passes = passes
+        await trigger_race_postprocess(race_id)
+
+    if updated is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+    return _row_to_race(updated)
+
+
+# ─── Manual race end (Stop button fallback) ──────────────────────────────
+#
+# When the sailor taps Stop and the auto-detector never crossed the final
+# mark (missed marks, DNF, abandoned race), the postprocess job that
+# generates the AI summary never fires. This endpoint sets ended_at
+# (idempotent via COALESCE) and triggers the postprocess job so a summary
+# is generated even when the course wasn't completed. Called from the
+# mobile recording screen's handleStop after recorder.stop() finishes.
+
+@router.post("/{race_id}/end", response_model=RaceOut)
+async def manual_end_race(
+    race_id: UUID,
+    user: dict = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool),
+):
+    """Mark a race as ended and trigger the postprocess job.
+
+    Sets ``ended_at = COALESCE(ended_at, now())`` so an authoritative
+    value from the detector is never overwritten, then fires the
+    race-postprocess Cloud Run Job so the AI summary is generated.
+
+    Called from the mobile app's Stop button after recorder.stop()
+    completes. Also safe to call when the detector already set
+    ended_at (idempotent — the COALESCE keeps the earlier value and
+    the postprocess trigger checks whether the job already ran).
+    """
+    from app.services.job_trigger import trigger_race_postprocess
+
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            UPDATE race_sessions
+            SET ended_at = COALESCE(ended_at, NOW()),
+                updated_at = NOW()
+            WHERE id = $1 AND EXISTS (
+                SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}
+            )
+            RETURNING {_SELECT_COLS}
+            """,
+            race_id, user["uid"],
+        )
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+
+    # Trigger postprocess — best-effort, never raises.
+    await trigger_race_postprocess(race_id)
+
+    return _row_to_race(row)
