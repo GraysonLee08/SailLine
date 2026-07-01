@@ -24,15 +24,18 @@ steps:
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:latest'
       - './backend'
 
-  # 3. Push both tags to Artifact Registry
+  # 3. Push both tags to Artifact Registry (parallel — both depend on
+  #    build, not on each other)
   - name: 'gcr.io/cloud-builders/docker'
     id: 'push-sha'
+    waitFor: ['build']
     args:
       - 'push'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:$SHORT_SHA'
 
   - name: 'gcr.io/cloud-builders/docker'
     id: 'push-latest'
+    waitFor: ['build']
     args:
       - 'push'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:latest'

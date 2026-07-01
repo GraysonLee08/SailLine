@@ -8,7 +8,7 @@ import basicSsl from '@vitejs/plugin-basic-ssl'
 export default defineConfig({
   plugins: [react(), basicSsl()],
   server: { port: 5173 },
-  build: { outDir: "dist", sourcemap: true },
+  build: { outDir: "dist", sourcemap: "hidden" },
 
   // Vitest reads its config from the same vite.config so the test runner
   // and dev server stay in sync (plugins, aliases, etc.). jsdom gives us

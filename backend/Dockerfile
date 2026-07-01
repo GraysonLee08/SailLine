@@ -1,11 +1,13 @@
-# Multi-stage build is overkill for an early-stage app.
-# Single-stage keeps the build simple and debuggable.
+# Multi-stage build (2026-06-30): strips test dependencies from the
+# production image. The builder stage installs all requirements (including
+# pytest); the runtime stage copies only the installed packages + app code,
+# leaving pytest and its transitive deps out of the shipped image.
+# Also runs as non-root (UID 1000) for security.
 
-FROM python:3.12-slim
+# ── Stage 1: Builder ───────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
 
 # eccodes is a C library required by cfgrib to parse NOAA GRIB2 files.
-# This is the most important line in the Dockerfile — without eccodes installed,
-# `import cfgrib` raises ImportError at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libeccodes-dev \
     libeccodes-tools \
@@ -13,8 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy requirements first to maximize Docker layer caching.
-# If requirements.txt doesn't change, this layer is reused on rebuilds.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -22,8 +22,23 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY workers/ ./workers/
 
-# Run as a non-root user for security (2026-06-30). Cloud Run adds its
-# own sandbox, but non-root inside the container limits escape blast radius.
+# ── Stage 2: Runtime ───────────────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+# eccodes runtime library (not the -dev headers) needed by cfgrib at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libeccodes-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages from the builder.
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+WORKDIR /app
+COPY --from=builder /app/ ./
+
+# Run as a non-root user for security. Cloud Run adds its own sandbox,
+# but non-root inside the container limits escape blast radius.
 RUN useradd -r -u 1000 -m -d /home/sailline sailline && \
     chown -R sailline:sailline /app
 USER 1000

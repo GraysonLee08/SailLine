@@ -1,0 +1,11 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Deny all client access. SailLine uses GCS (not Firebase Storage)
+    // for weather data, certs, and avatars. This rule prevents accidental
+    // client uploads if Firebase Storage is ever enabled on the project.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
