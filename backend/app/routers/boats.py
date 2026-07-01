@@ -116,6 +116,15 @@ _BOAT_COLS = (
     "created_at, updated_at"
 )
 
+# Whitelist of boat columns that Pydantic field names map to (2026-06-30).
+# Prevents latent SQL injection if the model ever allows dynamic fields.
+# Derived from _BOAT_COLS minus the managed columns (id, owner_id,
+# created_at, updated_at) that are never set by the client.
+_BOAT_WRITABLE_COLS = frozenset(
+    c.strip() for c in _BOAT_COLS.split(",")
+    if c.strip() not in ("id", "owner_id", "created_at", "updated_at")
+)
+
 
 def _row_to_out(row: asyncpg.Record) -> BoatOut:
     d = dict(row)
@@ -229,7 +238,9 @@ async def create_boat(
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
     data = payload.model_dump(exclude_none=True)
-    fields = list(data.keys())
+    # Filter through column whitelist to prevent SQL injection via
+    # field names spliced into the INSERT clause (2026-06-30).
+    fields = [f for f in data.keys() if f in _BOAT_WRITABLE_COLS]
     placeholders = [f"${i + 2}" for i in range(len(fields))]
     cols = ", ".join(fields)
     async with pool.acquire() as conn:
@@ -264,6 +275,8 @@ async def update_boat(
     pool: asyncpg.Pool = Depends(db.get_pool),
 ):
     data = payload.model_dump(exclude_none=True)
+    # Filter through column whitelist (2026-06-30).
+    data = {k: v for k, v in data.items() if k in _BOAT_WRITABLE_COLS}
     if not data:
         # Touch the row so updated_at advances; useful for the
         # frontend to know the user "confirmed" the boat record
