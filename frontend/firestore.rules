@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Deny all client access. SailLine uses Cloud SQL (not Firestore)
+    // for all user data. This rule prevents accidental client reads/writes
+    // if Firestore is ever enabled on the project.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
