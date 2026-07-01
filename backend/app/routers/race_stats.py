@@ -300,16 +300,23 @@ async def _load_track_rows(
     return [dict(r) for r in rows]
 
 
-def _cache_key(race_id: UUID, point_count: int, tier: Optional[str] = None) -> str:
+def _cache_key(
+    race_id: UUID, point_count: int, pass_count: int,
+    tier: Optional[str] = None,
+) -> str:
     # Tier in the key so free vs pro cached responses don't collide.
     # None tier (unauthenticated callers can't reach this endpoint, but
     # defensive) folds into 'free'.
+    # pass_count (2026-06-30): mark_passes count so a manual mark-pass
+    # entry invalidates the cache and leg splits are recomputed. Without
+    # this, adding a mark pass without new GPS points returns stale legs.
     t = tier or "free"
-    return f"race_stats:{race_id}:{point_count}:t{t}:v{_CACHE_VERSION}"
+    return f"race_stats:{race_id}:{point_count}:p{pass_count}:t{t}:v{_CACHE_VERSION}"
 
 
 async def _cached_stats(
-    race_id: UUID, point_count: int, *, tier: Optional[str] = None,
+    race_id: UUID, point_count: int, pass_count: int,
+    *, tier: Optional[str] = None,
 ) -> Optional[dict]:
     """Best-effort read of the cached stats dict. Returns None when
     Redis is unavailable or the key doesn't exist — caller falls back
@@ -319,7 +326,7 @@ async def _cached_stats(
     except HTTPException:
         return None
     try:
-        raw = await client.get(_cache_key(race_id, point_count, tier))
+        raw = await client.get(_cache_key(race_id, point_count, pass_count, tier))
     except Exception as e:  # noqa: BLE001
         log.warning("race_stats: cache read failed (%s)", e)
         return None
@@ -332,7 +339,7 @@ async def _cached_stats(
 
 
 async def _cache_stats(
-    race_id: UUID, point_count: int, stats_dict: dict,
+    race_id: UUID, point_count: int, pass_count: int, stats_dict: dict,
     *, tier: Optional[str] = None,
 ) -> None:
     try:
@@ -341,7 +348,7 @@ async def _cache_stats(
         return
     try:
         await client.setex(
-            _cache_key(race_id, point_count, tier),
+            _cache_key(race_id, point_count, pass_count, tier),
             _CACHE_TTL_S,
             json.dumps(stats_dict),
         )
@@ -424,6 +431,7 @@ async def get_stats(
     stats_dict: Optional[dict] = None
     if track_rows:
         point_count = len(track_rows)
+        pass_count = len(race.get("mark_passes") or [])
         # Cache key intentionally does NOT include the boat — the
         # boat's rating affects only the corrected-time field, which
         # we re-derive on every read from the boat row. If we cached
@@ -431,7 +439,11 @@ async def get_stats(
         # leave stale data behind until the next track flush.
         # D3: cache key DOES include tier so a free → pro upgrade
         # surfaces the corrected time on next fetch.
-        stats_dict = await _cached_stats(race_id, point_count, tier=user.get("tier"))
+        # pass_count (2026-06-30): includes mark_passes count so a
+        # manual mark-pass entry invalidates the cache.
+        stats_dict = await _cached_stats(
+            race_id, point_count, pass_count, tier=user.get("tier"),
+        )
         if stats_dict is None:
             pts = track_points_from_rows(track_rows)
             computed = compute_stats(
@@ -446,7 +458,8 @@ async def get_stats(
             if computed is not None:
                 stats_dict = computed.to_dict()
                 await _cache_stats(
-                    race_id, point_count, stats_dict, tier=user.get("tier"),
+                    race_id, point_count, pass_count, stats_dict,
+                    tier=user.get("tier"),
                 )
 
     ai_summary = race.get("ai_summary")

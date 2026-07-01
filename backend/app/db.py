@@ -83,7 +83,7 @@ async def startup() -> None:
             connect=_create_connection,
             init=_init_connection,
             min_size=0,
-            max_size=5,
+            max_size=10,
             command_timeout=10,
         )
     except Exception as exc:  # noqa: BLE001

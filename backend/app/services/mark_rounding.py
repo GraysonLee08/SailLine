@@ -469,6 +469,8 @@ class MarkRoundingDetector:
         """
         out: list[MarkPass] = []
         for p in points:
+            if self.done:
+                break
             r = self.feed(p)
             while r is not None:
                 out.append(r)
