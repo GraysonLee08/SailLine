@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from uuid import UUID
 
@@ -55,7 +55,7 @@ class RaceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     mode: Literal["inshore", "distance"]
     boat_class: str = Field(min_length=1, max_length=80)
-    marks: list[Mark] = Field(default_factory=list)
+    marks: list[Mark] = Field(default_factory=list, max_length=200)
     start_at: Optional[datetime] = None
     # Default mirrors the column default so a POST that omits the field
     # still ends up with auto_start_enabled=True. Sending False explicitly
@@ -415,7 +415,7 @@ async def manual_mark_pass(
             mark = marks[payload.mark_index]
             new_pass = {
                 "mark_index": payload.mark_index,
-                "ts": datetime.utcnow().isoformat() + "Z",
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "lat": float(mark["lat"]),
                 "lon": float(mark["lon"]),
             }
@@ -445,7 +445,7 @@ async def manual_mark_pass(
                     + str(len(args) + 1)
                     + ")"
                 )
-                args.append(datetime.utcnow())
+                args.append(datetime.now(timezone.utc))
 
             sql = f"""
                 UPDATE race_sessions
@@ -496,6 +496,16 @@ async def manual_end_race(
 
     pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
+        # First check the current ended_at so we know if THIS call
+        # actually set it (vs. COALESCE keeping an existing value).
+        prior = await conn.fetchrow(
+            f"SELECT ended_at FROM race_sessions WHERE id = $1", race_id,
+        )
+        if prior is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
+
+        ended_at_was_null = prior["ended_at"] is None
+
         row = await conn.fetchrow(
             f"""
             UPDATE race_sessions
@@ -511,7 +521,10 @@ async def manual_end_race(
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
 
-    # Trigger postprocess — best-effort, never raises.
-    await trigger_race_postprocess(race_id)
+    # Only trigger postprocess if THIS call actually set ended_at
+    # (it was NULL before and is now populated). Prevents repeated
+    # Cloud Run Job triggers if the endpoint is called multiple times.
+    if ended_at_was_null and row["ended_at"] is not None:
+        await trigger_race_postprocess(race_id)
 
     return _row_to_race(row)

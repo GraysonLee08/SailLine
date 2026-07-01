@@ -164,6 +164,13 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   );
   const queueLengthRef = useRef<number>(0);
   const flushingRef = useRef(false);
+  // Tracks the last time saveQueue was called — used to debounce
+  // AsyncStorage writes when the GPS queue grows large (offline periods).
+  const lastQueueSaveRef = useRef<number>(0);
+  // Stable ref to flushNow so the NetInfo effect can call it without
+  // adding flushNow as a dependency (which would re-subscribe on every
+  // render). Set after flushNow is defined below.
+  const flushNowRef = useRef<(() => Promise<void>) | null>(null);
   const raceIdRef = useRef<string | null>(raceId);
   raceIdRef.current = raceId;
 
@@ -197,12 +204,31 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   // Mount once for the hook's lifetime — independent of recording
   // state because we want fresh data the moment the user opens the
   // recording screen, not 1 s after they press Start.
+  //
+  // Offline→online transition (2026-06-30): when service returns after
+  // an offline period (common on Lake Michigan), immediately flush the
+  // queue instead of waiting up to 30s for the next flush timer. This
+  // drains accumulated GPS fixes as soon as cell returns, minimizing
+  // the window where data only exists in AsyncStorage.
+  const wasOfflineRef = useRef(false);
   useEffect(() => {
     const sub = NetInfo.addEventListener((state: NetInfoState) => {
       // ``isInternetReachable`` is what we want — ``isConnected`` is a
       // weaker signal (wifi associated but captive portal). NetInfo
       // reports null when reachability hasn't been probed yet.
-      netReachableRef.current = state.isInternetReachable;
+      const reachable = state.isInternetReachable;
+      netReachableRef.current = reachable;
+
+      // Drain the queue when service returns after an offline period.
+      // null (undetermined) is treated as "no change" — we only fire
+      // on a definitive false→true transition.
+      if (wasOfflineRef.current && reachable === true) {
+        wasOfflineRef.current = false;
+        // Small delay so NetInfo settles + the flushNow closure is fresh
+        setTimeout(() => void flushNowRef.current?.(), 500);
+      } else if (reachable === false) {
+        wasOfflineRef.current = true;
+      }
     });
     return () => sub();
   }, []);
@@ -213,9 +239,14 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
   // currently-rendered status and only commit if it changed, so the
   // badge re-renders only on transitions.
   //
+  // Gated on `recording` (2026-06-30): the badge isn't shown when not
+  // recording, so the interval is pointless idle work — a 1 Hz timer
+  // allocating objects + calling deriveUploadStatus for nothing.
+  //
   // queueLengthRef is the authoritative source — JS mode writes it
   // from onPosition, native mode writes it from the poll + onHttp.
   useEffect(() => {
+    if (!recording) return;
     const interval = setInterval(() => {
       const next = deriveUploadStatus(
         statsToStatusInputs(
@@ -228,7 +259,7 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       setUploadStatus((prev) => (prev === next ? prev : next));
     }, STATUS_RECOMPUTE_MS);
     return () => clearInterval(interval);
-  }, []);
+  }, [recording]);
 
   /**
    * Append to the ring buffer, updating both the in-memory mirror and
@@ -408,6 +439,10 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     }
   }, [recordLog]);
 
+  // Keep the ref current so the NetInfo effect can call flushNow
+  // without it being a dependency (avoids re-subscribing on every render).
+  flushNowRef.current = flushNow;
+
   // ── Position handler ─────────────────────────────────────────────────
   //
   // Branches on mode. JS mode: push onto the local queue, persist,
@@ -430,8 +465,21 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
         setError(null);
       }
 
-      // Breadcrumb UI is the same in both modes.
-      setPoints((prev) => [...prev, point]);
+      // Breadcrumb UI — capped to prevent unbounded memory growth on long
+      // races. A 3-hour race at 1 Hz = 10,800 points; without a cap this
+      // array grows without limit and every setPoints triggers re-renders
+      // in ActualRouteLayer + useNextMarkGuidance, creating an O(N²)
+      // cascade that eventually crashes the app (root cause of the Silly
+      // Race mid-race crashes). The cap only affects the UI trail; the
+      // GPS queue (gpsQueueRef / Transistorsoft SQLite) is the source of
+      // truth for upload and is NOT capped.
+      const BREADCRUMB_CAP = 5000;
+      setPoints((prev) => {
+        const next = [...prev, point];
+        return next.length > BREADCRUMB_CAP
+          ? next.slice(next.length - BREADCRUMB_CAP)
+          : next;
+      });
       setLastPoint(point);
 
       // ── Stats: capture (same in both modes) ────────────────────
@@ -455,9 +503,20 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
 
       // ── JS mode ────────────────────────────────────────────────
       gpsQueueRef.current.push(point);
-      // Persist on every fix (1 Hz) so a crash/kill loses nothing.
-      void saveQueue(id, gpsQueueRef.current);
+      // Persist to AsyncStorage for crash recovery. When the queue is
+      // small (< 50 points) we save on every fix so a crash loses at
+      // most 1 second of data. When the queue grows (offline period,
+      // upload failures), the JSON.stringify cost grows O(N) and we
+      // debounce to every 5s — losing 5s of data on a crash is
+      // acceptable, but the 1 Hz O(N) write was contributing to the
+      // mid-race crash cascade on the Silly Race.
       const depth = gpsQueueRef.current.length;
+      const shouldSave =
+        depth < 50 || Date.now() - lastQueueSaveRef.current > 5000;
+      if (shouldSave) {
+        lastQueueSaveRef.current = Date.now();
+        void saveQueue(id, gpsQueueRef.current);
+      }
       queueLengthRef.current = depth;
       setQueueLength(depth);
       if (depth > statsRef.current.maxQueueDepth) {
