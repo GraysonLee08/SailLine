@@ -103,13 +103,22 @@ async def _race_belongs_to_user(
 ) -> bool:
     """Same 404-equivalent ownership test the REST telemetry endpoint uses.
 
+    Uses race_write_predicate (2026-06-30 fix) so crew members and boat
+    owners can access the live WebSocket stream — matching the REST
+    telemetry endpoint's access model. Previously this only checked
+    race.user_id, which excluded crew members who can record via REST
+    but couldn't view via WS.
+
     Cross-user access returns False here, which the handler translates
     to a 1008 close — same "don't leak whether the race exists for
     someone else" semantics.
     """
+    from app.auth_helpers import race_write_predicate
+
+    pred = race_write_predicate(race_alias="r", uid_placeholder="$2")
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT 1 FROM race_sessions WHERE id = $1 AND user_id = $2",
+            f"SELECT 1 FROM race_sessions r WHERE r.id = $1 AND {pred}",
             race_id, user_id,
         )
     return row is not None

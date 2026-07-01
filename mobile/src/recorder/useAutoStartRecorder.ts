@@ -63,6 +63,23 @@ const ARM_WINDOW_MS = 5 * 60 * 1000; // don't retro-fire if >5min past start
 // (handled in the effect below — different key → cleared).
 const firedKeys: Set<string> = new Set();
 
+// Module-scoped flag set when auto-start fires (not when the user manually
+// taps Start). The recording screen reads this on mount to show a brief
+// "Auto-start activated" confirmation banner so the sailor knows recording
+// started automatically without having to check the LIVE pill. Cleared
+// after 4 seconds by the recording screen's effect.
+let _autoStartJustFired = false;
+
+/** Check whether auto-start just fired (for the recording screen confirmation). */
+export function wasAutoStartJustFired(): boolean {
+  return _autoStartJustFired;
+}
+
+/** Clear the auto-start-fired flag (called by the recording screen after showing the banner). */
+export function clearAutoStartFiredFlag(): void {
+  _autoStartJustFired = false;
+}
+
 type Args = {
   raceId: string | null;
   startAtIso: string | null;
@@ -109,6 +126,7 @@ export function useAutoStartRecorder({
     setOnFire(async () => {
       if (recordingRef.current) return;
       try {
+        _autoStartJustFired = true;
         await startRef.current?.();
       } catch {
         /* swallow */
@@ -189,6 +207,7 @@ export function useAutoStartRecorder({
       const t = setTimeout(() => {
         if (!recordingRef.current) {
           try {
+            _autoStartJustFired = true;
             void startRef.current?.();
           } catch {
             /* recorder may throw if no raceId — silently swallow */
@@ -231,6 +250,7 @@ export function useAutoStartRecorder({
     const fireT = setTimeout(() => {
       if (!recordingRef.current) {
         try {
+          _autoStartJustFired = true;
           void startRef.current?.();
         } catch {
           /* swallow */

@@ -22,6 +22,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY workers/ ./workers/
 
+# Run as a non-root user for security (2026-06-30). Cloud Run adds its
+# own sandbox, but non-root inside the container limits escape blast radius.
+RUN useradd -r -u 1000 -m -d /home/sailline sailline && \
+    chown -R sailline:sailline /app
+USER 1000
+
 # Cloud Run injects the PORT env var; default to 8080 for local docker run.
 ENV PORT=8080
 EXPOSE 8080
