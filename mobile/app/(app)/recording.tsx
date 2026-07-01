@@ -47,6 +47,10 @@ import { useRoute } from "../../src/routing/RoutingContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
 import { useTheme } from "../../src/theme/ThemeProvider";
 import { endRace } from "../../src/api/races";
+import {
+  wasAutoStartJustFired,
+  clearAutoStartFiredFlag,
+} from "../../src/recorder/useAutoStartRecorder";
 import { computeBarbFeatures } from "../../src/lib/windBarbViewport";
 import {
   baseRegionForPoint,
@@ -71,6 +75,23 @@ export default function RecordingScreen() {
   }, [selectedRace]);
 
   const { grid: windGrid } = useWeather(regionName);
+
+  // Auto-start confirmation banner (2026-06-30): shows a brief green
+  // banner when the recorder was started by auto-start (not a manual
+  // tap). Reads the module-scoped flag from useAutoStartRecorder and
+  // clears it after 4 seconds. Addresses Observation 1 from the Silly
+  // Race — "the auto-record didn't appear to work from the user's
+  // perspective" because there was no visible confirmation.
+  const [showAutoStartBanner, setShowAutoStartBanner] = useState(false);
+  useEffect(() => {
+    if (wasAutoStartJustFired()) {
+      setShowAutoStartBanner(true);
+      clearAutoStartFiredFlag();
+      const t = setTimeout(() => setShowAutoStartBanner(false), 4000);
+      return () => clearTimeout(t);
+    }
+  }, []);
+
   const [viewport, setViewport] = useState<{
     zoom: number;
     bounds: { south: number; north: number; west: number; east: number };
@@ -365,6 +386,19 @@ export default function RecordingScreen() {
         ) : null}
       </SafeAreaView>
 
+      {/* Auto-start confirmation banner — shows for 4 seconds when
+          recording was started by auto-start (not a manual tap). Gives
+          the sailor visible confirmation that auto-record fired,
+          addressing the Silly Race observation that "the auto-record
+          didn't appear to work from the user's perspective." */}
+      {showAutoStartBanner ? (
+        <View style={styles.autoStartBanner} pointerEvents="none">
+          <Text style={styles.autoStartBannerText}>
+            ✓ Auto-start activated
+          </Text>
+        </View>
+      ) : null}
+
       {/* Top-RIGHT: same FAB cluster the home screen uses. Compass
           toggles orientation (north / follow-heading), layers opens the
           LayersPanel (Route / Actual route / Wind / Waves), centre
@@ -506,6 +540,24 @@ export default function RecordingScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
+  autoStartBanner: {
+    position: "absolute",
+    top: 60,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    zIndex: 10,
+  },
+  autoStartBannerText: {
+    backgroundColor: "rgba(34, 139, 34, 0.9)",
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 16,
+    overflow: "hidden",
+  },
   topBar: {
     position: "absolute",
     top: 8,
