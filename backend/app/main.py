@@ -62,7 +62,7 @@ app.add_middleware(
         "https://sailline.firebaseapp.com",
     ],
     allow_origin_regex=r"https://sailline--.*\.web\.app",  # preview channels
-    allow_credentials=True,
+    allow_credentials=False,  # auth is Bearer token, not cookies
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )

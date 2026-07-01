@@ -250,7 +250,7 @@ export default function RecordingScreen() {
     // re-appears with the same race still selected (handy for reviewing
     // what just happened).
     router.replace("/");
-  }, [recorder]);
+  }, [recorder, selectedRace]);
 
   const handleBack = useCallback(() => {
     if (recorder.recording) return;

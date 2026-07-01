@@ -68,18 +68,28 @@ export function useRouteNotifications(raceId: string | null) {
     if (!raceId) return;
 
     let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     setError(null);
 
-    (async () => {
+    const connect = async (attempt: number): Promise<void> => {
+      if (cancelled) return;
+
       const user = auth.currentUser;
       if (!user) {
         setError("Not authenticated");
         return;
       }
 
+      // Always fetch a fresh token on (re)connect. Firebase ID tokens
+      // expire after 1 hour; a long race means the token captured at
+      // the initial connect will be stale by the time react-native-sse
+      // auto-reconnects (e.g., after a Redis timeout drops the stream).
+      // Reusing the stale token → 401 → "Not authorized" → lost route
+      // guidance for the rest of the race. This was Observation 4 from
+      // the Silly Race.
       let token: string;
       try {
-        token = await user.getIdToken();
+        token = await user.getIdToken(true); // forceRefresh = true
       } catch (e) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
@@ -88,21 +98,12 @@ export function useRouteNotifications(raceId: string | null) {
       }
       if (cancelled) return;
 
-      // react-native-sse's EventSource exposes the standard "open" /
-      // "message" / "error" / "close" lifecycle PLUS any named events
-      // we register via the generic type parameter ("alternative").
       const es = new EventSource<StreamEventType>(
         `${API_URL}/api/routing/notifications/${raceId}`,
         {
           headers: { Authorization: `Bearer ${token}` },
-          // Library defaults: reconnect on transient errors with backoff.
-          // Don't pollute log with the routine reconnects.
           debug: false,
-          pollingInterval: 0, // 0 = true streaming, not long-polling
-          // FastAPI + sse-starlette emit LF (\n) line endings. Without
-          // this hint react-native-sse can't auto-detect the delimiter
-          // on the initial frame and logs "Unable to identify the line
-          // ending character" instead of parsing events.
+          pollingInterval: 0,
           lineEndingCharacter: "\n",
         },
       );
@@ -114,8 +115,6 @@ export function useRouteNotifications(raceId: string | null) {
 
       es.addEventListener("alternative", (event) => {
         if (cancelled) return;
-        // event.data is the raw SSE data field — a JSON-encoded
-        // AlternativePayload, same shape as the web client receives.
         const raw = typeof event.data === "string" ? event.data : "";
         if (!raw) return;
         try {
@@ -127,9 +126,6 @@ export function useRouteNotifications(raceId: string | null) {
         }
       });
 
-      // AI tactician calls (2026-06-11). Same stream, own named event;
-      // latest-call-wins (mid-race only the newest call matters — the
-      // server's cooldowns guarantee they're minutes apart).
       es.addEventListener("tactics", (event) => {
         if (cancelled) return;
         const raw = typeof event.data === "string" ? event.data : "";
@@ -145,24 +141,27 @@ export function useRouteNotifications(raceId: string | null) {
 
       es.addEventListener("error", (event) => {
         if (cancelled) return;
-        // react-native-sse fires "error" for both transient network
-        // hiccups (the lib auto-retries) and terminal HTTP errors. The
-        // shape carries `type` + sometimes `status`. Surface only the
-        // terminal cases so the UI doesn't flicker during reconnects.
         const status = (event as { xhrStatus?: number }).xhrStatus;
         if (status === 401) {
-          setError("Not authorized for this race");
+          // Token expired or invalid — close and reconnect with a
+          // fresh token instead of dying permanently. Exponential
+          // backoff capped at 30s to avoid hammering the server.
           es.close();
+          const delay = Math.min(2000 * Math.pow(2, attempt), 30000);
+          reconnectTimer = setTimeout(() => void connect(attempt + 1), delay);
         } else if (status === 404) {
           setError("Race not found");
           es.close();
         }
         // Other errors: let the library retry silently.
       });
-    })();
+    };
+
+    void connect(0);
 
     return () => {
       cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       const es = esRef.current;
       esRef.current = null;
       if (es) {

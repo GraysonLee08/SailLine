@@ -29,9 +29,9 @@ async def health() -> HealthResponse:
             cfgrib_available=True,
             cfgrib_version=cfgrib.__version__,
         )
-    except ImportError as e:
+    except ImportError:
         return HealthResponse(
             status="degraded",
             cfgrib_available=False,
-            cfgrib_error=str(e),
+            cfgrib_error="dependency unavailable",
         )
