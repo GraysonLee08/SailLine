@@ -36,12 +36,15 @@ T0 = datetime(2026, 7, 2, 17, 0, tzinfo=timezone.utc)
 # Trimmed activestations.xml: one Lake Michigan met buoy, one met
 # C-MAN station, one met="n" water-quality platform (must be dropped),
 # one with a broken lat (must be skipped, not fatal).
+# NB: the C-MAN id is LOWERCASE on purpose — that's how NDBC's real
+# index publishes lettered ids, while realtime2 filenames are
+# uppercase. parse_station_index must normalise (2026-07-02 404 bug).
 STATIONS_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <stations created="2026-07-02T16:50:00UTC" count="4">
   <station id="45007" lat="42.674" lon="-87.026" name="SOUTH MICHIGAN"
            owner="NDBC" pgm="NDBC Meteorological/Ocean" type="buoy"
            met="y" currents="n" waterquality="n" dart="n"/>
-  <station id="CHII2" lat="41.916" lon="-87.572" name="Chicago, IL"
+  <station id="chii2" lat="41.916" lon="-87.572" name="Chicago, IL"
            owner="NDBC" pgm="C-MAN" type="fixed"
            met="y" currents="n" waterquality="n" dart="n"/>
   <station id="45999" lat="42.0" lon="-87.5" name="WQ ONLY"
@@ -78,7 +81,9 @@ def test_haversine_chicago_to_milwaukee():
 def test_parse_station_index_filters_and_survives_junk():
     stations = parse_station_index(STATIONS_XML)
     ids = {s.station_id for s in stations}
-    assert ids == {"45007", "CHII2"}          # met-only, broken row dropped
+    # met-only, broken row dropped, and the lowercase C-MAN id is
+    # UPPERCASED (realtime2 filenames are uppercase; lowercase 404s).
+    assert ids == {"45007", "CHII2"}
     s45007 = next(s for s in stations if s.station_id == "45007")
     assert s45007.lat == pytest.approx(42.674)
     assert s45007.name == "SOUTH MICHIGAN"

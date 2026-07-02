@@ -69,7 +69,9 @@ REALTIME2_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station_id}.txt"
 # Redis cache for the station index. ~300 KB of XML parsed down to
 # ~60 KB of JSON; refetching per postprocess run would be rude to NDBC
 # and slow for us.
-STATION_INDEX_CACHE_KEY = "obs:ndbc:station_index:v1"
+# v2: v1 cached lowercase lettered ids (the 404 bug) — key bumped so
+# the fix doesn't wait out v1's 24 h TTL.
+STATION_INDEX_CACHE_KEY = "obs:ndbc:station_index:v2"
 STATION_INDEX_CACHE_TTL_S = 24 * 3600
 
 # Station selection. 75 km keeps mid-lake buoys reachable from
@@ -145,7 +147,15 @@ def parse_station_index(xml_text: str) -> list[Station]:
         try:
             stations.append(
                 Station(
-                    station_id=el.attrib["id"],
+                    # activestations.xml lists lettered station ids in
+                    # LOWERCASE (chii2, oksi2) but the realtime2 file
+                    # names are UPPERCASE (CHII2.txt) — lowercase URLs
+                    # 404. Normalise here so the id is correct both in
+                    # the fetch URL and in the stored snapshot.
+                    # (Found 2026-07-02: every Chicago C-MAN station
+                    # 404'd on the first backfill; numeric buoy ids
+                    # were unaffected.)
+                    station_id=el.attrib["id"].upper(),
                     name=el.get("name", el.attrib["id"]),
                     lat=float(el.attrib["lat"]),
                     lon=float(el.attrib["lon"]),
