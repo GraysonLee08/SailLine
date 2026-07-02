@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 from uuid import UUID
 
@@ -64,12 +64,13 @@ from fastapi import HTTPException, status
 
 from app.auth_helpers import race_write_predicate
 from app.services.job_trigger import trigger_race_postprocess
+from app.services.mark_gates import GateAwareDetector, build_gates
 from app.services.mark_rounding import (
     Mark as DetectorMark,
-    MarkRoundingDetector,
     Point as DetectorPoint,
     thresholds_for_course,
 )
+from app.services.start_line import resolve_start_line_bearing
 
 log = logging.getLogger(__name__)
 
@@ -124,7 +125,8 @@ async def load_race_for_ingest(
     row = await conn.fetchrow(
         f"""
         SELECT r.marks, r.mark_passes, r.started_at, r.start_at, r.mode,
-               r.detector_state
+               r.detector_state,
+               r.start_line_bearing_override, r.start_line_bearing_deg
         FROM race_sessions r
         WHERE r.id = $1 AND {pred}
         FOR UPDATE OF r
@@ -169,6 +171,11 @@ async def load_race_for_ingest(
         # (the wider tolerance) when the column is somehow NULL.
         "mode": row["mode"] or "distance",
         "detector_state": detector_state,
+        # v4 start/finish line bearing (0022). Override = user-entered;
+        # deg = system-resolved cache. Both may be NULL — the detector
+        # falls back to CPA for the start/finish marks until resolved.
+        "start_line_bearing_override": row["start_line_bearing_override"],
+        "start_line_bearing_deg": row["start_line_bearing_deg"],
     }
 
 
@@ -220,6 +227,17 @@ def _parse_iso(ts_str: str) -> datetime:
     return datetime.fromisoformat(ts_str)
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to timezone-aware UTC.
+
+    DB timestamptz values arrive aware; wire timestamps should too, but
+    a naive datetime slipping through a fixture or an older client must
+    not blow up the pre-start comparison. Naive is assumed UTC — the
+    only convention this codebase uses.
+    """
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+
+
 async def detect_and_persist_new_passes(
     conn: asyncpg.Connection,
     *,
@@ -231,6 +249,8 @@ async def detect_and_persist_new_passes(
     start_at: Optional[datetime] = None,
     mode: str = "distance",
     detector_state: Optional[dict] = None,
+    start_line_bearing_override: Optional[float] = None,
+    start_line_bearing_deg: Optional[float] = None,
 ) -> tuple[list[dict], list[dict]]:
     """Run the detector over a single batch, persist new passes, return
     ``(all_passes, new_passes)`` as plain JSONB-shaped dicts.
@@ -309,8 +329,64 @@ async def detect_and_persist_new_passes(
         )
         return list(existing_passes), []
 
-    det = MarkRoundingDetector(
+    # ── Pre-start filtering (added 2026-07-02) ──────────────────────
+    # While the detector is still watching the FIRST mark and the race
+    # has a scheduled gun (start_at), samples recorded before the gun
+    # must not participate in detection. The Beer Can 7.1.2026 race
+    # showed why: a 390 m closest approach recorded two minutes BEFORE
+    # the start became the persisted running minimum; the genuine start
+    # crossing then read as "approaching again" (departing counter
+    # reset on every new minimum) and the pass never emitted — which
+    # cascaded into every subsequent mark reading as "missed" and
+    # auto-finish never firing. Boats legitimately mill around the
+    # start area pre-gun; none of that motion is course progress.
+    #
+    # Two parts:
+    #   1. Drop batch samples timestamped before the gun.
+    #   2. Discard persisted detector_state whose CPA (min_ts) predates
+    #      the gun — or whose provenance can't be verified (no min_ts).
+    #      A discarded state costs at most a couple of depart-confirm
+    #      samples; a poisoned one costs the whole race.
+    # Marks past the first need no filter: the detector can only reach
+    # them after a legitimate post-gun start pass.
+    if start_at is not None and next_idx == 0:
+        gun = _as_utc(start_at)
+        new_points = [p for p in new_points if _as_utc(p.ts) >= gun]
+        if detector_state:
+            raw_min_ts = detector_state.get("min_ts")
+            state_ts = (
+                _parse_iso(raw_min_ts)
+                if isinstance(raw_min_ts, str)
+                else None
+            )
+            if state_ts is None or _as_utc(state_ts) < gun:
+                detector_state = None
+    else:
+        new_points = list(new_points)
+
+    # ── v4 gate detection (added 2026-07-02) ────────────────────────
+    # Resolve the start/finish line bearing when the detector is
+    # watching either line mark. Precedence: user override → cached →
+    # forecast (resolved once, persisted, throttled on failure). None
+    # simply degrades those marks to v3 CPA.
+    line_bearing: Optional[float] = None
+    if next_idx == 0 or next_idx == len(detector_marks) - 1:
+        line_bearing = await resolve_start_line_bearing(
+            conn,
+            race_id=race_id,
+            marks=marks,
+            start_at=start_at,
+            override=start_line_bearing_override,
+            cached=start_line_bearing_deg,
+        )
+    elif start_line_bearing_override is not None:
+        line_bearing = float(start_line_bearing_override)
+    elif start_line_bearing_deg is not None:
+        line_bearing = float(start_line_bearing_deg)
+
+    det = GateAwareDetector(
         detector_marks,
+        gates=build_gates(marks, line_bearing),
         threshold_m=thresholds_for_course(len(detector_marks), mode=mode),
         next_mark_index=next_idx,
         state=detector_state,

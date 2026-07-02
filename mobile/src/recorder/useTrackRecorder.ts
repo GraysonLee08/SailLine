@@ -561,6 +561,15 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     setError(null);
     setRecording(true);
 
+    // Fresh breadcrumb for this session. Points intentionally survive
+    // stop() — the post-race Debrief screen (app/(app)/debrief/[id].tsx)
+    // draws the just-sailed track straight from memory — so the reset
+    // lives HERE, when the next recording begins, not in stop(). The
+    // crash-recovery restore below re-populates from the persisted
+    // queue when one exists.
+    setPoints([]);
+    setLastPoint(null);
+
     // ── Phase 2 — reset stats + restore log for this race ────────────
     statsRef.current = emptyLiveStats();
     logRef.current = await loadLog(id);

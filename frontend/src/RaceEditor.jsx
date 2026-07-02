@@ -10,8 +10,10 @@
 // coordinates. This avoids the (0, 0) Atlantic-Ocean default that
 // stretched the course line halfway across the world.
 //
-// Save validates that every mark has real coordinates before posting —
-// the API requires float lat/lon and would 422 on null otherwise.
+// Save validates that every mark has real coordinates and a rounding
+// side ("Leave Mark to" port/starboard) before posting — the API
+// requires float lat/lon and would 422 on null otherwise, and the
+// routing engine needs the rounding side to shape the course.
 //
 // Hovering a marker on the map shows a popup with its name, formatted
 // coords, and (for library marks) the race-book description.
@@ -67,6 +69,13 @@ const isPlaced = (m) =>
 
 const EMPTY_FC = { type: "FeatureCollection", features: [] };
 
+// MORF sailing instructions default to port roundings on buoy courses,
+// so preset marks arrive pre-filled with "port". Per-course exceptions
+// need verification against the race book — the course table in
+// @sailline/shared encodes no rounding side, only mark order. The user
+// can still change any mark's side in the row dropdown.
+const DEFAULT_MORF_ROUNDING = "port";
+
 export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   const isNew = !raceId;
 
@@ -102,6 +111,12 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
   // means partial input ("date but no time yet") doesn't crash anything.
   const [startDate, setStartDate] = useState(""); // "YYYY-MM-DD"
   const [startTime, setStartTime] = useState(""); // "HH:mm"
+
+  // Optional start-line bearing override, kept as the raw input string
+  // ("" = unset → null in the payload). Validated to 0 ≤ x < 360 on
+  // save; the backend derives the bearing from forecast wind at gun
+  // time when this is null.
+  const [startLineBearing, setStartLineBearing] = useState("");
 
   // 'dm' = deg-decimal-min (sailor default), 'decimal' = decimal degrees.
   // Persisted so it sticks across sessions / races.
@@ -150,6 +165,11 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
         setBoatId(race.boat_id ?? null);
         setUsesSpinnaker(race.uses_spinnaker !== false);
         setRaceUserId(race.user_id ?? null);
+        setStartLineBearing(
+          race.start_line_bearing_override != null
+            ? String(race.start_line_bearing_override)
+            : "",
+        );
         const parts = isoToLocalParts(race.start_at);
         setStartDate(parts.date);
         setStartTime(parts.time);
@@ -447,6 +467,14 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
       ),
     );
 
+  // "" (the placeholder option) → null so an unset side stays falsy for
+  // the save-time validation (which blocks the save before any payload
+  // with a missing rounding is built).
+  const setRounding = (i, value) =>
+    setMarks((prev) =>
+      prev.map((m, idx) => (idx === i ? { ...m, rounding: value || null } : m)),
+    );
+
   // New marks start unplaced — null lat/lon. The user fills in coords
   // via the inputs, or by dragging once a coord is entered.
   const addEmptyMark = () =>
@@ -478,7 +506,16 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
     }
     // Tag every mark with a fresh _animKey and use the "__all__" sentinel
     // so all rows scale-bounce in together when a preset is loaded.
-    setMarks(next.map((m) => ({ ...m, _animKey: newAnimKey() })));
+    // Preset marks arrive with the MORF default rounding pre-filled
+    // (the shared course table doesn't encode a side) — the user can
+    // still flip individual marks before saving.
+    setMarks(
+      next.map((m) => ({
+        ...m,
+        rounding: m.rounding ?? DEFAULT_MORF_ROUNDING,
+        _animKey: newAnimKey(),
+      })),
+    );
     setJustAddedMarkKey("__all__");
     fittedRef.current = false;
     lastFitCountRef.current = 0;
@@ -506,6 +543,32 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
       );
       return;
     }
+    // Every placed mark needs a rounding side — the routing engine can't
+    // shape the course around a mark without knowing which way to leave
+    // it. Description stays optional.
+    const noRounding = marks.find((m) => isPlaced(m) && !m.rounding);
+    if (noRounding) {
+      setError(
+        `Mark "${noRounding.name || "(unnamed)"}" is missing a "Leave Mark to" ` +
+          `side. Pick Port or Starboard before saving.`,
+      );
+      return;
+    }
+    // Bearing override: empty = null (derive from forecast wind at gun
+    // time); otherwise must parse to a number in [0, 360).
+    let bearingOverride = null;
+    const bearingStr = startLineBearing.trim();
+    if (bearingStr !== "") {
+      const b = Number(bearingStr);
+      if (!Number.isFinite(b) || b < 0 || b >= 360) {
+        setError(
+          "Start line bearing must be a number from 0 to 359, or blank " +
+            "to derive it from forecast wind at gun time.",
+        );
+        return;
+      }
+      bearingOverride = b;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -520,9 +583,11 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
           name: m.name,
           lat: m.lat,
           lon: m.lon,
+          rounding: m.rounding,
           ...(m.description ? { description: m.description } : {}),
         })),
         start_at: startAtIso, // null when either half is unset
+        start_line_bearing_override: bearingOverride,
         auto_start_enabled: autoStartEnabled,
         boat_id: boatId,
         uses_spinnaker: usesSpinnaker,
@@ -720,6 +785,23 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
               )}
             </Section>
 
+            <Section label="Start line bearing (°)">
+              <input
+                type="number"
+                min={0}
+                max={359}
+                step="any"
+                value={startLineBearing}
+                onChange={(e) => setStartLineBearing(e.target.value)}
+                placeholder="e.g. 270"
+                style={styles.input}
+                aria-label="Start line bearing override in degrees"
+              />
+              <p style={styles.fieldHint}>
+                Leave blank to derive from forecast wind at gun time.
+              </p>
+            </Section>
+
             <Section label="MORF course preset">
               <select
                 value=""
@@ -765,6 +847,7 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
                       onRename={(v) => renameMark(i, v)}
                       onLat={(v) => updateCoord(i, "lat", v)}
                       onLon={(v) => updateCoord(i, "lon", v)}
+                      onRounding={(v) => setRounding(i, v)}
                       onUp={() => moveUp(i)}
                       onDown={() => moveDown(i)}
                       onDelete={() => deleteMark(i)}
@@ -800,7 +883,7 @@ export default function RaceEditor({ raceId, onClose, onSaved, currentUid }) {
 
 function MarkRow({
   index, mark, format, isFirst, isLast, justAddedMarkKey,
-  onRename, onLat, onLon, onUp, onDown, onDelete,
+  onRename, onLat, onLon, onRounding, onUp, onDown, onDelete,
 }) {
   // Pick formatters based on the active format. parseCoord handles both
   // formats regardless, so users can still paste decimal into a deg-min
@@ -927,6 +1010,25 @@ function MarkRow({
           }}
           title="Decimal (-87.55683) or deg-min (87 33.41 W) both accepted"
         />
+      </div>
+      {/* "Leave Mark to" from the race book. New/hand-dropped marks start
+          unset (placeholder option) and must be picked before save;
+          MORF presets arrive pre-filled with the port default. */}
+      <div style={styles.markRowRounding}>
+        <span style={styles.roundingLabel}>Leave Mark to</span>
+        <select
+          value={mark.rounding || ""}
+          onChange={(e) => onRounding(e.target.value)}
+          style={{
+            ...styles.roundingSelect,
+            color: mark.rounding ? "var(--ink)" : "var(--ink-3)",
+          }}
+          aria-label="Leave Mark to"
+        >
+          <option value="">— pick —</option>
+          <option value="port">Port</option>
+          <option value="starboard">Starboard</option>
+        </select>
       </div>
     </li>
   );
@@ -1168,10 +1270,14 @@ const styles = {
   formatToggle: { display: "flex", border: "1px solid var(--rule)", borderRadius: "var(--r-sm)", overflow: "hidden" },
   formatBtn: { border: "none", padding: "4px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer", textTransform: "uppercase", letterSpacing: "0.04em", fontWeight: 500 },
   hint: { fontSize: 13, color: "var(--ink-3)", margin: "0 0 12px", lineHeight: 1.5 },
+  fieldHint: { fontSize: 12, color: "var(--ink-3)", margin: "6px 0 0", lineHeight: 1.4 },
   marksList: { listStyle: "none", padding: 0, margin: "0 0 12px" },
   markRow: { padding: "10px 0", borderBottom: "1px solid var(--rule)" },
   markRowTop: { display: "flex", alignItems: "center", gap: 6 },
   markRowBottom: { display: "flex", alignItems: "center", gap: 6, marginTop: 6, paddingLeft: 30 },
+  markRowRounding: { display: "flex", alignItems: "center", gap: 6, marginTop: 6, paddingLeft: 30 },
+  roundingLabel: { fontSize: 11, color: "var(--ink-3)", textTransform: "uppercase", letterSpacing: "0.04em", fontWeight: 500, flexShrink: 0 },
+  roundingSelect: { flex: 1, minWidth: 0, height: 28, padding: "0 8px", border: "1px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 12, background: "var(--paper)", outline: "none", boxSizing: "border-box", fontFamily: "inherit" },
   markIdx: { width: 24, height: 24, borderRadius: "50%", background: "var(--ink)", color: "var(--paper)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 600, flexShrink: 0 },
   markName: { flex: 1, minWidth: 0, height: 30, border: "1px solid transparent", background: "transparent", fontSize: 13, color: "var(--ink)", padding: "0 6px", borderRadius: "var(--r-sm)", outline: "none", fontFamily: "inherit" },
   coordInput: { flex: 1, minWidth: 0, height: 28, padding: "0 8px", border: "1px solid var(--rule)", borderRadius: "var(--r-sm)", fontSize: 12, fontFamily: "var(--mono, ui-monospace, monospace)", color: "var(--ink)", background: "var(--paper)", outline: "none", boxSizing: "border-box" },

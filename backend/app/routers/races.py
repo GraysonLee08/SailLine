@@ -49,6 +49,12 @@ class Mark(BaseModel):
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
     description: Optional[str] = Field(default=None, max_length=500)
+    # v4 gate detection (2026-07-02): which side the boat leaves the
+    # mark to ("Leave Mark to" in the race book). Drives the rounding
+    # ray in mark_gates.build_gates. Optional at the API layer so
+    # pre-v4 races and old clients keep working — marks without it
+    # fall back to CPA detection. The web editor enforces it on save.
+    rounding: Optional[Literal["port", "starboard"]] = None
 
 
 class RaceCreate(BaseModel):
@@ -64,6 +70,11 @@ class RaceCreate(BaseModel):
     # D2: per-race boat link + spinnaker choice.
     boat_id: Optional[UUID] = None
     uses_spinnaker: bool = True
+    # v4: manual start/finish line bearing (degrees true, the line's
+    # axis). NULL = derive from forecast wind at gun time.
+    start_line_bearing_override: Optional[float] = Field(
+        default=None, ge=0, lt=360,
+    )
 
 
 class RaceUpdate(BaseModel):
@@ -79,6 +90,9 @@ class RaceUpdate(BaseModel):
     auto_start_enabled: Optional[bool] = None
     boat_id: Optional[UUID] = None
     uses_spinnaker: Optional[bool] = None
+    start_line_bearing_override: Optional[float] = Field(
+        default=None, ge=0, lt=360,
+    )
 
 
 class RaceOut(BaseModel):
@@ -93,6 +107,7 @@ class RaceOut(BaseModel):
     auto_start_enabled: bool = True
     boat_id: Optional[UUID] = None
     uses_spinnaker: bool = True
+    start_line_bearing_override: Optional[float] = None
     # D3: who created the race. Frontend uses this to decide whether
     # to render the editor as read-only (creator vs crew/viewer).
     user_id: Optional[str] = None
@@ -105,7 +120,7 @@ class RaceOut(BaseModel):
 _SELECT_COLS = """
     id, name, mode, boat_class, marks, start_at, started_at, ended_at,
     auto_start_enabled, boat_id, uses_spinnaker, user_id,
-    created_at, updated_at
+    start_line_bearing_override, created_at, updated_at
 """
 
 # Same columns, aliased to the ``r`` table for queries that JOIN
@@ -113,7 +128,8 @@ _SELECT_COLS = """
 _SELECT_COLS_R = """
     r.id, r.name, r.mode, r.boat_class, r.marks, r.start_at,
     r.started_at, r.ended_at, r.auto_start_enabled, r.boat_id,
-    r.uses_spinnaker, r.user_id, r.created_at, r.updated_at
+    r.uses_spinnaker, r.user_id, r.start_line_bearing_override,
+    r.created_at, r.updated_at
 """
 
 
@@ -139,6 +155,7 @@ def _row_to_race(row: asyncpg.Record) -> dict:
         "auto_start_enabled": row["auto_start_enabled"],
         "boat_id": row["boat_id"],
         "uses_spinnaker": row["uses_spinnaker"],
+        "start_line_bearing_override": row["start_line_bearing_override"],
         "user_id": row.get("user_id") if hasattr(row, "get") else row["user_id"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -198,9 +215,10 @@ async def create_race(
             f"""
             INSERT INTO race_sessions (
                 user_id, name, mode, boat_class, marks, start_at,
-                auto_start_enabled, boat_id, uses_spinnaker
+                auto_start_enabled, boat_id, uses_spinnaker,
+                start_line_bearing_override
             )
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10)
             RETURNING {_SELECT_COLS}
             """,
             user["uid"],
@@ -212,6 +230,7 @@ async def create_race(
             payload.auto_start_enabled,
             payload.boat_id,
             payload.uses_spinnaker,
+            payload.start_line_bearing_override,
         )
     return _row_to_race(row)
 
@@ -276,6 +295,12 @@ async def update_race(
         else:
             set_parts.append(f"{key} = ${idx}")
             args.append(value)
+
+    # Editing the course or the gun time invalidates the cached
+    # forecast-derived start-line bearing (0022) — the line hangs off
+    # mark 0 at start_at. NULL makes the ingest path re-resolve.
+    if "marks" in updates or "start_at" in updates:
+        set_parts.append("start_line_bearing_deg = NULL")
 
     set_parts.append("updated_at = NOW()")
     # Append race_id as the final placeholder for the UPDATE.

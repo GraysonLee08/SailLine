@@ -92,6 +92,10 @@ def _race_row(
         "start_at": start_at,
         "mode": mode,
         "detector_state": detector_state,
+        # v4 line-bearing columns (0022). None → CPA fallback for the
+        # start/finish marks — the v3 behaviour these tests assume.
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
 

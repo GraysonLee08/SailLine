@@ -75,6 +75,8 @@ async def test_load_race_for_ingest_returns_parsed_jsonb(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": None,
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -98,6 +100,8 @@ async def test_load_race_for_ingest_parses_string_jsonb(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": json.dumps(state),
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -118,6 +122,8 @@ async def test_load_race_for_ingest_handles_null_jsonb(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": None,
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     out = await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -147,6 +153,8 @@ async def test_load_race_for_ingest_uses_write_predicate(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": None,
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -173,6 +181,8 @@ async def test_load_race_for_ingest_acquires_for_update(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": None,
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")
@@ -193,6 +203,8 @@ async def test_load_race_for_ingest_reads_detector_state_column(conn):
         "start_at": None,
         "mode": "distance",
         "detector_state": None,
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
     await track_ingest.load_race_for_ingest(conn, uuid4(), "uid")

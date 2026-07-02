@@ -2,6 +2,12 @@
 // during a race. Powers the missed-mark notifier's "next expected mark"
 // logic (and, post-race, anything that reads the pass list).
 //
+// 2026-07-02: also surfaces the race row's `ended_at`. The v4 finish-
+// gate detector sets it server-side the moment the boat crosses the
+// finish — the recording screen watches the value to auto-stop the
+// recorder. Piggybacks on the poll this hook already runs (getRace
+// returns the full row), so no second poller needed.
+//
 // Source of truth: the SERVER, always. Passes are written exclusively by
 // the backend mark-rounding detector on track ingest. There is no client
 // writer — the manual-pass path (markManualPass / recordManualMarkPass /
@@ -37,6 +43,10 @@ type Options = {
 export type UseMarkPassesApi = {
   /** Current list of passes, sorted by mark_index ascending. */
   passes: MarkPass[];
+  /** Server-authoritative race end. Null while the race is underway;
+   *  set by the v4 finish-gate detector (or a manual /end) — the
+   *  recording screen's auto-stop effect watches for the flip. */
+  endedAt: string | null;
   /** True until the first fetch completes. */
   loading: boolean;
   /** Last fetch error, sticky until the next success. */
@@ -47,6 +57,7 @@ export type UseMarkPassesApi = {
 
 export function useMarkPasses({ raceId, recording }: Options): UseMarkPassesApi {
   const [passes, setPasses] = useState<MarkPass[]>([]);
+  const [endedAt, setEndedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,6 +70,7 @@ export function useMarkPasses({ raceId, recording }: Options): UseMarkPassesApi 
     const id = raceIdRef.current;
     if (!id) {
       setPasses([]);
+      setEndedAt(null);
       setLoading(false);
       return;
     }
@@ -71,6 +83,7 @@ export function useMarkPasses({ raceId, recording }: Options): UseMarkPassesApi 
         .slice()
         .sort((a, b) => a.mark_index - b.mark_index);
       setPasses(serverPasses);
+      setEndedAt(race.ended_at ?? null);
       setError(null);
       setLoading(false);
     } catch (e) {
@@ -84,6 +97,7 @@ export function useMarkPasses({ raceId, recording }: Options): UseMarkPassesApi 
   useEffect(() => {
     if (!raceId) {
       setPasses([]);
+      setEndedAt(null);
       setLoading(false);
       return;
     }
@@ -98,5 +112,5 @@ export function useMarkPasses({ raceId, recording }: Options): UseMarkPassesApi 
     await fetchOnce();
   }, [fetchOnce]);
 
-  return { passes, loading, error, refresh };
+  return { passes, endedAt, loading, error, refresh };
 }

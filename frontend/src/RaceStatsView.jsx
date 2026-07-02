@@ -14,7 +14,8 @@
 //   4. Wind summary card (only when wind_snapshot exists)
 //   5. Leg-by-leg table
 //   6. Speed-over-time sparkline (inline SVG, no chart library)
-//   7. Read-only map: course marks + recorded track polyline
+//   7. Read-only map: course marks + recorded track polyline + the
+//      computed route the sailor raced against (track vs plan)
 //
 // Pulls all backend data through useRaceStats. The map uses the new
 // MapCanvas + MarksLayer + TrackLayer composition (see
@@ -22,14 +23,41 @@
 
 import { useEffect, useMemo, useState } from "react";
 
+import { apiFetch } from "./api";
 import { useRaceStats } from "./hooks/useRaceStats";
 import { MapCanvas } from "./components/MapCanvas.jsx";
 import { MarksLayer } from "./components/layers/MarksLayer.jsx";
+import { RouteLayer } from "./components/layers/RouteLayer.jsx";
 import { TrackLayer } from "./components/layers/TrackLayer.jsx";
 
 export default function RaceStatsView({ raceId, onBack, tier = "free" }) {
   const { data, track, loading, error, regenerating, regenerate } =
     useRaceStats(raceId);
+
+  // Computed-route overlay for the post-race map (2026-07-02). POST
+  // /api/routing/compute is idempotent + Redis-cached, so this returns
+  // the same plan the sailor raced against without a recompute button.
+  // Any failure — 425 forecast window, <2 marks, engine error — silently
+  // omits the layer: this view is read-only and the track is the star.
+  const [plannedRoute, setPlannedRoute] = useState(null);
+  useEffect(() => {
+    if (!raceId) return undefined;
+    let cancelled = false;
+    setPlannedRoute(null);
+    apiFetch("/api/routing/compute", {
+      method: "POST",
+      body: { race_id: raceId },
+    })
+      .then((res) => {
+        if (!cancelled) setPlannedRoute(res?.route || null);
+      })
+      .catch(() => {
+        /* silently omit the route layer */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [raceId]);
 
   if (!raceId) {
     return (
@@ -94,7 +122,11 @@ export default function RaceStatsView({ raceId, onBack, tier = "free" }) {
           <SpeedChart series={stats.speed_series} />
         ) : null}
 
-        <MapPanel marks={data?.marks || []} track={track || []} />
+        <MapPanel
+          marks={data?.marks || []}
+          track={track || []}
+          route={plannedRoute}
+        />
       </div>
     </div>
   );
@@ -434,7 +466,7 @@ function SpeedChart({ series }) {
 // ─── Map panel (read-only) ───────────────────────────────────────────
 
 
-function MapPanel({ marks, track }) {
+function MapPanel({ marks, track, route }) {
   const initialCenter = useMemo(() => {
     if (marks.length) {
       const lon = marks.reduce((a, m) => a + m.lon, 0) / marks.length;
@@ -464,6 +496,12 @@ function MapPanel({ marks, track }) {
           interactive
           containerStyle={{ position: "absolute", inset: 0 }}
         >
+          {/* Mounted first (route may arrive after the compute round
+              trip) so its layer sits UNDER the track + marks: actual is
+              truth, planned is reference — same convention as mobile.
+              RouteLayer handles route=null by drawing nothing. `cached`
+              skips the reveal animation; the user already saw it live. */}
+          <RouteLayer route={route} cached />
           <MarksLayer marks={marks} fitOnMount={marks.length > 0} />
           <TrackLayer points={track} showEndpoints />
         </MapCanvas>

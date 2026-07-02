@@ -120,6 +120,61 @@ export async function endRace(raceId: string): Promise<Race> {
   return normaliseRace(data);
 }
 
+/**
+ * endRace with retries (2026-07-02). The Beer Can 7.1.2026 race ended
+ * with `ended_at` NULL because the single silent endRace call from the
+ * Stop handler failed — which meant the ENTIRE post-race pipeline
+ * (stats, wind snapshot, AI summary) never ran. This wrapper retries
+ * with exponential backoff (1 s, 2 s, 4 s between attempts) before
+ * giving up, and the caller is expected to SURFACE the final failure to
+ * the user rather than swallow it. The server-side stale-race sweep
+ * (workers/race_sweep.py) is the backstop of last resort, but that
+ * runs on a schedule — the user shouldn't wait an hour for their
+ * summary because of one dropped request.
+ */
+export async function endRaceWithRetry(
+  raceId: string,
+  attempts = 3,
+): Promise<Race> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await endRace(raceId);
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) {
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/** A recorded GPS fix as returned by GET /api/races/{id}/track — mirrors
+ *  backend tracks.py::TrackPointOut. Note there is no gps_acc_m on the
+ *  wire; callers that need the recorder's LocalPoint shape fill it with
+ *  null. */
+export type TrackPoint = {
+  recorded_at: string;
+  lat: number;
+  lon: number;
+  speed_kts: number | null;
+  heading_deg: number | null;
+};
+
+/**
+ * Fetch every persisted track point for a race, chronological. Used by
+ * the Debrief screen's fallback path when the recorder's in-memory
+ * breadcrumb isn't available (old race opened from the list, or the app
+ * restarted since the recording stopped).
+ */
+export async function getTrack(raceId: string): Promise<TrackPoint[]> {
+  const data = await apiFetch<TrackPoint[]>(`/api/races/${raceId}/track`);
+  // The endpoint 200s with [] for a trackless race; normalise apiFetch's
+  // 204-null case defensively so callers never nullcheck.
+  return data ?? [];
+}
+
 /** A persisted mark-rounding event — matches the JSONB shape on
  *  race_sessions.mark_passes and the backend's track-ingest output.
  *  All passes are auto-detected: the manual-pass path was removed

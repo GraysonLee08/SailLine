@@ -86,6 +86,35 @@ steps:
       - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:$SHORT_SHA'
       - '--region=us-central1'
 
+  # 6. Same lockstep treatment for the race-sweep job (added 2026-07-02).
+  #    Hourly Cloud Scheduler execution ends orphaned races (started but
+  #    never ended) and runs their postprocess — the server-side backstop
+  #    for a dropped POST /end from the phone. One-time creation:
+  #      gcloud run jobs create race-sweep `
+  #        --image=us-central1-docker.pkg.dev/sailline/sailline/api:latest `
+  #        --region=us-central1 --command=python `
+  #        --args="-m,workers.race_sweep" `
+  #        --service-account=sailline-api@sailline.iam.gserviceaccount.com `
+  #        --vpc-connector=sailline-connector --vpc-egress=private-ranges-only `
+  #        --set-env-vars=<same as race-postprocess> --set-secrets=<same>
+  #      gcloud scheduler jobs create http race-sweep-hourly `
+  #        --location=us-central1 --schedule="17 * * * *" `
+  #        --uri="https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/sailline/jobs/race-sweep:run" `
+  #        --oauth-service-account-email=sailline-api@sailline.iam.gserviceaccount.com
+  #    Tolerant until the job exists: `jobs update` on a missing job fails
+  #    the whole build, and the one-time create is manual. Once created,
+  #    this keeps it in lockstep exactly like race-postprocess.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'update-sweep-job'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        gcloud run jobs update race-sweep \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:$SHORT_SHA \
+          --region=us-central1 \
+        || echo "WARNING: race-sweep job not found — create it once (see comment above), then this step keeps it updated."
+
 
 # Run as the dedicated build service account
 serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/sailline-cloudbuild@$PROJECT_ID.iam.gserviceaccount.com'

@@ -362,6 +362,8 @@ async def post_telemetry(
                     start_at=race["start_at"],
                     mode=race["mode"],
                     detector_state=race["detector_state"],
+                    start_line_bearing_override=race["start_line_bearing_override"],
+                    start_line_bearing_deg=race["start_line_bearing_deg"],
                 )
             else:
                 # No GPS in this flush — preserve the existing pass list

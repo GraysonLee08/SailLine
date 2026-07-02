@@ -158,24 +158,28 @@ export default function MapHomeScreen() {
 
   // Auto-start arming (mirrors what the legacy RecorderScreen did). When
   // the race has a scheduled start, arms the foreground timer + the
-  // OS-level T-6/T-5 fallbacks. The useEffect below detects the recorder
-  // flipping to recording and replaces the route to /recording — so the
-  // callback only needs to kick off startRecording, not navigate.
+  // OS-level T-6/T-5 fallbacks. The root-level RecordingGate
+  // (app/_layout.tsx) detects the recorder flipping to recording and
+  // replaces the route to /recording from ANY screen — so the callback
+  // only needs to kick off startRecording, not navigate.
   const auto = useAutoStartRecorder({
     raceId: selectedRace?.id ?? null,
     startAtIso: selectedRace?.start_at ?? null,
+    raceName: selectedRace?.name ?? null,
     enabled: !!selectedRace,
     recording: recorder.recording,
     start: startRecording,
   });
 
   // When the user picks a race: a FINISHED race (ended_at set) opens the
-  // read-only Review screen (AI recap + stats); an unraced race drops into
-  // the pre-race / Start flow on the map as before.
+  // map Debrief screen (track vs computed route + stats + AI recap — it
+  // supersedes the text-only Review screen, which stays routable as a
+  // fallback); an unraced race drops into the pre-race / Start flow on
+  // the map as before.
   const handleSelectRace = useCallback(
     (race: Race) => {
       if (race.ended_at) {
-        router.push(`/race-review/${race.id}`);
+        router.push(`/debrief/${race.id}`);
         return;
       }
       if (!setSelectedRace(race)) return;
@@ -188,22 +192,21 @@ export default function MapHomeScreen() {
     if (!setSelectedRace(null)) return;
   }, [setSelectedRace]);
 
-  // Start recording. The useEffect below replaces the route to /recording
-  // once recorder.recording flips to true, so we don't manually navigate
-  // here — keeps the "what triggered the screen change" logic in one
-  // place and avoids double-push when auto-start is also racing the same
-  // recording flag.
+  // Start recording. The root RecordingGate replaces the route to
+  // /recording once recorder.recording flips to true, so we don't
+  // manually navigate here — keeps the "what triggered the screen
+  // change" logic in one place and avoids double-push when auto-start
+  // is also racing the same recording flag.
   const handleStartRecording = useCallback(async () => {
     if (!selectedRace) return;
     await startRecording();
   }, [selectedRace, startRecording]);
 
-  // If a recording is in progress and the user lands here (e.g., after a
-  // crash recovery), bounce them to the recording chrome so they don't
-  // see a "start recording" CTA on an active session.
-  useEffect(() => {
-    if (recorder.recording) router.replace("/recording");
-  }, [recorder.recording]);
+  // Recording → /recording navigation moved to the root-level
+  // RecordingGate in app/_layout.tsx (2026-07-02). It sees the recorder
+  // from EVERY screen — the effect that used to live here only ran while
+  // home was mounted, which is why auto-start from the background never
+  // swapped the UI over (Beer Can 7.1.2026, observation 1).
 
   return (
     <View style={styles.root}>

@@ -15,8 +15,14 @@ export type RaceMark = {
   name: string;
   lat: number;
   lon: number;
-  /** Optional rounding side: "P" (port) or "S" (starboard). */
-  rounding?: "P" | "S" | null;
+  /** Race-book description; optional. */
+  description?: string | null;
+  /** "Leave Mark to" — drives the v4 gate detector's rounding ray
+   *  (2026-07-02). Optional: older races lack it and fall back to CPA
+   *  detection server-side. NOTE: an earlier declaration here said
+   *  "P" | "S" but nothing ever read or wrote that shape — the wire
+   *  contract is the full words, matching backend races.Mark. */
+  rounding?: "port" | "starboard" | null;
 };
 
 /** Recorded passage of a mark during a sailed race. Mirrors the
@@ -58,4 +64,8 @@ export type Race = {
   mark_passes?: MarkPass[];
   /** True when post-processing produced viewable stats. */
   stats_available?: boolean;
+  /** v4 (2026-07-02): manual start/finish line bearing (degrees true).
+   *  Null = derive from forecast wind at gun time. Read-only on mobile
+   *  today — set from the web race editor. */
+  start_line_bearing_override?: number | null;
 };

@@ -41,6 +41,8 @@ import BackgroundFetch from "react-native-background-fetch";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 
+import { ACTION_START_RECORDING } from "../notifications/raceCategories";
+
 // ── Module-scoped state ────────────────────────────────────────────────
 
 /**
@@ -127,8 +129,7 @@ export async function registerHandlers(): Promise<void> {
   notificationResponseSub?.remove();
   notificationResponseSub = Notifications.addNotificationResponseReceivedListener(
     (response) => {
-      const data = response.notification.request.content.data;
-      if (data?.kind !== "autoStart") return;
+      if (!isStartResponse(response)) return;
       // Defer to next tick so React has a chance to mount and the hook
       // can register its onFire ref if it hasn't yet.
       setTimeout(() => {
@@ -184,6 +185,25 @@ export function setOnFire(fn: (() => void | Promise<void>) | null): void {
 }
 
 /**
+ * Does this notification response mean "start the recorder"? Two shapes:
+ *   * a body tap on the T-6 auto-start notification (kind autoStart), or
+ *   * the "Start recording" action button on the start-failsafe
+ *     notification (kind startFailsafe — see notifications/raceEvents.ts).
+ * A body tap on the failsafe (no action) just opens the app; the user
+ * decides from there, so we deliberately require the explicit action.
+ */
+function isStartResponse(
+  response: Notifications.NotificationResponse,
+): boolean {
+  const data = response.notification.request.content.data;
+  if (data?.kind === "autoStart") return true;
+  return (
+    data?.kind === "startFailsafe" &&
+    response.actionIdentifier === ACTION_START_RECORDING
+  );
+}
+
+/**
  * Replay the last notification tap if it happened before the hook had a
  * chance to register onFire (cold start path). Called by the hook on
  * mount. Safe to call multiple times; tracks the last-handled id
@@ -196,8 +216,7 @@ export async function replayPendingTap(): Promise<void> {
     if (!response) return;
     const id = response.notification.request.identifier;
     if (id === lastHandledResponseId) return;
-    const data = response.notification.request.content.data;
-    if (data?.kind !== "autoStart") return;
+    if (!isStartResponse(response)) return;
     lastHandledResponseId = id;
     void onFire?.();
   } catch {

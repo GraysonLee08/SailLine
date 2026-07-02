@@ -119,6 +119,11 @@ def _race_row(
         # detector_state added in 0020 for cross-batch traversal
         # persistence. None == "fresh traversal" (default for a new race).
         "detector_state": detector_state,
+        # v4 line-bearing columns (0022). None == unresolved → the
+        # detector uses CPA for the start/finish marks, which is the
+        # exact v3 behaviour these tests were written against.
+        "start_line_bearing_override": None,
+        "start_line_bearing_deg": None,
     }
 
 

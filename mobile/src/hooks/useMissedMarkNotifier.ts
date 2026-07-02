@@ -10,7 +10,11 @@
 //   * Boat is now MORE than RECEDE_M away AND moving away (current
 //     distance > running minimum + RECEDE_BUFFER_M).
 //   * No pass has been emitted for this mark.
-//   * No notification has been fired in the last COOLDOWN_MS.
+//   * No notification has EVER been fired for this mark this session
+//     (2026-07-02 — was a 3-minute cooldown; the Beer Can 7.1.2026 race
+//     showed that when the detector wedges on a mark, a cooldown means
+//     the sailor gets nagged every 3 minutes for the whole race. One
+//     ask per mark: they answered the first time).
 //
 // Why these constants: the v3 detector fires within ~15 s of CPA when
 // the boat is < CPA threshold (250 m distance / 100 m inshore). If it
@@ -43,7 +47,6 @@ import type { RaceMark } from "../types";
 const APPROACH_M = 500; // running-min must drop below this to arm
 const RECEDE_M = 750; // current distance must exceed this to fire
 const RECEDE_BUFFER_M = 400; // current must also be running_min + this
-const COOLDOWN_MS = 3 * 60 * 1000; // don't re-fire within 3 min for same mark
 
 type Options = {
   raceId: string | null;
@@ -160,14 +163,14 @@ export function useMissedMarkNotifier({
 
     if (!recedingClear) return;
 
-    // Cooldown — never re-fire for the same mark within COOLDOWN_MS.
-    const now = Date.now();
+    // Fire AT MOST ONCE per mark per session. lastFireRef is cleared
+    // when nextIdx advances (a pass registered — the next mark deserves
+    // its own single chance), so this line only blocks REPEATS for the
+    // same wedged mark.
     const last = lastFireRef.current;
-    if (last && last.markIndex === nextIdx && now - last.firedAt < COOLDOWN_MS) {
-      return;
-    }
+    if (last && last.markIndex === nextIdx) return;
 
-    lastFireRef.current = { markIndex: nextIdx, firedAt: now };
+    lastFireRef.current = { markIndex: nextIdx, firedAt: Date.now() };
     void postMissedMarkNotification({
       raceId,
       markIndex: nextIdx,

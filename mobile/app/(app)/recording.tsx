@@ -17,7 +17,7 @@
 // when recording stops.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AppState, Pressable, StyleSheet, Text, View } from "react-native";
+import { Alert, AppState, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
@@ -38,6 +38,7 @@ import {
   dismissTacticsNotification,
   postTacticsNotification,
 } from "../../src/notifications/tactics";
+import { postRaceCompletedNotification } from "../../src/notifications/raceEvents";
 import { useLayerSettings } from "../../src/hooks/useLayerSettings";
 import { useMarkPasses } from "../../src/hooks/useMarkPasses";
 import { useMissedMarkNotifier } from "../../src/hooks/useMissedMarkNotifier";
@@ -46,7 +47,7 @@ import { useWeather } from "../../src/hooks/useWeather";
 import { useRoute } from "../../src/routing/RoutingContext";
 import { useRecorder } from "../../src/recorder/RecorderContext";
 import { useTheme } from "../../src/theme/ThemeProvider";
-import { endRace } from "../../src/api/races";
+import { endRaceWithRetry } from "../../src/api/races";
 import {
   wasAutoStartJustFired,
   clearAutoStartFiredFlag,
@@ -227,6 +228,46 @@ export default function RecordingScreen() {
     enabled: autoPass.enabled,
   });
 
+  // Auto-stop at the finish (2026-07-02 — race-night observation 3).
+  // The v4 finish-gate detector sets ended_at server-side the moment
+  // the boat crosses the line; useMarkPasses polls the race row every
+  // 15 s while recording, so within one poll of finishing we stop the
+  // recorder, confirm with a "Race completed" notification, and land
+  // on the debrief. Deliberately NO endRace call — the server already
+  // ended the race, and re-posting /end would stomp the detector's
+  // finish timestamp.
+  //
+  // Transition-guarded: fires only when ended_at flips null → set
+  // during THIS session (prev ref), so mounting onto a race that
+  // carries a stale ended_at from an earlier swept/ended session
+  // doesn't instantly kill the recording. autoStopFiredRef guards the
+  // async body against double-fire while stop() is in flight; it's
+  // reset if stop() throws so the sailor's manual Stop still works.
+  const autoStopFiredRef = useRef(false);
+  const prevEndedAtRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const endedAt = markPasses.endedAt;
+    const prev = prevEndedAtRef.current;
+    prevEndedAtRef.current = endedAt;
+    if (!recorder.recording || !selectedRace) return;
+    if (!endedAt || prev !== null) return;
+    if (autoStopFiredRef.current) return;
+    autoStopFiredRef.current = true;
+    const { id, name } = selectedRace;
+    void (async () => {
+      try {
+        await recorder.stop();
+      } catch {
+        // Stop failed — stay on the screen with the recorder live so
+        // the manual Stop button remains the way out.
+        autoStopFiredRef.current = false;
+        return;
+      }
+      await postRaceCompletedNotification({ raceId: id, raceName: name });
+      router.replace(`/debrief/${id}`);
+    })();
+  }, [markPasses.endedAt, recorder, selectedRace]);
+
   // Bounce out if the user navigated here without a race. Use replace,
   // not push, so the back stack doesn't trap them on /recording.
   useEffect(() => {
@@ -250,33 +291,61 @@ export default function RecordingScreen() {
     return () => clearTimeout(t);
   }, [selectedRace]);
 
-  if (!selectedRace) return null;
+  // End the race on the server, retrying, and SURFACE failure instead
+  // of swallowing it (2026-07-02). The Beer Can 7.1.2026 race ended
+  // with ended_at NULL because the old single silent endRace call
+  // failed — which meant stats, wind snapshot, and the AI summary never
+  // generated. endRaceWithRetry does 3 attempts with backoff; if it
+  // still fails the user gets an explicit choice. "Continue anyway" is
+  // recoverable: the server-side stale-race sweep (workers/race_sweep)
+  // ends orphaned races within the hour.
+  //
+  // Both exits land on the map debrief (/debrief/{id}) — track vs
+  // computed route + stats + AI recap. The recorder keeps its points in
+  // memory until the NEXT start (see useTrackRecorder.start), so the
+  // debrief draws the just-sailed track instantly without waiting on
+  // the backend copy.
+  const finalizeAndLeave = useCallback(async () => {
+    const id = selectedRace?.id;
+    if (!id) {
+      router.replace("/");
+      return;
+    }
+    try {
+      await endRaceWithRetry(id);
+      router.replace(`/debrief/${id}`);
+    } catch {
+      Alert.alert(
+        "Couldn't finalize race",
+        "Recording stopped, but the server didn't confirm the race end. " +
+          "Stats and the AI summary may be delayed until it goes through.",
+        [
+          { text: "Retry", onPress: () => void finalizeAndLeave() },
+          {
+            text: "Continue anyway",
+            style: "cancel",
+            onPress: () => router.replace(`/debrief/${id}`),
+          },
+        ],
+      );
+    }
+  }, [selectedRace?.id]);
 
   const handleStop = useCallback(async () => {
     await recorder.stop();
-    // Mark the race as ended and trigger the AI post-race summary.
-    // This ensures a summary is generated even when the auto-detector
-    // missed marks and the final mark was never crossed — the root
-    // cause of the missing AI summary from the Silly Race.
-    if (selectedRace?.id) {
-      try {
-        await endRace(selectedRace.id);
-      } catch {
-        // Best-effort — the recorder already stopped; a failure here
-        // just means the user can hit "Regenerate" from the Review
-        // screen later. Don't block navigation.
-      }
-    }
-    // After stopping, drop back to the map home so the race detail sheet
-    // re-appears with the same race still selected (handy for reviewing
-    // what just happened).
-    router.replace("/");
-  }, [recorder, selectedRace]);
+    await finalizeAndLeave();
+  }, [recorder, finalizeAndLeave]);
 
   const handleBack = useCallback(() => {
     if (recorder.recording) return;
     router.back();
   }, [recorder.recording]);
+
+  // NOTE: keep every hook above this line — an early return that skips
+  // hooks breaks React's hook ordering when selectedRace flips null
+  // mid-session (the bounce-out effect above). The callbacks used to
+  // sit below this return; moved 2026-07-02.
+  if (!selectedRace) return null;
 
   return (
     <View style={styles.root}>

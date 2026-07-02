@@ -10,20 +10,24 @@
 //
 // Phases the screen renders against:
 //   loading      — first fetch in flight, nothing yet.
-//   generating   — stats present, AI summary still being produced (poll).
+//   generating   — stats present, AI summary still being produced (poll
+//                  every 20 s, up to 10 min).
 //   ready        — ai_summary present.
-//   unavailable  — job finished but produced no summary (no wind / no key
-//                  / track not scoreable). Stats still shown.
+//   unavailable  — poll budget spent, or the job produced no summary
+//                  (no wind / no key / track not scoreable). Stats still
+//                  shown; Retry re-arms the budget.
 //   error        — fetch failed and we have nothing to show.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getRaceStats, type RaceStats } from "../api/raceStats";
 
-const POLL_MS = 4_000;
-// Stop auto-polling after ~80s so a permanently-pending race doesn't spin
-// forever; the user can still pull-to-refresh.
-const MAX_POLLS = 20;
+const POLL_MS = 20_000;
+// Stop auto-polling after 10 min (30 polls × 20 s) so a permanently-
+// pending race doesn't spin forever — the postprocess job normally lands
+// well inside that window. After the budget the phase flips to
+// "unavailable" and the Retry button re-arms it.
+const MAX_POLLS = 30;
 
 export type RaceStatsPhase =
   | "loading"
@@ -44,16 +48,21 @@ export type UseRaceStatsApi = {
 function derivePhase(
   data: RaceStats | null,
   error: string | null,
+  exhausted: boolean,
 ): RaceStatsPhase {
   if (!data) return error ? "error" : "loading";
   if (data.ai_summary) return "ready";
-  if (data.summary_pending) return "generating";
+  // summary_pending stays true server-side for as long as a summary is
+  // absent (see race_stats.py), so the poll budget is what keeps a race
+  // that will never get one from showing a spinner forever.
+  if (data.summary_pending && !exhausted) return "generating";
   return "unavailable";
 }
 
 export function useRaceStats(raceId: string | null): UseRaceStatsApi {
   const [data, setData] = useState<RaceStats | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exhausted, setExhausted] = useState(false);
   const pollsRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -76,6 +85,10 @@ export function useRaceStats(raceId: string | null): UseRaceStatsApi {
       if (stillGenerating && pollsRef.current < MAX_POLLS) {
         pollsRef.current += 1;
         timerRef.current = setTimeout(() => void fetchOnce(), POLL_MS);
+      } else if (stillGenerating) {
+        // Budget spent without a summary — stop the spinner (the phase
+        // flips to "unavailable"); Retry re-arms the budget.
+        setExhausted(true);
       }
     } catch (e) {
       // Keep the last-good data (sticky) so a transient blip mid-poll
@@ -88,6 +101,7 @@ export function useRaceStats(raceId: string | null): UseRaceStatsApi {
     pollsRef.current = 0;
     setData(null);
     setError(null);
+    setExhausted(false);
     clearTimer();
     if (raceId) void fetchOnce();
     return clearTimer;
@@ -95,8 +109,9 @@ export function useRaceStats(raceId: string | null): UseRaceStatsApi {
 
   const refresh = useCallback(async () => {
     pollsRef.current = 0; // re-arm the poll budget on a manual retry
+    setExhausted(false);
     await fetchOnce();
   }, [fetchOnce]);
 
-  return { data, phase: derivePhase(data, error), error, refresh };
+  return { data, phase: derivePhase(data, error, exhausted), error, refresh };
 }

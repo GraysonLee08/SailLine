@@ -55,6 +55,18 @@ export const ACTION_MARK_NOT_MISSED = "mark-not-missed";
 /** Action: stop the current recording (treats race as DNF). */
 export const ACTION_STOP_RACE = "stop-race";
 
+/** Fired at start_at + 2 min ONLY if every auto-start tier failed to
+ *  start the recorder — see notifications/raceEvents.ts::
+ *  scheduleStartFailsafe. Cancelled the moment recording starts, so if
+ *  the sailor ever sees this, tracking is genuinely NOT running. */
+export const CATEGORY_START_FAILSAFE = "sailline.start-failsafe";
+
+/** Action: start the recorder now. Dispatched through scheduledAutoStart's
+ *  onFire bridge (the same path the T-6 tap and T-5 BG fetch use) — the
+ *  response handler can't call the recorder hook directly. Opens the app
+ *  so the recording screen surfaces once the recorder flips live. */
+export const ACTION_START_RECORDING = "start-recording";
+
 // ── Registration ──────────────────────────────────────────────────────
 
 /**
@@ -82,6 +94,16 @@ export async function registerRaceNotificationCategories(): Promise<void> {
         options: { opensAppToForeground: true, isDestructive: true },
       },
     ]);
+    await Notifications.setNotificationCategoryAsync(
+      CATEGORY_START_FAILSAFE,
+      [
+        {
+          identifier: ACTION_START_RECORDING,
+          buttonTitle: "Start recording",
+          options: { opensAppToForeground: true },
+        },
+      ],
+    );
   } catch {
     // Category registration can fail on Expo Go (which we don't ship
     // anyway — see CLAUDE.md mobile section). Surface no error; the

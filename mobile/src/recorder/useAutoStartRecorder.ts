@@ -20,6 +20,17 @@
 // when the app hasn't been opened in a while. The T-6 notification is
 // the user-visible safety net for that case.
 //
+// Failsafe + confirmation (2026-07-02 interview):
+//   * A "recording is NOT running" notification is scheduled at
+//     start_at + 2 min whenever this hook arms ahead of the start, and
+//     cancelled the moment the recorder starts via ANY tier (or the
+//     race/arming changes). If it fires, all three tiers failed — its
+//     "Start recording" action button starts the recorder through the
+//     scheduledAutoStart onFire bridge. See notifications/raceEvents.ts.
+//   * When an auto tier starts the recorder while the app is NOT
+//     active, a "Recording started" notification confirms tracking is
+//     live (the in-app green banner can't be seen from a pocket).
+//
 // Differences from the original web version:
 //   - TypeScript signature.
 //   - Adds OS-level fallbacks (notification + BG fetch) alongside the
@@ -39,7 +50,13 @@
 //   timer per armed race) and the fix the user actually wanted.
 
 import { useEffect, useRef, useState } from "react";
+import { AppState } from "react-native";
 
+import {
+  cancelStartFailsafe,
+  postRecordingStartedNotification,
+  scheduleStartFailsafe,
+} from "../notifications/raceEvents";
 import {
   cancelAutoStart,
   replayPendingTap,
@@ -80,9 +97,39 @@ export function clearAutoStartFiredFlag(): void {
   _autoStartJustFired = false;
 }
 
+/**
+ * Shared post-fire side-effects, run by every auto-start tier AFTER
+ * start() resolves (deliberately not when it throws — a failed start
+ * means the failsafe's premise still holds):
+ *
+ *   1. Disarm the start-failsafe immediately. The recording-transition
+ *      effect inside the hook is the authoritative backstop, but that
+ *      waits for the `recording` flag to propagate through React —
+ *      cancel here so a slow state flush can't race the T+2 fire time.
+ *   2. Post the "Recording started" confirmation when the app is NOT
+ *      active (BG-fetch tier, suspended-JS setTimeout tier). An in-app
+ *      start already shows the green "Auto-start activated" banner on
+ *      the recording screen — a notification on top would be noise.
+ */
+function onAutoStartFired(
+  raceId: string | null,
+  raceName: string | null,
+): void {
+  if (!raceId) return;
+  void cancelStartFailsafe(raceId);
+  if (AppState.currentState !== "active") {
+    void postRecordingStartedNotification({
+      raceId,
+      raceName: raceName ?? "Race",
+    });
+  }
+}
+
 type Args = {
   raceId: string | null;
   startAtIso: string | null;
+  /** For the "Recording started" notification body. */
+  raceName: string | null;
   enabled: boolean;
   recording: boolean;
   start: () => void | Promise<void>;
@@ -97,6 +144,7 @@ type Result = {
 export function useAutoStartRecorder({
   raceId,
   startAtIso,
+  raceName,
   enabled,
   recording,
   start,
@@ -111,6 +159,10 @@ export function useAutoStartRecorder({
   recordingRef.current = recording;
   const startRef = useRef(start);
   startRef.current = start;
+  const raceIdRef = useRef(raceId);
+  raceIdRef.current = raceId;
+  const raceNameRef = useRef(raceName);
+  raceNameRef.current = raceName;
 
   // Reset `fired` when the identifying key changes (new race or
   // re-scheduled start). Without this, editing start_at to a later time
@@ -128,6 +180,7 @@ export function useAutoStartRecorder({
       try {
         _autoStartJustFired = true;
         await startRef.current?.();
+        onAutoStartFired(raceIdRef.current, raceNameRef.current);
       } catch {
         /* swallow */
       }
@@ -152,6 +205,17 @@ export function useAutoStartRecorder({
     void replayPendingTap();
   }, []);
 
+  // ── Failsafe disarm on ANY recorder start ───────────────────────────
+  //
+  // The start-failsafe's only job is to fire when recording never
+  // started — so the moment `recording` flips true (auto-start, a
+  // manual Start tap, crash-recovery resume), disarm it. This is the
+  // authoritative cancel; onAutoStartFired() is the fast path the
+  // auto tiers run without waiting for this flag to propagate.
+  useEffect(() => {
+    if (recording && raceId) void cancelStartFailsafe(raceId);
+  }, [recording, raceId]);
+
   // ── Foreground setTimeout + OS-level fallback scheduling ────────────
   useEffect(() => {
     const key =
@@ -171,8 +235,11 @@ export function useAutoStartRecorder({
     if (!key || !startAtIso || !raceId) {
       // Disabled or no race — make sure any prior OS-level schedule for
       // the previous race is cleared (otherwise switching races would
-      // leak a stale T-5 task).
-      if (raceId) void cancelAutoStart(raceId);
+      // leak a stale T-5 task). Same for the start-failsafe.
+      if (raceId) {
+        void cancelAutoStart(raceId);
+        void cancelStartFailsafe(raceId);
+      }
       return;
     }
 
@@ -200,18 +267,26 @@ export function useAutoStartRecorder({
       const sincePast = -delay;
       if (sincePast > ARM_OFFSET_MS + ARM_WINDOW_MS) {
         // Race started long ago — don't auto-start. Also cancel the
-        // OS-level fallbacks (no value firing now).
+        // OS-level fallbacks (no value firing now) + the failsafe.
         void cancelAutoStart(raceId);
+        void cancelStartFailsafe(raceId);
         return;
       }
+      // No failsafe scheduling on this late-arm path: the user is
+      // in-app looking at the race (that's how we got here) and the
+      // immediate fire below starts the recorder right away — a
+      // schedule/cancel pair racing each other buys nothing.
       const t = setTimeout(() => {
         if (!recordingRef.current) {
-          try {
-            _autoStartJustFired = true;
-            void startRef.current?.();
-          } catch {
-            /* recorder may throw if no raceId — silently swallow */
-          }
+          _autoStartJustFired = true;
+          void (async () => {
+            try {
+              await startRef.current?.();
+              onAutoStartFired(raceId, raceNameRef.current);
+            } catch {
+              /* recorder may throw if no raceId — silently swallow */
+            }
+          })();
         }
         firedKeys.add(key);
         setFired(true);
@@ -225,6 +300,19 @@ export function useAutoStartRecorder({
 
     setArmed(true);
     setMsUntilFire(delay);
+
+    // Arm the start-failsafe alongside the T-6/T-5 fallbacks: a
+    // "recording is NOT running" notification at start_at + 2 min that
+    // only ever surfaces if every tier above failed to start the
+    // recorder. Disarmed by onAutoStartFired() / the recording-
+    // transition effect the moment recording begins, and by the cancel
+    // branches above when the race or arming changes. Guard on
+    // recordingRef: re-arming while already recording (user started
+    // early, then edited start_at) must not schedule a failsafe that
+    // nothing will cancel.
+    if (!recordingRef.current) {
+      void scheduleStartFailsafe(raceId, startAtIso);
+    }
 
     // One-shot dev-only breadcrumb so the next on-water test can
     // confirm the parsed startAt matches what the user expects (the
@@ -249,12 +337,15 @@ export function useAutoStartRecorder({
 
     const fireT = setTimeout(() => {
       if (!recordingRef.current) {
-        try {
-          _autoStartJustFired = true;
-          void startRef.current?.();
-        } catch {
-          /* swallow */
-        }
+        _autoStartJustFired = true;
+        void (async () => {
+          try {
+            await startRef.current?.();
+            onAutoStartFired(raceId, raceNameRef.current);
+          } catch {
+            /* swallow */
+          }
+        })();
       }
       firedKeys.add(key);
       setFired(true);
@@ -285,12 +376,15 @@ export function useAutoStartRecorder({
     return () => {
       clearTimeout(fireT);
       clearInterval(tickT);
-      // Note: we deliberately do NOT cancelAutoStart on every cleanup,
-      // because the cleanup also runs when the effect re-runs with the
-      // same key. scheduleAutoStart at the top of the next run is
-      // idempotent (it cancels then re-schedules), so leaving the
+      // Note: we deliberately do NOT cancelAutoStart (nor the
+      // failsafe) on every cleanup, because the cleanup also runs when
+      // the effect re-runs with the same key. scheduleAutoStart /
+      // scheduleStartFailsafe at the top of the next run are
+      // idempotent (they cancel then re-schedule), so leaving the
       // schedule in place between renders is safe and avoids a brief
-      // window where the fallback is unscheduled.
+      // window where the fallback is unscheduled. Unmount keeps them
+      // too — they're OS-level fallbacks for exactly the case where
+      // the app (and this hook) isn't around.
     };
   }, [raceId, startAtIso, enabled]);
 

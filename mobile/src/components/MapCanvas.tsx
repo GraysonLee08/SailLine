@@ -60,6 +60,11 @@ export type MapCanvasHandle = {
   locateMe: () => void;
   /** Fly to bounds containing all marks of the active race. */
   fitToRace: (race: Race) => void;
+  /** Fly to bounds containing an arbitrary point set — course marks +
+   *  recorded track on the debrief screen. Tighter padding than
+   *  fitToRace: callers of this method have no bottom sheet over the
+   *  map, so no 320px sheet-peek reservation. */
+  fitToPoints: (points: Array<{ lat: number; lon: number }>) => void;
   /**
    * Two-mode toggle, Google-Maps-compass-style:
    *   First call (or after any user-initiated rotation): snap heading to 0
@@ -347,6 +352,24 @@ export const MapCanvas = forwardRef<MapCanvasHandle, Props>(function MapCanvas(
           [maxLon, maxLat],
           [minLon, minLat],
           [120, 60, 320, 60],
+          900,
+        );
+        didInitialCenter.current = true;
+      },
+      fitToPoints: (points) => {
+        if (points.length === 0 || !camRef.current) return;
+        let minLon = Infinity, maxLon = -Infinity;
+        let minLat = Infinity, maxLat = -Infinity;
+        for (const p of points) {
+          if (p.lon < minLon) minLon = p.lon;
+          if (p.lon > maxLon) maxLon = p.lon;
+          if (p.lat < minLat) minLat = p.lat;
+          if (p.lat > maxLat) maxLat = p.lat;
+        }
+        camRef.current.fitBounds(
+          [maxLon, maxLat],
+          [minLon, minLat],
+          [60, 40, 60, 40],
           900,
         );
         didInitialCenter.current = true;
