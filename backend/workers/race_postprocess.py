@@ -15,8 +15,12 @@ What it does, in order:
   3. Snapshot the live wind forecast over the race window, IF the
      forecast is still in Redis and the marks resolve to a known
      region.
-  4. Generate an AI recap+tips via Anthropic (``services/race_summary``).
-  5. UPDATE race_sessions: ``ai_summary``, ``wind_snapshot``, ``heel_summary``.
+  4. Snapshot OBSERVED conditions from the nearest NDBC buoys/C-MAN
+     stations over the race window (``services/observations``) — the
+     "actuals" counterpart to the forecast snapshot in step 3.
+  5. Generate an AI recap+tips via Anthropic (``services/race_summary``).
+  6. UPDATE race_sessions: ``ai_summary``, ``wind_snapshot``,
+     ``obs_snapshot``, ``heel_summary``.
 
 Why a separate job, not in-line in the POST track endpoint:
 
@@ -63,6 +67,7 @@ from app.services.race_stats import (
     compute_stats,
     track_points_from_rows,
 )
+from app.services.observations import build_obs_snapshot
 from app.services.race_summary import (
     PROMPT_VERSION,
     generate_summary,
@@ -109,7 +114,7 @@ async def _load_race(
             SELECT
                 r.id, r.user_id, r.name, r.boat_class, r.start_at,
                 r.marks, r.mark_passes, r.ai_summary, r.wind_snapshot,
-                r.heel_summary, r.performance_summary,
+                r.obs_snapshot, r.heel_summary, r.performance_summary,
                 r.mode, r.uses_spinnaker, r.boat_id,
                 b.hcp    AS boat_hcp,
                 b.dhcp   AS boat_dhcp,
@@ -199,10 +204,11 @@ async def _persist(
     wind_snapshot: Optional[dict],
     heel_summary: Optional[dict],
     performance_summary: Optional[dict] = None,
+    obs_snapshot: Optional[dict] = None,
 ) -> None:
     """UPDATE race_sessions with whatever new fields we produced.
 
-    All four fields are JSONB. Pass None to leave a column untouched —
+    All five fields are JSONB. Pass None to leave a column untouched —
     we only overwrite a column when we have a fresh value for it.
 
     Note: ``compute_heel_summary`` returns None when there are no IMU
@@ -233,6 +239,10 @@ async def _persist(
     if performance_summary is not None:
         sets.append(f"performance_summary = ${i}::jsonb")
         args.append(performance_summary)
+        i += 1
+    if obs_snapshot is not None:
+        sets.append(f"obs_snapshot = ${i}::jsonb")
+        args.append(obs_snapshot)
         i += 1
     if not sets:
         return
@@ -311,6 +321,52 @@ async def _build_wind_snapshot(
     )
 
 
+# ─── Observed-conditions snapshot orchestration ──────────────────────
+
+
+async def _build_obs_snapshot(
+    marks: list[dict],
+    track_rows: list[dict],
+    track_started: datetime,
+    track_ended: datetime,
+) -> Optional[dict]:
+    """Fetch actual conditions from the nearest observation stations
+    (NDBC buoys/C-MAN) over the race window.
+
+    Query point: marks centroid when marks exist, else the track's
+    mean position — unlike the wind snapshot, observations need NO
+    region resolution (NDBC covers all US waters), so a race outside
+    every configured wind region still gets actuals.
+
+    Returns None when no stations are in range or nothing reported in
+    the window (seasonal buoy haul-out, NDBC outage). Not an error —
+    the column stays null and the next run retries.
+    """
+    pts = [
+        m for m in marks
+        if isinstance(m, dict) and "lat" in m and "lon" in m
+    ] or track_rows
+    if not pts:
+        return None
+    try:
+        lat_c = sum(float(p["lat"]) for p in pts) / len(pts)
+        lon_c = sum(float(p["lon"]) for p in pts) / len(pts)
+    except (TypeError, ValueError, KeyError):
+        return None
+
+    pad = _SNAPSHOT_PAD_H * 3600
+    try:
+        return await build_obs_snapshot(
+            lat=lat_c,
+            lon=lon_c,
+            t_start=track_started - timedelta(seconds=pad),
+            t_end=track_ended + timedelta(seconds=pad),
+        )
+    except Exception as e:  # noqa: BLE001 - never fail the job on obs
+        log.warning("obs snapshot: build failed (%s); skipping", e)
+        return None
+
+
 # ─── Orchestrator ─────────────────────────────────────────────────────
 
 
@@ -385,6 +441,20 @@ async def process_race(
     if force or not race.get("wind_snapshot"):
         new_snapshot = await _build_wind_snapshot(
             marks=marks,
+            track_started=stats.started_at,
+            track_ended=stats.ended_at,
+        )
+
+    # Observed conditions ("actuals") — same refresh-if-missing gating
+    # as the wind snapshot. Independent of region resolution, so this
+    # runs even when the wind step skipped. NDBC's realtime2 feed only
+    # spans 45 days, so a much later --force finds no in-window obs and
+    # gracefully keeps the column as-is.
+    new_obs_snapshot: Optional[dict] = None
+    if force or not race.get("obs_snapshot"):
+        new_obs_snapshot = await _build_obs_snapshot(
+            marks=marks,
+            track_rows=track_rows,
             track_started=stats.started_at,
             track_ended=stats.ended_at,
         )
@@ -477,12 +547,15 @@ async def process_race(
         wind_snapshot=new_snapshot,
         heel_summary=new_heel_summary,
         performance_summary=new_performance_summary,
+        obs_snapshot=new_obs_snapshot,
     )
     log.info(
-        "race %s: postprocess complete (summary=%s, snapshot=%s, heel=%s, perf=%s)",
+        "race %s: postprocess complete "
+        "(summary=%s, snapshot=%s, obs=%s, heel=%s, perf=%s)",
         race_id,
         "regenerated" if new_summary else "skipped",
         "refreshed" if new_snapshot else "skipped",
+        "refreshed" if new_obs_snapshot else "skipped",
         "refreshed" if new_heel_summary else "skipped",
         "refreshed" if new_performance_summary else "skipped",
     )

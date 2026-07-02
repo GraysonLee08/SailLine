@@ -238,19 +238,23 @@ async def test_detect_and_persist_emits_passes(conn):
     sql = conn.execute.await_args.args[0]
     assert "UPDATE race_sessions" in sql
     assert "mark_passes" in sql
-    # detector_state is part of the same UPDATE; emit case resets it to
-    # NULL because _reset_traversal_state ran inside feed().
+    # detector_state is part of the same UPDATE. v4: even after an emit
+    # the state is non-null — it carries the previous sample so a gate
+    # crossing that straddles the next batch boundary is still seen.
     assert "detector_state" in sql
     # Writers now pass the plain Python object to the ::jsonb param (the
     # asyncpg codec encodes once) — NOT a json.dumps string. So the arg is
     # the list itself, not a string to re-parse.
     persisted_passes = conn.execute.await_args.args[1]
     assert persisted_passes == new_p
-    # The second positional arg is the new detector_state JSONB. After
-    # an emit the state should be None (the traversal is done for this
-    # mark; next batch starts fresh on the next mark).
+    # The second positional arg is the new detector_state JSONB. v4
+    # (GateAwareDetector.dump_state): the CPA traversal was reset by the
+    # emit, so no traversal keys survive — but the previous sample is
+    # kept for cross-batch gate detection on the next mark.
     persisted_state = conn.execute.await_args.args[2]
-    assert persisted_state is None
+    assert persisted_state is not None
+    assert set(persisted_state) == {"prev_lat", "prev_lon", "prev_ts"}
+    assert persisted_state["prev_lat"] == pytest.approx(mark["lat"], abs=0.01)
 
 
 async def test_detect_and_persist_persists_state_when_no_passes(conn):

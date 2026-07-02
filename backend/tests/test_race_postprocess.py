@@ -49,6 +49,7 @@ def _make_race_row(
     wind_snapshot: Optional[dict] = None,
     heel_summary: Optional[dict] = None,
     performance_summary: Optional[dict] = None,
+    obs_snapshot: Optional[dict] = None,
 ) -> dict:
     return {
         "id": RACE_ID,
@@ -76,6 +77,7 @@ def _make_race_row(
         "wind_snapshot": wind_snapshot,
         "heel_summary": heel_summary,
         "performance_summary": performance_summary,
+        "obs_snapshot": obs_snapshot,
         # D2 columns
         "mode": "inshore",
         "uses_spinnaker": True,
@@ -94,6 +96,7 @@ class _Spy:
     def __init__(self) -> None:
         self.persist_calls: list[dict] = []
         self.wind_calls: int = 0
+        self.obs_calls: int = 0
         self.summary_calls: int = 0
         self.summary_kwargs: list[dict] = []
 
@@ -104,7 +107,7 @@ def spy(monkeypatch: pytest.MonkeyPatch):
 
     async def fake_persist(
         pool, race_id, *, ai_summary, wind_snapshot, heel_summary,
-        performance_summary=None,
+        performance_summary=None, obs_snapshot=None,
     ):
         s.persist_calls.append(
             {
@@ -112,12 +115,17 @@ def spy(monkeypatch: pytest.MonkeyPatch):
                 "wind_snapshot": wind_snapshot,
                 "heel_summary": heel_summary,
                 "performance_summary": performance_summary,
+                "obs_snapshot": obs_snapshot,
             }
         )
 
     async def fake_build_wind_snapshot(**kwargs: Any):
         s.wind_calls += 1
         return {"fake": "snapshot"}
+
+    async def fake_build_obs_snapshot(**kwargs: Any):
+        s.obs_calls += 1
+        return {"fake": "obs"}
 
     def fake_generate_summary(**kwargs: Any):
         s.summary_calls += 1
@@ -133,6 +141,9 @@ def spy(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(race_postprocess, "_persist", fake_persist)
     monkeypatch.setattr(
         race_postprocess, "_build_wind_snapshot", fake_build_wind_snapshot
+    )
+    monkeypatch.setattr(
+        race_postprocess, "_build_obs_snapshot", fake_build_obs_snapshot
     )
     monkeypatch.setattr(
         race_postprocess, "generate_summary", fake_generate_summary
@@ -210,20 +221,22 @@ async def test_skips_when_summary_current_and_snapshot_present(monkeypatch, spy)
             "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
+        obs_snapshot={"already": "there"},
     )
     _patch_loads(monkeypatch, race=race, track=_make_track_rows())
     rc = await race_postprocess.process_race(FakePool(), RACE_ID)
     assert rc == 0
-    # Neither AI nor wind ran.
+    # Neither AI nor wind nor obs ran.
     assert spy.summary_calls == 0
     assert spy.wind_calls == 0
+    assert spy.obs_calls == 0
     # _persist still called but with all fields None — no-op UPDATE.
     # heel_summary is also None here because the heel_summary column
     # was non-null in the seed row, so the "backfill" branch was skipped.
     assert len(spy.persist_calls) == 1
     assert spy.persist_calls[0] == {
         "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
-        "performance_summary": None,
+        "performance_summary": None, "obs_snapshot": None,
     }
 
 
@@ -483,6 +496,8 @@ async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
             "avg_actual_kts": 5.7,
             "by_leg": [],
         },
+        # Present so the obs backfill branch is also skipped.
+        obs_snapshot={"already": "there"},
     )
 
     # Track IMU loads to confirm we never reached them.
@@ -508,7 +523,7 @@ async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
     assert len(spy.persist_calls) == 1
     assert spy.persist_calls[0] == {
         "ai_summary": None, "wind_snapshot": None, "heel_summary": None,
-        "performance_summary": None,
+        "performance_summary": None, "obs_snapshot": None,
     }
 
 
@@ -635,6 +650,85 @@ async def test_performance_backfill_when_column_null_but_ai_current(monkeypatch,
     assert spy.persist_calls[0]["wind_snapshot"] is None
     assert spy.persist_calls[0]["performance_summary"] is not None
     assert spy.persist_calls[0]["performance_summary"]["sample_count"] == 3
+
+
+# ─── obs_snapshot plumbing (migration 0023) ────────────────────────────
+
+
+async def test_obs_snapshot_built_when_missing(monkeypatch, spy):
+    """Fresh race: the obs branch runs alongside wind and persists."""
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.obs_calls == 1
+    assert spy.persist_calls[0]["obs_snapshot"] == {"fake": "obs"}
+
+
+async def test_obs_snapshot_kept_when_present(monkeypatch, spy):
+    """Refresh-if-missing: an existing obs_snapshot is preserved even
+    when the AI summary regenerates."""
+    race = _make_race_row(obs_snapshot={"already": "there"})
+    _patch_loads(monkeypatch, race=race, track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.summary_calls == 1          # AI ran (no summary on row)
+    assert spy.obs_calls == 0              # obs did not
+    assert spy.persist_calls[0]["obs_snapshot"] is None
+
+
+async def test_obs_backfill_when_column_null_but_everything_else_current(
+    monkeypatch, spy,
+):
+    """Races processed before migration 0023: next run backfills obs
+    only — AI/wind/heel/perf all skip. Mirrors the heel backfill."""
+    race = _make_race_row(
+        ai_summary={
+            "recap": "current", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        obs_snapshot=None,
+    )
+    _patch_loads(monkeypatch, race=race, track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.summary_calls == 0
+    assert spy.wind_calls == 0
+    assert spy.obs_calls == 1
+    assert spy.persist_calls[0]["obs_snapshot"] == {"fake": "obs"}
+
+
+async def test_force_rebuilds_obs_snapshot(monkeypatch, spy):
+    race = _make_race_row(
+        ai_summary={
+            "recap": "x", "tips": [],
+            "model": "test", "prompt_version": PROMPT_VERSION,
+        },
+        wind_snapshot={"already": "there"},
+        obs_snapshot={"already": "there"},
+    )
+    _patch_loads(monkeypatch, race=race, track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID, force=True)
+    assert rc == 0
+    assert spy.obs_calls == 1
+
+
+async def test_obs_build_returning_none_persists_none(monkeypatch, spy):
+    """No stations in range / NDBC down → build returns None and the
+    column is left untouched (persist gets None, no overwrite)."""
+    async def no_obs(**kwargs):
+        spy.obs_calls += 1
+        return None
+    monkeypatch.setattr(race_postprocess, "_build_obs_snapshot", no_obs)
+
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.obs_calls == 1
+    assert spy.persist_calls[0]["obs_snapshot"] is None
+    # The rest of the pipeline was unaffected.
+    assert spy.persist_calls[0]["wind_snapshot"] is not None
+    assert spy.summary_calls == 1
 
 
 # ─── Cold-import regression (circular import guard) ────────────────────

@@ -79,6 +79,8 @@ def _make_row(**overrides):
         # D2 columns
         "boat_id": None,
         "uses_spinnaker": True,
+        # v4 gate column (migration 0022)
+        "start_line_bearing_override": None,
         "created_at": now,
         "updated_at": now,
     }

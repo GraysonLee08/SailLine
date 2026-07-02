@@ -99,8 +99,23 @@ def test_build_gates_kinds_with_bearing():
 
 
 def test_build_gates_falls_back_to_cpa_without_bearing_or_rounding():
+    """No bearing: start degrades to CPA (i == 0 can't build a ray);
+    a rounding-less intermediate mark degrades to CPA; but a FINISH
+    with a rounding side keeps a ray — ray+CPA union detects strictly
+    more than CPA alone, and under-detection at the last mark is what
+    wedged the 7.1 Beer Can. Decision 2026-07-02."""
     marks = _course_marks()
     del marks[1]["rounding"]
+    gates = build_gates(marks, line_bearing_deg=None)
+    assert [g.kind for g in gates] == ["cpa", "cpa", "ray"]
+
+
+def test_build_gates_all_cpa_without_bearing_or_any_rounding():
+    """With no bearing and no rounding values anywhere, everything
+    degrades to v3 CPA."""
+    marks = _course_marks()
+    del marks[1]["rounding"]
+    del marks[2]["rounding"]
     gates = build_gates(marks, line_bearing_deg=None)
     assert [g.kind for g in gates] == ["cpa", "cpa", "cpa"]
 

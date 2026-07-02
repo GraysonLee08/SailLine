@@ -206,9 +206,14 @@ def build_gates(
     """Build one :class:`GateSpec` per mark from the JSONB mark dicts.
 
     * Index 0 (start) and index n-1 (finish, when n > 1): LINE through
-      the mark along ``line_bearing_deg``, if a bearing is available —
-      otherwise CPA. Start is direction-gated toward mark 1; finish is
-      direction-gated from mark n-2.
+      the mark along ``line_bearing_deg``, if a bearing is available.
+      Start is direction-gated toward mark 1; finish is direction-gated
+      from mark n-2.
+    * Without a bearing, the START degrades to CPA. The FINISH degrades
+      to a rounding RAY when it carries a ``rounding`` value (decision
+      2026-07-02: ray + the always-on CPA union detects strictly more
+      than CPA alone, and under-detecting the last mark is what wedged
+      the 7.1 Beer Can pipeline), else CPA.
     * Intermediate marks: RAY on the passing side, when the mark has a
       valid ``rounding`` value — otherwise CPA.
 
