@@ -204,6 +204,21 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
     from app.services.polars import load_polar_for_class
     polar = load_polar_for_class(race["boat_class"])
 
+    # Pre-race playbook: directives from this boat's past races in
+    # matching conditions (post-race analysis v4). Cached per race;
+    # any failure degrades to "no playbook".
+    from app.services.tactics.playbook import get_playbook
+    playbook = None
+    try:
+        last_fix = track[-1]
+        playbook = await get_playbook(
+            redis=redis, pool=pool, race_id=race_id, uid=uid,
+            forecast=forecast, lat=last_fix["lat"], lon=last_fix["lon"],
+            now=now,
+        )
+    except Exception:  # noqa: BLE001 - never let the playbook break a call
+        log.exception("tactician: playbook lookup failed race=%s", race_id)
+
     from app.services.performance import evaluate_point
     evals: list[dict] = []
     for p in track:
@@ -272,6 +287,7 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
         },
         track=track, evals=evals, forecast=forecast,
         next_mark=next_mark, heel_stat=heel_stat,
+        playbook=playbook,
         recent_calls=[
             {"created_at": r["created_at"].isoformat(timespec="seconds"),
              "call_type": r["call_type"], "message": r["message"]}

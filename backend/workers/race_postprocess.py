@@ -68,6 +68,7 @@ from app.services.race_stats import (
     track_points_from_rows,
 )
 from app.services.observations import build_obs_snapshot
+from app.services.race_analysis import build_race_analysis
 from app.services.race_summary import (
     PROMPT_VERSION,
     generate_summary,
@@ -116,10 +117,13 @@ async def _load_race(
                 r.marks, r.mark_passes, r.ai_summary, r.wind_snapshot,
                 r.obs_snapshot, r.heel_summary, r.performance_summary,
                 r.mode, r.uses_spinnaker, r.boat_id,
+                r.start_line_bearing_override,
+                r.start_line_bearing_deg,
                 b.hcp    AS boat_hcp,
                 b.dhcp   AS boat_dhcp,
                 b.nshcp  AS boat_nshcp,
-                b.dnshcp AS boat_dnshcp
+                b.dnshcp AS boat_dnshcp,
+                b.loa    AS boat_loa
             FROM race_sessions r
             LEFT JOIN boats b ON b.id = r.boat_id
             WHERE r.id = $1
@@ -142,7 +146,8 @@ async def _load_track(
                 ST_Y(position::geometry) AS lat,
                 ST_X(position::geometry) AS lon,
                 speed_kts,
-                heading_deg
+                heading_deg,
+                gps_acc_m
             FROM track_points
             WHERE session_id = $1
             ORDER BY recorded_at ASC
@@ -169,6 +174,24 @@ async def _load_imu_samples(
             FROM imu_samples
             WHERE session_id = $1
             ORDER BY recorded_at ASC
+            """,
+            race_id,
+        )
+    return [dict(r) for r in rows]
+
+
+async def _load_tactician_calls(
+    pool: asyncpg.Pool, race_id: UUID,
+) -> list[dict]:
+    """Delivered tactician calls for the race, oldest first — the 1.9
+    call-replay input. Missing table / no rows → empty list."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT created_at, call_type, message, eta
+            FROM tactician_calls
+            WHERE session_id = $1
+            ORDER BY created_at ASC
             """,
             race_id,
         )
@@ -377,7 +400,7 @@ def _summary_is_current(existing: Optional[dict]) -> bool:
         return False
     return (
         existing.get("prompt_version") == PROMPT_VERSION
-        and isinstance(existing.get("recap"), str)
+        and isinstance(existing.get("summary"), str)
     )
 
 
@@ -386,6 +409,7 @@ async def process_race(
     race_id: UUID,
     *,
     force: bool = False,
+    regen_stale: bool = True,
 ) -> int:
     """Run the pipeline for one race. Returns a process exit code:
     0 on success or graceful skip, 1 on a state-inconsistent error.
@@ -468,7 +492,18 @@ async def process_race(
     # IMU (GPS-only race, iOS permission denied) returns None and the
     # column stays null until samples exist. Calibration history is
     # applied at read time inside compute_heel_summary.
-    ai_needs_regen = force or not _summary_is_current(race.get("ai_summary"))
+    # Regen policy: force always regenerates; a missing summary always
+    # generates; a version-stale summary regenerates only when
+    # ``regen_stale`` (True for single-race runs; ``--all`` requires the
+    # explicit ``--regen-analysis`` flag so a routine backfill doesn't
+    # burn a Sonnet call per historical race).
+    existing_summary = race.get("ai_summary")
+    if force or not existing_summary:
+        ai_needs_regen = True
+    elif _summary_is_current(existing_summary):
+        ai_needs_regen = False
+    else:
+        ai_needs_regen = regen_stale
     need_heel = ai_needs_regen or race.get("heel_summary") is None
     new_heel_summary: Optional[dict] = None
     if need_heel:
@@ -513,31 +548,91 @@ async def process_race(
                     race_id, e,
                 )
 
-    # AI summary — skip the call if a current version already exists.
+    # AI analysis — skip the call if a current version already exists.
     new_summary: Optional[dict] = None
     if ai_needs_regen:
-        # Use the freshly-built snapshot if we have one, else the
-        # already-stored one (so the summary still gets wind context).
+        # Use the freshly-built snapshots if we have them, else the
+        # already-stored ones (so the analysis still gets wind context).
         snapshot_for_prompt = new_snapshot or race.get("wind_snapshot")
-        # Same for heel: prefer the fresh compute, fall back to whatever
-        # is already on the row.
-        heel_for_prompt = (
-            new_heel_summary
-            if new_heel_summary is not None
-            else race.get("heel_summary")
+        obs_for_prompt = new_obs_snapshot or race.get("obs_snapshot")
+        perf_for_prompt = (
+            new_performance_summary
+            if new_performance_summary is not None
+            else race.get("performance_summary")
         )
 
-        new_summary = generate_summary(
-            race_name=race.get("name"),
-            boat_class=race.get("boat_class"),
-            stats=stats.to_dict(),
-            wind_snapshot=snapshot_for_prompt,
-            heel_summary=heel_for_prompt,
-        )
+        # need_heel is implied by ai_needs_regen, so the heel step above
+        # already loaded the IMU rows — reuse them.
+        imu_rows_for_analysis = imu_rows
+        try:
+            call_rows = await _load_tactician_calls(pool, race_id)
+        except Exception as e:  # noqa: BLE001 - calls optional for analysis
+            log.warning("race %s: tactician_calls load failed (%s)", race_id, e)
+            call_rows = []
+
+        polar_for_analysis = None
+        try:
+            polar_for_analysis = load_polar_for_class(race.get("boat_class"))
+        except Exception as e:  # noqa: BLE001 - no polar → no layline/polar blocks
+            log.info("race %s: polar unavailable for analysis (%s)", race_id, e)
+
+        loa_ft = None
+        if race.get("boat_loa") is not None:
+            try:
+                loa_ft = float(race["boat_loa"])
+            except (TypeError, ValueError):
+                loa_ft = None
+
+        ratings = None
+        if boat_for_math:
+            ratings = {
+                k: (int(v) if v is not None else None)
+                for k, v in boat_for_math.items()
+            }
+
+        payload = None
+        try:
+            payload = build_race_analysis(
+                track_rows=track_rows,
+                imu_rows=imu_rows_for_analysis,
+                marks=marks,
+                mark_passes=mark_passes,
+                race_start_at=race_start_at,
+                mode=race.get("mode"),
+                boat_class=race.get("boat_class"),
+                loa_ft=loa_ft,
+                ratings=ratings,
+                polar=polar_for_analysis,
+                wind_snapshot=snapshot_for_prompt,
+                obs_snapshot=obs_for_prompt,
+                performance_summary=perf_for_prompt,
+                tactician_call_rows=call_rows,
+                start_line_bearing_override=race.get("start_line_bearing_override"),
+                start_line_bearing_deg=race.get("start_line_bearing_deg"),
+                stats=stats.to_dict(),
+            )
+        except Exception as e:  # noqa: BLE001 - metrics bug must not fail the job
+            log.warning("race %s: analysis payload failed (%s)", race_id, e)
+
+        if payload is not None:
+            # Heel rollup rides along in the payload (the v3 prompt's
+            # heel-discipline coaching stays available to the model).
+            heel_for_prompt = (
+                new_heel_summary
+                if new_heel_summary is not None
+                else race.get("heel_summary")
+            )
+            if heel_for_prompt:
+                payload["heel"] = heel_for_prompt
+            new_summary = generate_summary(
+                race_name=race.get("name"),
+                payload=payload,
+            )
         if new_summary is None:
             log.warning(
-                "race %s: AI summary generation returned None "
-                "(missing key, API error, or unparseable response)",
+                "race %s: AI analysis generation returned None "
+                "(unusable track, missing key, API error, or unparseable "
+                "response)",
                 race_id,
             )
 
@@ -582,7 +677,7 @@ async def _amain(race_id: UUID, force: bool) -> int:
         await db.shutdown()
 
 
-async def _amain_all(force: bool) -> int:
+async def _amain_all(force: bool, regen_stale: bool) -> int:
     """Backfill EVERY finished race (``ended_at IS NOT NULL``) in one run.
 
     A one-shot maintenance path — far cheaper than firing one Cloud Run
@@ -610,7 +705,9 @@ async def _amain_all(force: bool) -> int:
         failures = 0
         for i, rid in enumerate(race_ids, 1):
             try:
-                rc = await process_race(pool, rid, force=force)
+                rc = await process_race(
+                    pool, rid, force=force, regen_stale=regen_stale,
+                )
                 if rc != 0:
                     failures += 1
                     log.warning("[%d/%d] race %s exit %d", i, total, rid, rc)
@@ -660,13 +757,25 @@ def main() -> int:
             "current prompt version and wind_snapshot is present."
         ),
     )
+    parser.add_argument(
+        "--regen-analysis",
+        action="store_true",
+        help=(
+            "With --all: regenerate version-stale AI analyses (one "
+            "Anthropic call per stale race). Without it, --all only "
+            "generates missing summaries. Single-race runs always "
+            "regenerate stale versions."
+        ),
+    )
     args = parser.parse_args()
 
     if args.all:
         if args.race_id:
             log.error("--all and --race-id are mutually exclusive")
             return 2
-        return asyncio.run(_amain_all(force=args.force))
+        return asyncio.run(
+            _amain_all(force=args.force, regen_stale=args.regen_analysis)
+        )
 
     if not args.race_id:
         log.error("one of --race-id or --all is required")

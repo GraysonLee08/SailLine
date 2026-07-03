@@ -92,12 +92,17 @@ def build_snapshot(
     heel_stat: Optional[dict],
     recent_calls: list[dict],
     now: datetime,
+    playbook: Optional[dict] = None,
 ) -> dict:
     """Assemble the advisor's input document.
 
     ``race_meta`` is pipeline-shaped: ``{race_name, boat_class, mode,
     leg_index, marks_total}``. ``recent_calls`` is the last ≤3 rows
     from ``tactician_calls`` as ``{created_at, call_type, message}``.
+    ``playbook`` (optional) is the matched pre-race brief from
+    ``tactics.playbook``: ``{signature_text, source_race_name, score,
+    directives}`` — this boat's own directives from a past race in
+    similar conditions.
     """
     last = track[-1] if track else None
 
@@ -134,6 +139,12 @@ def build_snapshot(
     }
     if heel_stat is not None:
         snapshot["heel"] = heel_stat
+    if playbook is not None and playbook.get("directives"):
+        snapshot["playbook"] = {
+            "conditions": playbook.get("signature_text"),
+            "from_race": playbook.get("source_race_name"),
+            "directives": playbook["directives"],
+        }
     # Next-mark distance, when we have both a fix and a mark.
     if last and next_mark:
         from app.services.tactics.detectors import _haversine_m, _bearing_deg

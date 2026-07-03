@@ -252,6 +252,15 @@ def tactics_cooldown_key(
     return f"tactics:cooldown:{race_id}"
 
 
+def tactics_playbook_key(race_id: Union[UUID, str]) -> str:
+    """Cached pre-race playbook match for this race — the result of
+    scoring today's forecast signature against the user's past
+    post-race playbooks (``ai_summary.playbook``). Written once by the
+    first tactician evaluation (negative results are cached too, so a
+    no-match race doesn't re-query the DB every 30 s batch)."""
+    return f"tactics:playbook:{race_id}"
+
+
 def route_last_request_key(race_id: Union[UUID, str]) -> str:
     """The user's most recent ``RouteRequest`` JSON. The endpoint
     writes this on every successful compute; the background recompute

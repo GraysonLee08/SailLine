@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     anthropic_model: str = Field(
         default="claude-haiku-4-5-20251001", alias="ANTHROPIC_MODEL"
     )
+    # Post-race analysis model (prompt v4). Sonnet class — synthesis
+    # over the derived-metrics payload; the in-race tactician stays on
+    # ANTHROPIC_MODEL (Haiku, latency-sensitive rephrasing).
+    anthropic_analysis_model: str = Field(
+        default="claude-sonnet-4-6", alias="ANTHROPIC_ANALYSIS_MODEL"
+    )
 
     # === Cloud Run Job: race-postprocess (Session D1) ===
     # Fully-qualified job name used by ``app/services/job_trigger.py``

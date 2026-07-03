@@ -105,9 +105,35 @@ class BoatSummaryOut(BaseModel):
     dnshcp: Optional[int] = None
 
 
+class CostFindingOut(BaseModel):
+    tag: str                     # "EXECUTION" | "DECISION"
+    text: str
+    cost_s: Optional[float] = None
+
+
+class PlaybookOut(BaseModel):
+    signature: Optional[dict[str, Any]] = None
+    signature_text: Optional[str] = None
+    directives: list[str] = []
+
+
 class AiSummaryOut(BaseModel):
-    recap: str
-    tips: list[str]
+    """Prompt v4 analysis shape + legacy v3 fields.
+
+    v4 rows carry ``summary``/``what_worked``/``what_cost``/``playbook``
+    (+ the full derived-metrics ``analysis`` payload); rows written
+    before the v4 rollout carry ``recap``/``tips`` and keep rendering
+    until regenerated. Everything is Optional so either vintage
+    validates.
+    """
+    summary: Optional[str] = None
+    what_worked: Optional[list[str]] = None
+    what_cost: Optional[list[CostFindingOut]] = None
+    total_identifiable_loss_s: Optional[float] = None
+    playbook: Optional[PlaybookOut] = None
+    analysis: Optional[dict[str, Any]] = None
+    recap: Optional[str] = None
+    tips: Optional[list[str]] = None
     model: Optional[str] = None
     prompt_version: Optional[int] = None
     generated_at: Optional[str] = None

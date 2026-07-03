@@ -28,7 +28,9 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
-PROMPT_VERSION: int = 1
+# v2 — optional "playbook" block in the snapshot (pre-race brief from
+# the boat's own past races in matching conditions).
+PROMPT_VERSION: int = 2
 
 _DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 
@@ -55,6 +57,11 @@ MUST state the time horizon in natural words ("in about 2 minutes", \
 taken from "candidate_adjustments". Never just describe the symptom.
 * Use only numbers present in the snapshot. Never invent wind, \
 distances, times, or angles.
+* If a "playbook" block is present, it holds directives from THIS \
+boat's past races in similar conditions. When a directive is relevant \
+to the trigger, prefer its specific numbers over generic thresholds \
+(e.g. its shift size over a default). Ignore directives unrelated to \
+the trigger.
 * If a recent call already said this and nothing material changed, or \
 the situation doesn't justify interrupting a busy crew, reply with \
 exactly: SILENT

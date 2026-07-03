@@ -29,8 +29,12 @@ RACE_ID = uuid4()
 # ─── Stubs ────────────────────────────────────────────────────────────
 
 
-def _make_track_rows(n: int = 60) -> list[dict]:
-    """n points 1s apart, ~5 m/s eastward — a sane sailing track."""
+def _make_track_rows(n: int = 240) -> list[dict]:
+    """n points 1s apart, ~5 m/s eastward — a sane sailing track.
+
+    n defaults to 240 because the v4 analysis payload requires ≥ 120
+    cleaned points (~2 min of track) before it will produce anything.
+    """
     return [
         {
             "recorded_at": T0 + timedelta(seconds=i),
@@ -38,6 +42,7 @@ def _make_track_rows(n: int = 60) -> list[dict]:
             "lon": -87.75 + i * 0.00005,   # ~5m east per step
             "speed_kts": 10.0,
             "heading_deg": 90.0,
+            "gps_acc_m": 5.0,
         }
         for i in range(n)
     ]
@@ -131,8 +136,11 @@ def spy(monkeypatch: pytest.MonkeyPatch):
         s.summary_calls += 1
         s.summary_kwargs.append(kwargs)
         return {
-            "recap": "ok",
-            "tips": [],
+            "summary": "ok",
+            "what_worked": [],
+            "what_cost": [],
+            "total_identifiable_loss_s": None,
+            "playbook": {"directives": []},
             "model": "test",
             "prompt_version": PROMPT_VERSION,
             "generated_at": T0.isoformat(),
@@ -215,7 +223,7 @@ async def test_generates_summary_when_missing(monkeypatch, spy):
 async def test_skips_when_summary_current_and_snapshot_present(monkeypatch, spy):
     race = _make_race_row(
         ai_summary={
-            "recap": "previously generated",
+            "summary": "previously generated",
             "tips": [],
             "model": "test",
             "prompt_version": PROMPT_VERSION,
@@ -243,7 +251,7 @@ async def test_skips_when_summary_current_and_snapshot_present(monkeypatch, spy)
 async def test_force_regenerates_both(monkeypatch, spy):
     race = _make_race_row(
         ai_summary={
-            "recap": "x", "tips": [],
+            "summary": "x", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -258,7 +266,7 @@ async def test_force_regenerates_both(monkeypatch, spy):
 async def test_stale_prompt_version_triggers_summary_regen(monkeypatch, spy):
     race = _make_race_row(
         ai_summary={
-            "recap": "older", "tips": [],
+            "summary": "older", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION - 1,
         },
         wind_snapshot={"already": "there"},
@@ -276,7 +284,7 @@ async def test_snapshot_missing_triggers_wind_build_even_if_summary_current(
 ):
     race = _make_race_row(
         ai_summary={
-            "recap": "ok", "tips": [],
+            "summary": "ok", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot=None,
@@ -311,6 +319,75 @@ async def test_generate_summary_failure_leaves_existing_intact(
     assert spy.persist_calls[0]["wind_snapshot"] is not None
 
 
+async def test_regen_stale_false_keeps_stale_summary(monkeypatch, spy):
+    """--all without --regen-analysis: a version-stale summary is NOT
+    regenerated (no Sonnet call per historical race)."""
+    race = _make_race_row(
+        ai_summary={
+            "summary": "older", "model": "test",
+            "prompt_version": PROMPT_VERSION - 1,
+        },
+        wind_snapshot={"already": "there"},
+        obs_snapshot={"already": "there"},
+        heel_summary={"sample_count": 1, "max_heel_deg": 1.0,
+                      "max_heel_abs_deg": 1.0, "avg_heel_abs_deg": 1.0,
+                      "pct_time_heeled_gt_10": 0.0,
+                      "pct_time_heeled_gt_20": 0.0,
+                      "max_pitch_abs_deg": 0.0, "by_leg": []},
+        performance_summary={"sample_count": 1, "by_leg": []},
+    )
+    _patch_loads(monkeypatch, race=race, track=_make_track_rows())
+    rc = await race_postprocess.process_race(
+        FakePool(), RACE_ID, regen_stale=False,
+    )
+    assert rc == 0
+    assert spy.summary_calls == 0
+
+
+async def test_regen_stale_false_still_generates_missing_summary(
+    monkeypatch, spy,
+):
+    """--all without --regen-analysis still fills races that have NO
+    summary at all."""
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+    rc = await race_postprocess.process_race(
+        FakePool(), RACE_ID, regen_stale=False,
+    )
+    assert rc == 0
+    assert spy.summary_calls == 1
+
+
+async def test_analysis_payload_reaches_generate_summary(monkeypatch, spy):
+    """The v4 wiring: generate_summary receives the derived-metrics
+    payload (boat/course/maneuvers present) and the race name."""
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    kwargs = spy.summary_kwargs[0]
+    assert kwargs["race_name"] == "Test race"
+    payload = kwargs["payload"]
+    assert payload["boat"]["class"] == "J/70"
+    assert payload["course"]["marks_count"] == 2
+    assert "maneuvers" in payload
+    assert payload["result"]["elapsed_s"] > 0
+
+
+async def test_payload_build_failure_skips_ai_but_not_job(monkeypatch, spy):
+    """A metrics bug must not fail the job — the AI step is skipped and
+    everything else persists."""
+    def boom(**kwargs):
+        raise RuntimeError("simulated metrics bug")
+    monkeypatch.setattr(race_postprocess, "build_race_analysis", boom)
+
+    _patch_loads(monkeypatch, race=_make_race_row(), track=_make_track_rows())
+    rc = await race_postprocess.process_race(FakePool(), RACE_ID)
+    assert rc == 0
+    assert spy.summary_calls == 0
+    assert len(spy.persist_calls) == 1
+    assert spy.persist_calls[0]["ai_summary"] is None
+    assert spy.persist_calls[0]["wind_snapshot"] is not None
+
+
 # ─── Heel summary plumbing ────────────────────────────────────────────
 
 
@@ -340,9 +417,9 @@ async def test_heel_summary_passed_to_generate_summary_when_imu_present(
     rc = await race_postprocess.process_race(FakePool(), RACE_ID)
     assert rc == 0
     assert spy.summary_calls == 1
-    kwargs = spy.summary_kwargs[0]
-    assert "heel_summary" in kwargs
-    heel = kwargs["heel_summary"]
+    # v4: heel rides inside the analysis payload.
+    payload = spy.summary_kwargs[0]["payload"]
+    heel = payload.get("heel")
     assert heel is not None
     assert heel["sample_count"] == 30
     assert heel["max_heel_abs_deg"] >= 12.0
@@ -358,8 +435,8 @@ async def test_heel_summary_none_when_no_imu_rows(monkeypatch, spy):
     )
     rc = await race_postprocess.process_race(FakePool(), RACE_ID)
     assert rc == 0
-    kwargs = spy.summary_kwargs[0]
-    assert kwargs.get("heel_summary") is None
+    payload = spy.summary_kwargs[0]["payload"]
+    assert payload.get("heel") is None
 
 
 async def test_imu_load_failure_does_not_break_postprocess(monkeypatch, spy):
@@ -380,8 +457,8 @@ async def test_imu_load_failure_does_not_break_postprocess(monkeypatch, spy):
     rc = await race_postprocess.process_race(FakePool(), RACE_ID)
     assert rc == 0
     assert spy.summary_calls == 1
-    # heel_summary kwarg should be None (graceful degrade).
-    assert spy.summary_kwargs[0].get("heel_summary") is None
+    # No heel block in the payload (graceful degrade).
+    assert spy.summary_kwargs[0]["payload"].get("heel") is None
 
 
 async def test_calibration_offsets_applied_in_postprocess(monkeypatch, spy):
@@ -400,7 +477,7 @@ async def test_calibration_offsets_applied_in_postprocess(monkeypatch, spy):
     )
     rc = await race_postprocess.process_race(FakePool(), RACE_ID)
     assert rc == 0
-    heel = spy.summary_kwargs[0]["heel_summary"]
+    heel = spy.summary_kwargs[0]["payload"]["heel"]
     # Raw max was ~20° (12 + 4×2). After subtracting a 10° offset, the
     # max should drop close to ~10°.
     assert heel is not None
@@ -438,7 +515,7 @@ async def test_heel_summary_backfill_when_column_null_but_ai_current(
     column — even though the AI step is skipped."""
     race = _make_race_row(
         ai_summary={
-            "recap": "previously generated", "tips": [],
+            "summary": "previously generated", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -471,7 +548,7 @@ async def test_heel_summary_not_recomputed_when_column_present_and_ai_current(
     job should do nothing — no IMU load, no compute, no overwrite."""
     race = _make_race_row(
         ai_summary={
-            "recap": "previously generated", "tips": [],
+            "summary": "previously generated", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -532,7 +609,7 @@ async def test_force_recomputes_heel_summary(monkeypatch, spy):
     heel_summary are both already current."""
     race = _make_race_row(
         ai_summary={
-            "recap": "x", "tips": [],
+            "summary": "x", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -632,7 +709,7 @@ async def test_performance_backfill_when_column_null_but_ai_current(monkeypatch,
     monkeypatch.setattr(race_postprocess, "compute_performance_summary", fake_perf)
     race = _make_race_row(
         ai_summary={
-            "recap": "current", "tips": [],
+            "summary": "current", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -683,7 +760,7 @@ async def test_obs_backfill_when_column_null_but_everything_else_current(
     only — AI/wind/heel/perf all skip. Mirrors the heel backfill."""
     race = _make_race_row(
         ai_summary={
-            "recap": "current", "tips": [],
+            "summary": "current", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},
@@ -701,7 +778,7 @@ async def test_obs_backfill_when_column_null_but_everything_else_current(
 async def test_force_rebuilds_obs_snapshot(monkeypatch, spy):
     race = _make_race_row(
         ai_summary={
-            "recap": "x", "tips": [],
+            "summary": "x", "tips": [],
             "model": "test", "prompt_version": PROMPT_VERSION,
         },
         wind_snapshot={"already": "there"},

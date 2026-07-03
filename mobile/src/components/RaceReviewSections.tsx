@@ -27,7 +27,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 
 import { useTheme } from "../theme/ThemeProvider";
-import type { RaceStats } from "../api/raceStats";
+import type { AiSummary, RaceStats } from "../api/raceStats";
 import type { RaceStatsPhase } from "../hooks/useRaceStats";
 
 function fmtElapsed(totalSeconds: number): string {
@@ -129,20 +129,30 @@ export function RaceReviewSections({ data, phase, error, refresh }: Props) {
           </View>
 
           {phase === "ready" && data.ai_summary ? (
-            <>
-              <Text style={{ color: colors.text.primary, fontFamily: font.body, fontSize: size.body, lineHeight: 21, marginTop: 6 }}>
-                {data.ai_summary.recap}
-              </Text>
-              {data.ai_summary.tips?.map((tip, i) => (
-                <Text
-                  key={i}
-                  style={{ color: colors.accent.primary, fontFamily: font.bodyMedium, fontSize: size.body, lineHeight: 20, marginTop: 8 }}
-                >
-                  {"› "}
-                  <Text style={{ color: colors.text.secondary }}>{tip}</Text>
+            data.ai_summary.summary ? (
+              <AnalysisSections
+                summary={data.ai_summary}
+                colors={colors}
+                font={font}
+                size={size}
+              />
+            ) : (
+              <>
+                {/* Legacy v3 shape — shown until the race regenerates under v4 */}
+                <Text style={{ color: colors.text.primary, fontFamily: font.body, fontSize: size.body, lineHeight: 21, marginTop: 6 }}>
+                  {data.ai_summary.recap}
                 </Text>
-              ))}
-            </>
+                {data.ai_summary.tips?.map((tip, i) => (
+                  <Text
+                    key={i}
+                    style={{ color: colors.accent.primary, fontFamily: font.bodyMedium, fontSize: size.body, lineHeight: 20, marginTop: 8 }}
+                  >
+                    {"› "}
+                    <Text style={{ color: colors.text.secondary }}>{tip}</Text>
+                  </Text>
+                ))}
+              </>
+            )
           ) : phase === "generating" ? (
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8, marginTop: 8 }}>
               <ActivityIndicator size="small" color={colors.accent.primary} />
@@ -237,6 +247,103 @@ export function RaceReviewSections({ data, phase, error, refresh }: Props) {
 }
 
 // ─── Small presentational helpers ─────────────────────────────────────
+
+function AnalysisSections({
+  summary, colors, font, size,
+}: { summary: AiSummary; colors: any; font: any; size: any }) {
+  const worked = summary.what_worked ?? [];
+  const cost = summary.what_cost ?? [];
+  const playbook = summary.playbook ?? null;
+  const totalLoss = summary.total_identifiable_loss_s;
+
+  const head = (text: string) => (
+    <Text
+      style={{
+        color: colors.text.muted,
+        fontFamily: font.bodySemibold,
+        fontSize: size.caption,
+        letterSpacing: 0.4,
+        marginTop: 14,
+      }}
+    >
+      {text}
+    </Text>
+  );
+
+  return (
+    <>
+      <Text style={{ color: colors.text.primary, fontFamily: font.body, fontSize: size.body, lineHeight: 21, marginTop: 6 }}>
+        {summary.summary}
+      </Text>
+
+      {worked.length ? (
+        <>
+          {head("WHAT WORKED")}
+          {worked.map((t, i) => (
+            <Text
+              key={i}
+              style={{ color: colors.accent.primary, fontFamily: font.bodyMedium, fontSize: size.body, lineHeight: 20, marginTop: 8 }}
+            >
+              {"› "}
+              <Text style={{ color: colors.text.secondary }}>{t}</Text>
+            </Text>
+          ))}
+        </>
+      ) : null}
+
+      {cost.length ? (
+        <>
+          {head("WHAT COST US")}
+          {cost.map((c, i) => (
+            <Text
+              key={i}
+              style={{ color: colors.text.secondary, fontFamily: font.body, fontSize: size.body, lineHeight: 20, marginTop: 8 }}
+            >
+              <Text style={{ fontFamily: font.bodySemibold, color: colors.accent.primary }}>
+                {c.tag}
+              </Text>
+              {"  "}
+              {c.text}
+              {c.cost_s != null ? (
+                <Text style={{ fontFamily: font.bodySemibold }}>
+                  {`  ~${Math.round(c.cost_s)}s`}
+                </Text>
+              ) : null}
+            </Text>
+          ))}
+          {totalLoss != null ? (
+            <Text style={{ color: colors.text.primary, fontFamily: font.bodySemibold, fontSize: size.body, marginTop: 10 }}>
+              Total identifiable loss: ~{Math.round(totalLoss)}s
+            </Text>
+          ) : null}
+        </>
+      ) : null}
+
+      {playbook?.directives?.length ? (
+        <>
+          {head("SAME-CONDITIONS PLAYBOOK")}
+          {playbook.signature_text ? (
+            <Text style={{ color: colors.text.muted, fontFamily: font.body, fontSize: size.caption, fontStyle: "italic", marginTop: 6 }}>
+              {playbook.signature_text}
+            </Text>
+          ) : null}
+          {playbook.directives.map((d, i) => (
+            <Text
+              key={i}
+              style={{ color: colors.text.secondary, fontFamily: font.body, fontSize: size.body, lineHeight: 20, marginTop: 8 }}
+            >
+              <Text style={{ fontFamily: font.bodySemibold, color: colors.accent.primary }}>
+                {i + 1}.
+              </Text>
+              {" "}
+              {d}
+            </Text>
+          ))}
+        </>
+      ) : null}
+    </>
+  );
+}
 
 function cardStyle(colors: any) {
   return {

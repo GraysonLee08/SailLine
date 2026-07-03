@@ -1,10 +1,12 @@
-"""Tests for app/services/race_summary.py.
+"""Tests for app/services/race_summary.py (prompt v4).
 
 The Anthropic call is mocked end-to-end — tests don't hit the real
 API. We exercise:
-  * the deterministic prompt builder
-  * the response parser, including the forgiving JSON extraction
-  * the generate_summary wrapper with an injected fake client
+  * the deterministic prompt builder (payload → user message)
+  * the response parser, including the forgiving JSON extraction and
+    shape coercion (tags, cost_s, directives)
+  * the generate_summary wrapper with an injected fake client,
+    including signature attachment to the playbook
   * the no-key-graceful-degrade path
 """
 from __future__ import annotations
@@ -23,204 +25,130 @@ from app.services.race_summary import (
 )
 
 
-# ─── Fixture stats / wind ─────────────────────────────────────────────
+# ─── Fixture payload ──────────────────────────────────────────────────
 
 
-def _stats(
-    *,
-    distance_m: float = 4000.0,
-    elapsed_s: float = 1800.0,
-    avg_sog_kt: float = 4.3,
-    avg_moving_sog_kt: float = 4.5,
-    max_sog_kt: float = 6.8,
-    stopped_s: float = 60.0,
-    legs: list[dict] | None = None,
-) -> dict:
-    return {
-        "point_count": 1800,
-        "started_at": "2026-05-14T18:00:00+00:00",
-        "ended_at": "2026-05-14T18:30:00+00:00",
-        "elapsed_s": elapsed_s,
-        "moving_s": elapsed_s - stopped_s,
-        "stopped_s": stopped_s,
-        "distance_m": distance_m,
-        "avg_sog_kt": avg_sog_kt,
-        "avg_moving_sog_kt": avg_moving_sog_kt,
-        "max_sog_kt": max_sog_kt,
-        "legs": legs or [
-            {
-                "leg_index": 0,
-                "from_label": "Start",
-                "to_label": "A",
-                "start_ts": "2026-05-14T18:00:00+00:00",
-                "end_ts": "2026-05-14T18:10:00+00:00",
-                "elapsed_s": 600.0,
-                "distance_m": 1500.0,
-                "avg_sog_kt": 4.9,
-            },
-            {
-                "leg_index": 1,
-                "from_label": "A",
-                "to_label": "Finish",
-                "start_ts": "2026-05-14T18:10:00+00:00",
-                "end_ts": "2026-05-14T18:30:00+00:00",
-                "elapsed_s": 1200.0,
-                "distance_m": 2500.0,
-                "avg_sog_kt": 4.1,
-            },
+def _payload(**overrides: Any) -> dict:
+    base = {
+        "boat": {"class": "Beneteau 36.7", "loa_ft": 36.7},
+        "course": {"mode": "inshore", "marks_count": 3, "legs_count": 2},
+        "start": {
+            "line_bearing_deg": 310.0,
+            "bias_deg": 6.0,
+            "favored_end": "A",
+            "end_started": "B",
+            "distance_to_line_at_gun_m": 41.0,
+            "sog_at_gun_kts": 5.1,
+            "time_to_cross_s": 14.0,
+            "ocs": False,
+        },
+        "legs": [
+            {"n": 1, "type": "upwind", "elapsed_s": 900.0,
+             "sailed_ratio": 1.41, "speed_ratio": 0.93,
+             "pct_time_lifted": 0.4, "pct_time_headed": 0.35,
+             "tacks": 6},
+            {"n": 2, "type": "run", "elapsed_s": 700.0,
+             "sailed_ratio": 1.05, "speed_ratio": 0.97, "gybes": 2},
         ],
-        "speed_series": [],
+        "maneuvers": {
+            "tacks": {"count": 6, "mean_loss_bl": 2.4, "worst_loss_bl": 5.0},
+            "gybes": {"count": 2, "mean_loss_bl": 1.1, "worst_loss_bl": 1.5},
+        },
+        "condition_signature": {
+            "tws_lo_kts": 8.0, "tws_hi_kts": 12.0,
+            "twd_mean_deg": 220.0, "character": "oscillating",
+            "osc_amplitude_deg": 12.0, "tws_trend": "steady",
+        },
+        "condition_signature_text": "TWS 8-12 kt, TWD ~220° with oscillating ±12°",
+        "result": {"elapsed_s": 1600.0, "corrected_s": 1450.0},
     }
+    base.update(overrides)
+    return base
 
 
-def _wind_snapshot() -> dict:
-    # Snapshot that produces a non-null summary: 1 time, 2x2 grid, all
-    # filled, ~10 kt westerly.
-    return {
-        "bbox": [42.0, -87.7, 42.1, -87.5],
-        "grid_deg": 0.1,
-        "lats": [42.0, 42.1],
-        "lons": [-87.7, -87.5],
-        "t_start": "2026-05-14T18:00:00+00:00",
-        "t_end": "2026-05-14T18:30:00+00:00",
-        "dt_s": 900,
-        "times": ["2026-05-14T18:00:00+00:00"],
-        "source": "hybrid",
-        "u_mps": [[[5.144, 5.144], [5.144, 5.144]]],
-        "v_mps": [[[0.0, 0.0], [0.0, 0.0]]],
-    }
+_GOOD_RESPONSE = (
+    '{"summary": "Oscillating southwesterly; the beat decided it.",'
+    ' "what_worked": ["Start 2 BL from the favored end with speed"],'
+    ' "what_cost": ['
+    '   {"tag": "EXECUTION", "text": "6 tacks at 2.4 BL mean", "cost_s": 45},'
+    '   {"tag": "DECISION", "text": "35% of leg 1 sailed headed", "cost_s": 60}'
+    ' ],'
+    ' "total_identifiable_loss_s": 105,'
+    ' "playbook_directives": ["Tack on headers >= 8 deg", "Two-tack beats only"]}'
+)
 
 
 # ─── build_prompt ─────────────────────────────────────────────────────
 
 
-def test_prompt_includes_basic_race_facts():
-    p = build_prompt(
-        race_name="Tuesday Beer Can #3",
-        boat_class="Beneteau 36.7",
-        stats=_stats(),
-    )
-    assert "Tuesday Beer Can #3" in p
+def test_prompt_wraps_payload_in_race_data_tags():
+    p = build_prompt(_payload())
+    assert p.startswith("Analyze this race.")
+    assert "<race_data>" in p and "</race_data>" in p
+
+
+def test_prompt_serialises_payload_content():
+    p = build_prompt(_payload())
     assert "Beneteau 36.7" in p
-    # Elapsed shown as M:SS or H format.
-    assert "30:00" in p or "1800" in p
-
-
-def test_prompt_includes_leg_lines():
-    p = build_prompt(race_name=None, boat_class=None, stats=_stats())
-    assert "Leg 1: Start → A" in p
-    assert "Leg 2: A → Finish" in p
-
-
-def test_prompt_handles_no_legs():
-    s = _stats()
-    s["legs"] = []
-    p = build_prompt(race_name=None, boat_class=None, stats=s)
-    assert "no marks rounded" in p.lower() or "dnf" in p.lower()
-
-
-def test_prompt_includes_wind_summary_when_snapshot_present():
-    p = build_prompt(
-        race_name=None,
-        boat_class=None,
-        stats=_stats(),
-        wind_snapshot=_wind_snapshot(),
-    )
-    # 10 kt westerly: speed ~10.0 and cardinal "W".
-    assert "10.0 kt" in p
-    assert "W)" in p or "W " in p  # WSW/WNW/W all contain W
-
-
-def test_prompt_includes_corrected_time_when_present():
-    s = _stats()
-    s["corrected_time_s"] = 1500.0
-    s["corrected_using"] = "hcp"
-    s["rating_seconds_per_mile"] = 75
-    p = build_prompt(race_name=None, boat_class=None, stats=s)
-    assert "Corrected time" in p
-    assert "rating 75" in p
-    assert "ToD HCP" in p
-
-
-def test_prompt_omits_corrected_time_when_no_rating():
-    s = _stats()
-    # corrected_time_s / corrected_using / rating all unset.
-    p = build_prompt(race_name=None, boat_class=None, stats=s)
-    assert "Corrected time" not in p
-
-
-def test_prompt_notes_missing_wind():
-    p = build_prompt(
-        race_name=None,
-        boat_class=None,
-        stats=_stats(),
-        wind_snapshot=None,
-    )
-    assert "wind data: not available" in p.lower()
-
-
-def test_prompt_handles_partial_wind_coverage():
-    # All-null snapshot → "no forecast coverage" branch.
-    null_snap = _wind_snapshot()
-    null_snap["u_mps"] = [[[None, None], [None, None]]]
-    null_snap["v_mps"] = [[[None, None], [None, None]]]
-    p = build_prompt(
-        race_name=None,
-        boat_class=None,
-        stats=_stats(),
-        wind_snapshot=null_snap,
-    )
-    assert "no forecast coverage" in p.lower()
+    assert "oscillating" in p
+    assert "favored_end" in p
 
 
 # ─── parse_response ──────────────────────────────────────────────────
 
 
 def test_parse_strict_json():
-    raw = '{"recap": "Solid race.", "tips": ["Keep going."]}'
+    out = parse_response(_GOOD_RESPONSE)
+    assert out is not None
+    assert out["summary"].startswith("Oscillating")
+    assert len(out["what_worked"]) == 1
+    assert len(out["what_cost"]) == 2
+    assert out["what_cost"][0]["tag"] == "EXECUTION"
+    assert out["what_cost"][0]["cost_s"] == 45.0
+    assert out["total_identifiable_loss_s"] == 105.0
+    assert out["playbook_directives"] == [
+        "Tack on headers >= 8 deg", "Two-tack beats only",
+    ]
+
+
+def test_parse_extracts_json_from_prose_and_fences():
+    raw = "Here's the analysis:\n```json\n" + _GOOD_RESPONSE + "\n```\nDone."
     out = parse_response(raw)
-    assert out == {"recap": "Solid race.", "tips": ["Keep going."]}
+    assert out is not None
+    assert out["summary"].startswith("Oscillating")
 
 
-def test_parse_extracts_json_from_prose():
+def test_parse_coerces_bad_tag_to_decision():
     raw = (
-        "Here's your debrief:\n"
-        '{"recap": "Tight tacking duel.", "tips": ["Trim earlier."]}'
-        "\nLet me know if you want more."
+        '{"summary": "s", "what_cost": '
+        '[{"tag": "WHATEVER", "text": "x", "cost_s": "not a number"}]}'
     )
     out = parse_response(raw)
     assert out is not None
-    assert "Tight tacking duel" in out["recap"]
+    assert out["what_cost"][0]["tag"] == "DECISION"
+    assert out["what_cost"][0]["cost_s"] is None
 
 
-def test_parse_extracts_from_code_fence():
+def test_parse_drops_non_string_directives_and_findings():
     raw = (
-        "```json\n"
-        '{"recap": "Clean.", "tips": ["x", "y"]}\n'
-        "```"
+        '{"summary": "s",'
+        ' "what_worked": ["ok", 5, null],'
+        ' "what_cost": [{"tag": "EXECUTION", "text": "x"}, {"no": "text"}, "str"],'
+        ' "playbook_directives": ["a", 3]}'
     )
     out = parse_response(raw)
     assert out is not None
-    assert out["tips"] == ["x", "y"]
-
-
-def test_parse_drops_non_string_tips():
-    raw = '{"recap": "ok", "tips": ["good", 5, null, "also good"]}'
-    out = parse_response(raw)
-    assert out is not None
-    assert out["tips"] == ["good", "also good"]
+    assert out["what_worked"] == ["ok"]
+    assert len(out["what_cost"]) == 1
+    assert out["playbook_directives"] == ["a"]
 
 
 def test_parse_returns_none_on_malformed():
     assert parse_response("nothing here") is None
     assert parse_response("") is None
-    assert parse_response('{"recap": 5}') is None  # recap not a string
-
-
-def test_parse_returns_none_on_empty_recap_field():
-    # recap must exist as a string; empty string is allowed but
-    # missing key should fail.
-    assert parse_response('{"tips": ["a"]}') is None
+    assert parse_response('{"summary": 5}') is None      # summary not a string
+    assert parse_response('{"summary": "  "}') is None   # empty summary
+    assert parse_response('{"what_worked": ["a"]}') is None  # missing summary
 
 
 # ─── generate_summary with fake client ───────────────────────────────
@@ -255,155 +183,89 @@ class _FakeClient:
 
 
 def test_generate_summary_happy_path():
-    client = _FakeClient('{"recap": "Good race.", "tips": ["a", "b"]}')
+    client = _FakeClient(_GOOD_RESPONSE)
     out = generate_summary(
-        race_name="Test",
-        boat_class="Etchells",
-        stats=_stats(),
-        wind_snapshot=_wind_snapshot(),
-        client=client,
-        model="test-model",
+        race_name="Beer Can 7.2", payload=_payload(),
+        client=client, model="test-model",
     )
     assert out is not None
-    assert out["recap"] == "Good race."
-    assert out["tips"] == ["a", "b"]
+    assert out["summary"].startswith("Oscillating")
     assert out["model"] == "test-model"
     assert out["prompt_version"] == PROMPT_VERSION
     assert "generated_at" in out
-    # System prompt and user prompt were passed.
+    # The derived payload is persisted alongside the model output.
+    assert out["analysis"]["boat"]["class"] == "Beneteau 36.7"
+    # System + user prompt were passed; race name injected.
     call = client.messages.last_call
     assert call["model"] == "test-model"
     assert "sailing race coach" in call["system"].lower()
+    assert "Beer Can 7.2" in call["messages"][0]["content"]
+
+
+def test_generate_summary_attaches_computed_signature_to_playbook():
+    """The signature comes from signature.py via the payload — the
+    model only writes directives."""
+    client = _FakeClient(_GOOD_RESPONSE)
+    out = generate_summary(
+        race_name=None, payload=_payload(), client=client, model="m",
+    )
+    assert out is not None
+    pb = out["playbook"]
+    assert pb["directives"] == ["Tack on headers >= 8 deg", "Two-tack beats only"]
+    assert pb["signature"]["character"] == "oscillating"
+    assert "±12" in pb["signature_text"] or "oscillating" in pb["signature_text"]
+    # playbook_directives must not leak as a top-level key.
+    assert "playbook_directives" not in out
+
+
+def test_generate_summary_playbook_without_signature():
+    payload = _payload()
+    payload.pop("condition_signature")
+    payload.pop("condition_signature_text")
+    client = _FakeClient(_GOOD_RESPONSE)
+    out = generate_summary(race_name=None, payload=payload, client=client)
+    assert out is not None
+    assert "signature" not in out["playbook"]
+    assert out["playbook"]["directives"]
 
 
 def test_generate_summary_returns_none_on_api_error():
     client = _FakeClient(
         "ignored", raise_exc=RuntimeError("anthropic 429 rate limit"),
     )
-    out = generate_summary(
-        race_name="Test",
-        boat_class=None,
-        stats=_stats(),
-        client=client,
-    )
-    assert out is None
+    assert generate_summary(
+        race_name="Test", payload=_payload(), client=client,
+    ) is None
 
 
 def test_generate_summary_returns_none_when_response_unparseable():
     client = _FakeClient("the model said no")
-    out = generate_summary(
-        race_name=None,
-        boat_class=None,
-        stats=_stats(),
-        client=client,
-    )
-    assert out is None
+    assert generate_summary(
+        race_name=None, payload=_payload(), client=client,
+    ) is None
 
 
 def test_generate_summary_returns_none_when_no_api_key(monkeypatch: pytest.MonkeyPatch):
     """No client passed AND no key in settings — should not raise."""
-    # Stub the lazy import. race_summary calls `from app.config import
-    # get_settings` inside generate_summary; we replace get_settings
-    # in the app.config namespace with a fake returning a key-less
-    # settings object.
     fake_settings = type(
-        "FakeSettings", (), {"anthropic_api_key": None, "anthropic_model": "x"}
+        "FakeSettings", (),
+        {"anthropic_api_key": None, "anthropic_model": "x",
+         "anthropic_analysis_model": "y"},
     )()
 
     import app.config
     monkeypatch.setattr(
         app.config, "get_settings", lambda: fake_settings, raising=False
     )
-    out = generate_summary(
-        race_name=None, boat_class=None, stats=_stats(),
-    )
-    assert out is None
+    assert generate_summary(race_name=None, payload=_payload()) is None
 
 
-# ─── Heel summary rendering (v3 prompt addition) ─────────────────────
+def test_prompt_version_is_4():
+    assert PROMPT_VERSION == 4
 
 
-def _heel_summary(**overrides: Any) -> dict:
-    base = {
-        "sample_count": 12_000,
-        "max_heel_abs_deg": 27.4,
-        "max_heel_deg": -27.4,   # port heel
-        "avg_heel_abs_deg": 14.2,
-        "pct_time_heeled_gt_10": 0.62,
-        "pct_time_heeled_gt_20": 0.21,
-        "max_pitch_abs_deg": 8.1,
-        "by_leg": [
-            {
-                "leg_index": 0,
-                "max_heel_abs_deg": 24.0,
-                "avg_heel_abs_deg": 17.5,
-                "sample_count": 6000,
-            },
-            {
-                "leg_index": 1,
-                "max_heel_abs_deg": 27.4,
-                "avg_heel_abs_deg": 11.0,
-                "sample_count": 6000,
-            },
-        ],
-    }
-    base.update(overrides)
-    return base
-
-
-def test_prompt_includes_heel_section_when_provided():
-    p = build_prompt(
-        race_name="Tuesday Beer Can",
-        boat_class="Beneteau 36.7",
-        stats=_stats(),
-        heel_summary=_heel_summary(),
-    )
-    assert "Boat heel" in p
-    # Side annotation present.
-    assert "port" in p.lower()
-    # Per-leg block rendered.
-    assert "Leg 1" in p and "Leg 2" in p
-
-
-def test_prompt_omits_heel_section_when_empty():
-    p = build_prompt(
-        race_name=None, boat_class=None, stats=_stats(),
-        heel_summary=None,
-    )
-    assert "Boat heel" not in p
-
-
-def test_prompt_omits_heel_section_when_zero_samples():
-    p = build_prompt(
-        race_name=None, boat_class=None, stats=_stats(),
-        heel_summary={"sample_count": 0},
-    )
-    assert "Boat heel" not in p
-
-
-def test_prompt_heel_starboard_label():
-    p = build_prompt(
-        race_name=None, boat_class=None, stats=_stats(),
-        heel_summary=_heel_summary(max_heel_deg=28.1),
-    )
-    assert "starboard" in p.lower()
-
-
-def test_prompt_version_is_3():
-    assert PROMPT_VERSION == 3
-
-
-def test_generate_summary_threads_heel_through(monkeypatch: pytest.MonkeyPatch):
-    """Heel summary should make it into the user message that the
-    Anthropic client receives — guards against accidentally dropping
-    the new arg in the wrapper."""
-    client = _FakeClient('{"recap": "ok", "tips": []}')
-    out = generate_summary(
-        race_name="X", boat_class="Etchells",
-        stats=_stats(), heel_summary=_heel_summary(),
-        client=client, model="test-model",
-    )
-    assert out is not None
-    user_msg = client.messages.last_call["messages"][0]["content"]
-    assert "Boat heel" in user_msg
-    assert "27" in user_msg  # max heel magnitude
+def test_system_prompt_contains_hard_rules():
+    sp = race_summary._SYSTEM_PROMPT
+    assert "double-count" in sp
+    assert "EXECUTION" in sp and "DECISION" in sp
+    assert "do not comment on data that isn't present" in sp.lower()

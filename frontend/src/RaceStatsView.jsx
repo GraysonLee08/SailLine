@@ -227,7 +227,7 @@ function SummaryCard({ summary, pending, onRegenerate, regenerating }) {
   return (
     <section style={styles.card}>
       <div style={styles.cardHead}>
-        <div style={styles.cardTitle}>Race recap</div>
+        <div style={styles.cardTitle}>Race analysis</div>
         {onRegenerate ? (
           <button
             onClick={onRegenerate}
@@ -239,16 +239,22 @@ function SummaryCard({ summary, pending, onRegenerate, regenerating }) {
         ) : null}
       </div>
       {summary ? (
-        <>
-          <p style={styles.recap}>{summary.recap}</p>
-          {summary.tips?.length ? (
-            <ul style={styles.tipsList}>
-              {summary.tips.map((t, i) => (
-                <li key={i} style={styles.tip}>{t}</li>
-              ))}
-            </ul>
-          ) : null}
-        </>
+        summary.summary ? (
+          <AnalysisBody summary={summary} />
+        ) : (
+          <>
+            {/* Legacy v3 shape ({recap, tips}) — shown until the race
+                is regenerated under prompt v4. */}
+            <p style={styles.recap}>{summary.recap}</p>
+            {summary.tips?.length ? (
+              <ul style={styles.tipsList}>
+                {summary.tips.map((t, i) => (
+                  <li key={i} style={styles.tip}>{t}</li>
+                ))}
+              </ul>
+            ) : null}
+          </>
+        )
       ) : pending ? (
         <Skeleton lines={4} />
       ) : (
@@ -258,6 +264,72 @@ function SummaryCard({ summary, pending, onRegenerate, regenerating }) {
         </div>
       )}
     </section>
+  );
+}
+
+function AnalysisBody({ summary }) {
+  const worked = summary.what_worked || [];
+  const cost = summary.what_cost || [];
+  const playbook = summary.playbook || null;
+  const totalLoss = summary.total_identifiable_loss_s;
+  return (
+    <>
+      <p style={styles.recap}>{summary.summary}</p>
+      {worked.length ? (
+        <>
+          <div style={styles.analysisHead}>What worked</div>
+          <ul style={styles.tipsList}>
+            {worked.map((t, i) => (
+              <li key={i} style={styles.tip}>{t}</li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {cost.length ? (
+        <>
+          <div style={styles.analysisHead}>What cost us</div>
+          <ul style={styles.tipsList}>
+            {cost.map((c, i) => (
+              <li key={i} style={styles.tip}>
+                <span
+                  style={{
+                    ...styles.findingTag,
+                    background:
+                      c.tag === "EXECUTION"
+                        ? "var(--tag-exec, #e8f0fe)"
+                        : "var(--tag-decision, #fdecea)",
+                  }}
+                >
+                  {c.tag}
+                </span>{" "}
+                {c.text}
+                {c.cost_s != null ? (
+                  <span style={styles.costChip}> ~{Math.round(c.cost_s)}s</span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {totalLoss != null ? (
+            <div style={styles.totalLoss}>
+              Total identifiable loss: ~{Math.round(totalLoss)}s
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      {playbook?.directives?.length ? (
+        <>
+          <div style={styles.analysisHead}>Same-conditions playbook</div>
+          {playbook.signature_text ? (
+            <div style={styles.signature}>{playbook.signature_text}</div>
+          ) : null}
+          <ol style={styles.tipsList}>
+            {playbook.directives.map((d, i) => (
+              <li key={i} style={styles.tip}>{d}</li>
+            ))}
+          </ol>
+        </>
+      ) : null}
+    </>
   );
 }
 
@@ -680,6 +752,38 @@ const styles = {
     lineHeight: 1.55,
     whiteSpace: "pre-wrap",
     margin: 0,
+  },
+  analysisHead: {
+    fontSize: 12,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+    color: "var(--ink-soft, #55555e)",
+    margin: "16px 0 0",
+  },
+  findingTag: {
+    display: "inline-block",
+    fontSize: 10,
+    fontWeight: 700,
+    letterSpacing: "0.04em",
+    padding: "1px 6px",
+    borderRadius: 4,
+    verticalAlign: "middle",
+  },
+  costChip: {
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  totalLoss: {
+    marginTop: 10,
+    fontSize: 13,
+    fontWeight: 700,
+  },
+  signature: {
+    marginTop: 8,
+    fontSize: 13,
+    fontStyle: "italic",
+    color: "var(--ink-soft, #55555e)",
   },
   tipsList: {
     margin: "12px 0 0",

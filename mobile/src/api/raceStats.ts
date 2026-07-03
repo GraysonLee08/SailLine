@@ -40,9 +40,29 @@ export type Stats = {
   rating_seconds_per_mile?: number | null;
 };
 
+export type CostFinding = {
+  tag: "EXECUTION" | "DECISION";
+  text: string;
+  cost_s?: number | null;
+};
+
+export type Playbook = {
+  signature?: Record<string, unknown> | null;
+  signature_text?: string | null;
+  directives: string[];
+};
+
 export type AiSummary = {
-  recap: string;
-  tips: string[];
+  // v4 analysis shape (prompt_version >= 4)
+  summary?: string;
+  what_worked?: string[];
+  what_cost?: CostFinding[];
+  total_identifiable_loss_s?: number | null;
+  playbook?: Playbook | null;
+  analysis?: Record<string, unknown> | null;
+  // Legacy v3 shape — present until the race is regenerated under v4
+  recap?: string;
+  tips?: string[];
   model?: string | null;
   prompt_version?: number | null;
   generated_at?: string | null;
