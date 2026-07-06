@@ -33,10 +33,15 @@ export type FeatureFlag = "native_uploader";
 /** Defaults baked into the build. Update here when promoting a flag
  *  from opt-in to opt-out. */
 const DEFAULTS: Record<FeatureFlag, boolean> = {
-  // Phase 4 ships OFF until the first on-water validation. After two
-  // clean races we flip the default to true (and after the third we
-  // delete the flag + JS uploader entirely — Phase 5 cleanup).
-  native_uploader: false,
+  // Promoted to default-ON 2026-07-06. The js-mode failure pattern
+  // showed up yet again in the Dummy Test session (flush stalls of
+  // 48 s / 240 s with the screen off, session dies with the process),
+  // and the whole 2026-07-05 persistence + watchdog feature set only
+  // arms in native mode — leaving this opt-in meant racing unprotected
+  // by default. The debug-screen toggle remains as the manual opt-OUT.
+  // Phase 5 (delete the flag + JS uploader entirely) still applies
+  // after the next clean on-water race.
+  native_uploader: true,
 };
 
 function storageKey(flag: FeatureFlag): string {
