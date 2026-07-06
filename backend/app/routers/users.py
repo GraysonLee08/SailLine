@@ -451,7 +451,12 @@ async def delete_push_token(
     token: str,
     user: dict = Depends(get_current_user),
     pool: asyncpg.Pool = Depends(db.get_pool),
-) -> None:
+):
+    # No return annotation — the pinned FastAPI version treats `-> None`
+    # on a 204 route as a declared response body and asserts at import
+    # time ("Status code 204 must not have a response body"). Same bare
+    # signature as delete_race in races.py, which established the
+    # pattern.
     """Unregister a device token (sign-out path).
 
     Token arrives as a query param (``?token=``), not a path segment —
@@ -464,6 +469,7 @@ async def delete_push_token(
             "DELETE FROM device_push_tokens WHERE token = $1 AND user_id = $2",
             token, user["uid"],
         )
+    return None
 
 
 @router.delete("/me/avatar", response_model=UserProfileOut)
