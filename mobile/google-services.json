@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "105706282249",
+    "project_id": "sailline",
+    "storage_bucket": "sailline.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:105706282249:android:d01154bd0accd9dd5e87d8",
+        "android_client_info": {
+          "package_name": "com.sailline.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "105706282249-v6gpoe4as4u26ur1hk9k3obli9p5dn2s.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA2bEW2cBWL7W5SuRoE8a5PDy2QvJc_M2A"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "105706282249-v6gpoe4as4u26ur1hk9k3obli9p5dn2s.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
