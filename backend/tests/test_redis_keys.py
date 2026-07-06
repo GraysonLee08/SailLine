@@ -233,3 +233,18 @@ def test_ttl_constants():
     assert redis_keys.ROUTE_CACHE_TTL_S == 3600
     assert redis_keys.ROUTE_NOTIFICATION_TTL_S == 7 * 24 * 3600
     assert redis_keys.ROUTE_LAST_REQUEST_TTL_S == 7 * 24 * 3600
+
+
+# ---------------------------------------------------------------------------
+# Dead-recorder watchdog
+
+
+def test_recorder_watchdog_key_fingerprint():
+    assert (
+        redis_keys.recorder_watchdog_key(_RACE_ID)
+        == "watchdog:recorder:11111111-2222-3333-4444-555555555555"
+    )
+
+
+def test_recorder_watchdog_ttl():
+    assert redis_keys.RECORDER_WATCHDOG_TTL_S == 6 * 3600

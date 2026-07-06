@@ -126,6 +126,37 @@ export async function syncNow(): Promise<void> {
 }
 
 /**
+ * Is the native tracking service currently running? Used by the
+ * relaunch reconciler (RecorderContext) to discover a session that
+ * survived a JS process kill or a reboot (stopOnTerminate:false /
+ * startOnBoot:true, 2026-07-05). Falls back to false on any error —
+ * "not tracking" is the safe answer for a reconciler deciding whether
+ * to re-attach.
+ */
+export async function isPluginTracking(): Promise<boolean> {
+  try {
+    const state = await BackgroundGeolocation.getState();
+    return state.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop the native service directly, without a watcher handle. The
+ * reconciler's teardown path for orphaned sessions (plugin running
+ * but its race is already ended/deleted): drain what's queued, then
+ * kill the service. Safe to call when already stopped.
+ */
+export async function stopPlugin(): Promise<void> {
+  try {
+    await BackgroundGeolocation.stop();
+  } catch {
+    // Already stopped or plugin not ready — nothing to tear down.
+  }
+}
+
+/**
  * Read the current native queue depth — number of locations awaiting
  * upload. Used by the recorder to reconcile its displayed queueLength
  * against native truth on foreground events. Falls back to 0 on any
@@ -281,8 +312,23 @@ export async function startWatcher({
   onPosition,
   onError,
   nativeUploader,
+  persistSession = false,
 }: WatcherCallbacks & {
   nativeUploader?: NativeUploaderConfig;
+  /**
+   * 2026-07-05 — survive process kill + reboot. When true the config
+   * flips to ``stopOnTerminate: false`` + ``startOnBoot: true`` so an
+   * OS kill (or the user swiping the app away, or a mid-race reboot)
+   * does NOT stop capture: the foreground service keeps running (and
+   * the native HTTP layer keeps uploading) with no JS above it. The
+   * relaunch reconciler (RecorderContext + activeSession.ts) re-attaches
+   * the UI on next launch.
+   *
+   * Callers should only pass true in native-uploader mode: a revived
+   * js-mode service would capture into the void (no JS = no queue, no
+   * flush), burning battery for data that never lands.
+   */
+  persistSession?: boolean;
 }): Promise<{ stop: () => Promise<void> }> {
   const locationSub: Subscription = BackgroundGeolocation.onLocation(
     (location) => {
@@ -321,11 +367,15 @@ export async function startWatcher({
     },
 
     // ── App lifecycle + Android foreground service ───────────────────
-    // We start/stop explicitly around a race; don't auto-resume on boot
-    // or keep running after the app is terminated in Phase 1.
+    // Phase 1 hard-coded stopOnTerminate:true / startOnBoot:false ("we
+    // start/stop explicitly around a race"). 2026-07-05: that policy
+    // lost a race — the OS killed the app mid-race and recording died
+    // with it. persistSession (native-uploader sessions only) now keeps
+    // the service alive across kill/reboot; see the startWatcher
+    // docstring and activeSession.ts for the reconcile contract.
     app: {
-      stopOnTerminate: true,
-      startOnBoot: false,
+      stopOnTerminate: !persistSession,
+      startOnBoot: persistSession,
       backgroundPermissionRationale: {
         title:
           "Allow SailLine to record your track while the screen is off?",

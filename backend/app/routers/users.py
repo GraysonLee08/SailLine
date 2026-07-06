@@ -388,6 +388,84 @@ async def upload_avatar(
     return _row_to_out(user["uid"], user["tier"], row)
 
 
+# ─── Device push tokens ──────────────────────────────────────────────
+#
+# Registration surface for FCM device tokens, consumed by
+# ``app/services/push.py`` (dead-recorder watchdog). One row per
+# device; the token itself is the identity (see migration 0024).
+
+
+class PushTokenIn(BaseModel):
+    """Body of POST /me/push-tokens.
+
+    ``token`` is an opaque FCM registration token — we do no structural
+    validation beyond a sanity length cap (real tokens are ~150-300
+    chars; 4096 leaves headroom for format changes without letting a
+    megabyte of garbage into the table).
+    """
+
+    token: str = Field(min_length=16, max_length=4096)
+    platform: Literal["android", "ios"]
+
+
+class PushTokenAck(BaseModel):
+    registered: bool = True
+
+
+@router.post(
+    "/me/push-tokens",
+    response_model=PushTokenAck,
+    status_code=status.HTTP_201_CREATED,
+)
+async def register_push_token(
+    payload: PushTokenIn,
+    user: dict = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool),
+) -> PushTokenAck:
+    """UPSERT a device token for the caller.
+
+    ON CONFLICT reassigns ``user_id``: the same physical device
+    signing in as a different account must move the token, otherwise
+    pushes for the new user go to nobody and pushes for the old user
+    leak to a phone they no longer control. ``last_seen_at`` refreshes
+    on every call — the client re-registers on each app launch, so
+    this doubles as a liveness stamp.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO device_push_tokens (token, user_id, platform)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (token) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    platform = EXCLUDED.platform,
+                    last_seen_at = NOW()
+            """,
+            payload.token, user["uid"], payload.platform,
+        )
+    return PushTokenAck()
+
+
+@router.delete("/me/push-tokens", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_push_token(
+    token: str,
+    user: dict = Depends(get_current_user),
+    pool: asyncpg.Pool = Depends(db.get_pool),
+) -> None:
+    """Unregister a device token (sign-out path).
+
+    Token arrives as a query param (``?token=``), not a path segment —
+    FCM tokens contain ``:`` which routers mangle in paths. Scoped to
+    the caller's own rows so one user can't unregister another's
+    device. Deleting an unknown token is a silent 204 (idempotent).
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM device_push_tokens WHERE token = $1 AND user_id = $2",
+            token, user["uid"],
+        )
+
+
 @router.delete("/me/avatar", response_model=UserProfileOut)
 async def delete_avatar(
     user: dict = Depends(get_current_user),

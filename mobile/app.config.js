@@ -54,6 +54,17 @@ const TRANSISTOR_LICENSE =
   process.env.TRANSISTOR_LICENSE ||
   "eyJhbGciOiJFZERTQSIsImtpZCI6ImVkMjU1MTktbWFpbi12MSJ9.eyJvcyI6ImFuZHJvaWQiLCJhcHBfaWQiOiJjb20uc2FpbGxpbmUuYXBwIiwib3JkZXJfbnVtYmVyIjoxNjM4NCwicmVuZXdhbF91cmwiOiJodHRwczovL3Nob3AudHJhbnNpc3RvcnNvZnQuY29tL2NhcnQvMTY1MDc4NjE1MDU6MT9ub3RlPTEwODYyIiwiY3VzdG9tZXJfaWQiOjk4NzAsInByb2R1Y3QiOiJyZWFjdC1uYXRpdmUtYmFja2dyb3VuZC1nZW9sb2NhdGlvbiIsImtleV92ZXJzaW9uIjoxLCJhbGxvd2VkX3N1ZmZpeGVzIjpbIi5kZXYiLCIuZGV2ZWxvcG1lbnQiLCIuc3RhZ2luZyIsIi5zdGFnZSIsIi5xYSIsIi51YXQiLCIudGVzdCIsIi5kZWJ1ZyJdLCJtYXhfYnVpbGRfc3RhbXAiOjIwMjcwNjI3LCJncmFjZV9idWlsZHMiOjAsImVudGl0bGVtZW50cyI6WyJjb3JlIl0sImlhdCI6MTc3OTkwMjY3Nn0.cF3q-jT3jKHpNgFOkcrEbkwvZKfXPZuUQiVuwOJXY672JrQacfeVES-oqOUeEAa5rpMJrRtaDBQBDdojUz1WBg";
 
+// FCM for server-initiated push (dead-recorder watchdog, 2026-07-05).
+// google-services.json comes from the Firebase console (Project settings
+// → Your apps → Android app com.sailline.app → download) and is safe to
+// commit — it contains identifiers, not credentials. Conditional so
+// prebuild keeps working before the file is downloaded; without it,
+// device push registration no-ops (see src/notifications/pushTokens.ts).
+const fs = require("fs");
+const GOOGLE_SERVICES = fs.existsSync(`${__dirname}/google-services.json`)
+  ? { googleServicesFile: "./google-services.json" }
+  : {};
+
 module.exports = ({ config }) => ({
   ...config,
 
@@ -76,6 +87,7 @@ module.exports = ({ config }) => ({
 
   android: {
     ...config.android,
+    ...GOOGLE_SERVICES,
     permissions: [
       "ACCESS_COARSE_LOCATION",
       "ACCESS_FINE_LOCATION",

@@ -115,6 +115,34 @@ steps:
           --region=us-central1 \
         || echo "WARNING: race-sweep job not found — create it once (see comment above), then this step keeps it updated."
 
+  # 7. Same lockstep treatment for the recorder-watchdog job (added
+  #    2026-07-05). Every-2-minutes Cloud Scheduler execution pushes a
+  #    "recording stopped" FCM notification to the owner of any open race
+  #    whose telemetry has gone silent >5 min — the mid-race counterpart
+  #    to race-sweep's after-the-fact cleanup. One-time creation:
+  #      gcloud run jobs create recorder-watchdog `
+  #        --image=us-central1-docker.pkg.dev/sailline/sailline/api:latest `
+  #        --region=us-central1 --command=python `
+  #        --args="-m,workers.recorder_watchdog" `
+  #        --service-account=sailline-api@sailline.iam.gserviceaccount.com `
+  #        --vpc-connector=sailline-connector --vpc-egress=private-ranges-only `
+  #        --set-env-vars=<same as race-postprocess> --set-secrets=<same>
+  #      gcloud scheduler jobs create http recorder-watchdog-2min `
+  #        --location=us-central1 --schedule="*/2 * * * *" `
+  #        --uri="https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/sailline/jobs/recorder-watchdog:run" `
+  #        --oauth-service-account-email=sailline-api@sailline.iam.gserviceaccount.com
+  #    Same tolerant-update pattern as race-sweep until the job exists.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'update-watchdog-job'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        gcloud run jobs update recorder-watchdog \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/sailline/api:$SHORT_SHA \
+          --region=us-central1 \
+        || echo "WARNING: recorder-watchdog job not found — create it once (see comment above), then this step keeps it updated."
+
 
 # Run as the dedicated build service account
 serviceAccount: 'projects/$PROJECT_ID/serviceAccounts/sailline-cloudbuild@$PROJECT_ID.iam.gserviceaccount.com'

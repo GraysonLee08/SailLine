@@ -261,6 +261,28 @@ def tactics_playbook_key(race_id: Union[UUID, str]) -> str:
     return f"tactics:playbook:{race_id}"
 
 
+# ---------------------------------------------------------------------------
+# Dead-recorder watchdog (workers/recorder_watchdog.py)
+
+
+# 6 hours — outlives any race plus the race_sweep stale window (3 h),
+# so a swept race's notify-state expires on its own instead of
+# lingering until the next race reuses the id (it never does — ids are
+# UUIDs — but unbounded keys are unbounded keys).
+RECORDER_WATCHDOG_TTL_S: int = 6 * 3600
+
+
+def recorder_watchdog_key(race_id: Union[UUID, str]) -> str:
+    """Notify-state for the dead-recorder watchdog. JSON
+    ``{"last_fix_at": iso, "notified_at": iso}`` — the last-fix
+    timestamp the most recent push was sent about, and when. Used to
+    (a) not re-push every sweep tick for the same silence, (b) re-arm
+    when fixes resume and go silent again, (c) re-push after a
+    cooldown if the silence simply continues.
+    """
+    return f"watchdog:recorder:{race_id}"
+
+
 def route_last_request_key(race_id: Union[UUID, str]) -> str:
     """The user's most recent ``RouteRequest`` JSON. The endpoint
     writes this on every successful compute; the background recompute

@@ -52,6 +52,10 @@ import {
   gatherDeviceInfo,
   type LiveStats,
 } from "./debrief";
+import {
+  clearActiveSession,
+  saveActiveSession,
+} from "./activeSession";
 import { startImuCapture, type ImuCaptureHandle } from "./imuRecorder";
 import { getFlag } from "./featureFlags";
 import { clearQueue, loadQueue, saveQueue } from "./queue";
@@ -604,6 +608,19 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       message: `start mode=${nativeModeRef.current ? "native" : "js"}`,
     });
 
+    // 2026-07-05 — persist the session descriptor so the relaunch
+    // reconciler (RecorderContext) can re-attach after a process kill
+    // or reboot. Written for BOTH modes: native sessions get
+    // re-attached; a dead js-mode session is at least reported as
+    // interrupted instead of silently vanishing. Idempotent on
+    // re-attach — the reconciler calls start() again for the same
+    // race, which just rewrites the same descriptor.
+    await saveActiveSession({
+      raceId: id,
+      mode: nativeModeRef.current ? "native" : "js",
+      startedAt: new Date().toISOString(),
+    });
+
     // Restore any points left over from a previous (interrupted) JS-mode
     // session for this race so they flush with the new run. Skipped in
     // native mode: Transistorsoft's SQLite store already holds the
@@ -632,6 +649,9 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
       onPosition,
       onError,
       nativeUploader: nativeUploaderCfg,
+      // Survive process kill / reboot — native mode only (a revived
+      // js-mode service would capture into the void; see startWatcher).
+      persistSession: nativeModeRef.current,
     })
       .then((handle) => {
         watcherRef.current = handle;
@@ -750,6 +770,12 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     if (!nativeModeRef.current && id && gpsQueueRef.current.length === 0) {
       await clearQueue(id);
     }
+
+    // 2026-07-05 — the session ended on purpose; drop the descriptor so
+    // the next launch doesn't try to re-attach a recording that isn't
+    // there. Deliberately AFTER the final flush (a crash between flush
+    // and here leaves the descriptor behind → reconciler cleans up).
+    await clearActiveSession();
 
     // ── Phase 2 — post the debrief, best-effort ─────────────────────
     //
