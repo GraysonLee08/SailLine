@@ -36,6 +36,10 @@ export type RaceDetailSheetHandle = {
 type Props = {
   race: Race;
   onClose: () => void;
+  /** Opens the race editor (/race-edit?id=…). Omit to hide the pencil —
+      the parent passes undefined while this race is being recorded,
+      since editing marks mid-race would fight the mark detector. */
+  onEdit?: () => void;
   onStart: () => void;
   /** "Compute route" button handler. */
   onCompute: () => void;
@@ -85,6 +89,7 @@ const SNAP_POINTS = ["32%", "75%"];
 export const RaceDetailSheet = forwardRef<RaceDetailSheetHandle, Props>(function RaceDetailSheet({
   race,
   onClose,
+  onEdit,
   onStart,
   onCompute,
   routeLoading,
@@ -210,6 +215,20 @@ export const RaceDetailSheet = forwardRef<RaceDetailSheetHandle, Props>(function
               </Text>
             </View>
           </View>
+          {onEdit ? (
+            <Pressable
+              onPress={onEdit}
+              accessibilityLabel="Edit race"
+              hitSlop={10}
+              style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
+            >
+              <Ionicons
+                name="pencil-outline"
+                size={20}
+                color={colors.text.muted}
+              />
+            </Pressable>
+          ) : null}
           <Pressable
             onPress={onClose}
             accessibilityLabel="Close race details"

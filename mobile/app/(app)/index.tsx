@@ -192,6 +192,16 @@ export default function MapHomeScreen() {
     if (!setSelectedRace(null)) return;
   }, [setSelectedRace]);
 
+  // Edit the selected race in the full-screen editor (2026-07-06). The
+  // editor screen has supported ?id= since it was built — this is the
+  // first navigation into it with an id. Suppressed while recording:
+  // editing marks mid-race would fight the mark detector, and the
+  // recorder locks race selection anyway.
+  const handleEditRace = useCallback(() => {
+    if (!selectedRace) return;
+    router.push(`/race-edit?id=${selectedRace.id}`);
+  }, [selectedRace]);
+
   // Start recording. The root RecordingGate replaces the route to
   // /recording once recorder.recording flips to true, so we don't
   // manually navigate here — keeps the "what triggered the screen
@@ -290,6 +300,7 @@ export default function MapHomeScreen() {
           ref={detailSheetRef}
           race={selectedRace}
           onClose={handleCloseDetail}
+          onEdit={recorder.recording ? undefined : handleEditRace}
           onStart={handleStartRecording}
           onCompute={routing.compute}
           routeLoading={routing.loading}
