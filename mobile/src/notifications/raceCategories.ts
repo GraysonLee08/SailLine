@@ -67,6 +67,15 @@ export const CATEGORY_START_FAILSAFE = "sailline.start-failsafe";
  *  so the recording screen surfaces once the recorder flips live. */
 export const ACTION_START_RECORDING = "start-recording";
 
+/** The T-6 "Race starts in 6 min" reminder — see scheduledAutoStart.ts.
+ *  2026-07-06: gained an explicit "Start recording" action button. The
+ *  body-tap path still works, but watches (Garmin especially) only
+ *  surface Android notifications' ACTION BUTTONS, not body taps — on
+ *  the wrist the tap-to-start cue was showing as Dismiss/Block App
+ *  with no way to actually start. Same ACTION_START_RECORDING id as
+ *  the failsafe so the response handler needs no new branch. */
+export const CATEGORY_AUTO_START = "sailline.auto-start";
+
 // ── Registration ──────────────────────────────────────────────────────
 
 /**
@@ -104,6 +113,13 @@ export async function registerRaceNotificationCategories(): Promise<void> {
         },
       ],
     );
+    await Notifications.setNotificationCategoryAsync(CATEGORY_AUTO_START, [
+      {
+        identifier: ACTION_START_RECORDING,
+        buttonTitle: "Start recording",
+        options: { opensAppToForeground: true },
+      },
+    ]);
   } catch {
     // Category registration can fail on Expo Go (which we don't ship
     // anyway — see CLAUDE.md mobile section). Surface no error; the

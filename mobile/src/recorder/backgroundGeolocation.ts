@@ -395,10 +395,15 @@ export async function startWatcher({
     },
 
     // ── Logging ──────────────────────────────────────────────────────
-    // Keep the on-device log small; raise to LogLevel.Verbose while
-    // debugging a failed screen-locked run.
+    // 2026-07-06 — TEMPORARILY Verbose to diagnose the heartbeat-only
+    // capture bug (native-mode session recorded ~1 fix/min at :30 past
+    // each minute — the stationary-state signature — despite
+    // disableStopDetection + changePace(true)). The native SDK logs to
+    // logcat independent of JS console stripping:
+    //   adb logcat -d -s TSLocationManager
+    // Revert to LogLevel.Warning once the motion-state issue is fixed.
     logger: {
-      logLevel: BackgroundGeolocation.LogLevel.Warning,
+      logLevel: BackgroundGeolocation.LogLevel.Verbose,
     },
 
     // ── Phase 4: native HTTP uploader (flag-gated by caller) ────────

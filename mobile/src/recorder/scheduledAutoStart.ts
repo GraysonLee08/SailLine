@@ -41,7 +41,10 @@ import BackgroundFetch from "react-native-background-fetch";
 import * as Notifications from "expo-notifications";
 import { Platform } from "react-native";
 
-import { ACTION_START_RECORDING } from "../notifications/raceCategories";
+import {
+  ACTION_START_RECORDING,
+  CATEGORY_AUTO_START,
+} from "../notifications/raceCategories";
 
 // ── Module-scoped state ────────────────────────────────────────────────
 
@@ -185,8 +188,10 @@ export function setOnFire(fn: (() => void | Promise<void>) | null): void {
 }
 
 /**
- * Does this notification response mean "start the recorder"? Two shapes:
- *   * a body tap on the T-6 auto-start notification (kind autoStart), or
+ * Does this notification response mean "start the recorder"? Three shapes:
+ *   * a body tap on the T-6 auto-start notification (kind autoStart),
+ *   * the "Start recording" action button on that same T-6 notification
+ *     (2026-07-06 — watches only relay action buttons, not body taps), or
  *   * the "Start recording" action button on the start-failsafe
  *     notification (kind startFailsafe — see notifications/raceEvents.ts).
  * A body tap on the failsafe (no action) just opens the app; the user
@@ -196,6 +201,9 @@ function isStartResponse(
   response: Notifications.NotificationResponse,
 ): boolean {
   const data = response.notification.request.content.data;
+  // autoStart: body tap AND the action button both mean "start" — the
+  // action's identifier is ACTION_START_RECORDING but we don't need to
+  // check it; the category defines no other actions.
   if (data?.kind === "autoStart") return true;
   return (
     data?.kind === "startFailsafe" &&
@@ -282,6 +290,10 @@ export async function scheduleAutoStart(
           title: "Race starts in 6 min",
           body:
             "Tap to start tracking. SailLine will auto-start at T-5 if you don't.",
+          // 2026-07-06 — explicit action button so watches can start the
+          // recorder from the wrist. Body tap still works on the phone;
+          // Garmin only relays action buttons (see raceCategories.ts).
+          categoryIdentifier: CATEGORY_AUTO_START,
           data: { kind: "autoStart", raceId },
           ...(Platform.OS === "android"
             ? { channelId: ANDROID_CHANNEL_ID }
