@@ -66,6 +66,12 @@ export type LocalPoint = {
 export type WatcherCallbacks = {
   onPosition: (point: LocalPoint) => void;
   onError?: (err: Error) => void;
+  /** Diagnostic lifecycle events (motion-state transitions, heartbeats,
+   *  forced-moving re-assertions). The recorder writes these into the
+   *  ring buffer so the debug screen shows the motion-state history —
+   *  added 2026-07-07 after two sessions spent silently STATIONARY.
+   *  Optional: tests and future callers may not care. */
+  onLifecycleEvent?: (message: string) => void;
 };
 
 /**
@@ -342,6 +348,7 @@ const NORMALIZE_LOG_EVERY = 10; // one log per ~10 fixes ≈ once per 10 s
 export async function startWatcher({
   onPosition,
   onError,
+  onLifecycleEvent,
   nativeUploader,
   persistSession = false,
 }: WatcherCallbacks & {
@@ -372,6 +379,41 @@ export async function startWatcher({
     (error) => {
       // Transistorsoft location-error codes are numeric; surface them.
       onError?.(new Error(`location error ${error}`));
+    },
+  );
+
+  // ── 2026-07-07 — forced-moving watchdog ──────────────────────────
+  //
+  // Both 07-06 and 07-07 sessions spent themselves in the STATIONARY
+  // state, persisting one heartbeat fix per minute while the screen
+  // drew full-rate (non-persisted) sample locations. changePace(true)
+  // at start is evidently not sticking. Policy: while a recording
+  // session is active the plugin is NEVER allowed to be stationary —
+  // whenever it reports a transition to isMoving:false we immediately
+  // force it back. Every transition + re-assertion is logged via
+  // onLifecycleEvent so the debug screen finally shows the motion
+  // history instead of us inferring it from POST cadences.
+  let watcherActive = true;
+  const motionSub: Subscription = BackgroundGeolocation.onMotionChange(
+    (event) => {
+      onLifecycleEvent?.(
+        `motionchange isMoving=${event.isMoving}`,
+      );
+      if (!event.isMoving && watcherActive) {
+        onLifecycleEvent?.("forcing moving state (recording active)");
+        BackgroundGeolocation.changePace(true).catch((e: unknown) => {
+          onError?.(e instanceof Error ? e : new Error(String(e)));
+        });
+      }
+    },
+  );
+
+  // Heartbeats only fire while stationary — with the watchdog above,
+  // seeing one in the ring buffer means the forced-moving policy is
+  // being fought by something. Pure diagnostics.
+  const heartbeatSub: Subscription = BackgroundGeolocation.onHeartbeat(
+    () => {
+      onLifecycleEvent?.("heartbeat (plugin is stationary)");
     },
   );
 
@@ -408,6 +450,13 @@ export async function startWatcher({
       // the whole session — a sailboat's low-motion lulls must not pause
       // capture. Paired with changePace(true) after start().
       disableStopDetection: true,
+      // 2026-07-07 — backstop for the same disease: even if the motion
+      // detector declares "still" despite disableStopDetection, tracking
+      // persists 30 more minutes before the plugin may go stationary —
+      // by which time the forced-moving watchdog (onMotionChange above)
+      // has flipped it back anyway. Belt AND suspenders because two
+      // sessions were lost to this state.
+      stopTimeout: 30,
       locationAuthorizationRequest: "Always",
       pausesLocationUpdatesAutomatically: false,
       showsBackgroundLocationIndicator: true,
@@ -520,10 +569,15 @@ export async function startWatcher({
 
   return {
     stop: async () => {
+      // Disarm the forced-moving watchdog FIRST — stop() itself emits a
+      // motionchange(false), which must not trigger a re-assertion.
+      watcherActive = false;
       try {
         await BackgroundGeolocation.stop();
       } finally {
         locationSub.remove();
+        motionSub.remove();
+        heartbeatSub.remove();
       }
     },
   };

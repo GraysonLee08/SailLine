@@ -648,6 +648,11 @@ export function useTrackRecorder(raceId: string | null): RecorderApi {
     watcherPromiseRef.current = startWatcher({
       onPosition,
       onError,
+      // Motion-state transitions + heartbeats + forced-moving
+      // re-assertions land in the ring buffer (2026-07-07) so the
+      // debug screen shows WHY a session captured at heartbeat rate.
+      onLifecycleEvent: (message) =>
+        recordLog({ kind: "lifecycle", status: "info", message }),
       nativeUploader: nativeUploaderCfg,
       // Survive process kill / reboot — native mode only (a revived
       // js-mode service would capture into the void; see startWatcher).
