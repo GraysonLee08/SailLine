@@ -69,6 +69,13 @@ type RecorderCtx = {
   selectedRace: Race | null;
   /** Replace the selection. Blocked while recording; returns false if so. */
   setSelectedRace: (race: Race | null) => boolean;
+  /** Update the selected race IN PLACE with fresh server data (same id
+      only). Unlike setSelectedRace this is NOT blocked while recording
+      — the id doesn't change, so the recorder is unaffected. Added
+      2026-07-07: RaceEditScreen saves weren't propagating here, so
+      auto-start kept arming against the STALE start_at (the missed
+      T-6 notification on the 07-07 test). */
+  refreshSelectedRace: (race: Race) => void;
   recorder: RecorderApi;
   /** Wraps recorder.start with the OS battery prompt nudge. */
   startRecording: () => Promise<void>;
@@ -95,6 +102,14 @@ export function RecorderProvider({ children }: { children: ReactNode }) {
     },
     [recorder.recording],
   );
+
+  // Same-id refresh after an edit. Functional update so we never race a
+  // concurrent selection change; a mismatched id is a silent no-op.
+  const refreshSelectedRace = useCallback((race: Race) => {
+    setSelectedRaceState((prev) =>
+      prev && prev.id === race.id ? race : prev,
+    );
+  }, []);
 
   const startRecording = useCallback(async () => {
     await requestBatteryOptimizationExemption();
@@ -234,8 +249,14 @@ export function RecorderProvider({ children }: { children: ReactNode }) {
   }, [selectedRace, recorder]);
 
   const value = useMemo<RecorderCtx>(
-    () => ({ selectedRace, setSelectedRace, recorder, startRecording }),
-    [selectedRace, setSelectedRace, recorder, startRecording],
+    () => ({
+      selectedRace,
+      setSelectedRace,
+      refreshSelectedRace,
+      recorder,
+      startRecording,
+    }),
+    [selectedRace, setSelectedRace, refreshSelectedRace, recorder, startRecording],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

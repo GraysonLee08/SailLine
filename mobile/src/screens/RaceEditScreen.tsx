@@ -64,6 +64,7 @@ import {
 } from "../api/races";
 import { listBoats, type BoatOption } from "../api/boats";
 import { MapCanvas, type MapCanvasHandle } from "../components/MapCanvas";
+import { useRecorder } from "../recorder/RecorderContext";
 import { useTheme } from "../theme/ThemeProvider";
 import type { RaceMark } from "../types";
 
@@ -116,6 +117,10 @@ type Props = {
 
 export function RaceEditScreen({ raceId }: Props) {
   const { colors, font, size } = useTheme();
+  // For pushing a saved edit back into the recorder context — without
+  // this, the detail sheet + auto-start keep the pre-edit race (stale
+  // start_at killed the T-6 notification on the 2026-07-07 test).
+  const { refreshSelectedRace } = useRecorder();
   const isNew = !raceId;
 
   // ── Form state (mirror of webapp RaceEditor.jsx state shape) ──────
@@ -362,7 +367,12 @@ export function RaceEditScreen({ raceId }: Props) {
       if (isNew) {
         await createRace(payload);
       } else if (raceId) {
-        await updateRace(raceId, payload);
+        const saved = await updateRace(raceId, payload);
+        // Push the fresh row into the recorder context so the detail
+        // sheet re-renders with the new values and auto-start re-arms
+        // against the NEW start_at. No-op if this race isn't the
+        // current selection.
+        refreshSelectedRace(saved);
       }
       // Pop back to the map home. The race list reloads on focus
       // (RaceListSheet refresh handler).
@@ -383,6 +393,7 @@ export function RaceEditScreen({ raceId }: Props) {
     usesSpinnaker,
     isNew,
     raceId,
+    refreshSelectedRace,
   ]);
 
   // ── Map render props ──────────────────────────────────────────────

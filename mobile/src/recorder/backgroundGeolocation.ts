@@ -88,15 +88,46 @@ export type NativeUploaderConfig = {
 };
 
 /**
+ * The full http block of the CURRENT native-uploader session, captured
+ * by startWatcher. setAuthHeader re-sends the whole block (not just
+ * headers) on every token rotation.
+ *
+ * WHY (2026-07-07 — the zero-upload bug): setConfig({http: {headers}})
+ * passes a PARTIAL http group across the bridge, and the native
+ * TSConfig treats the group as a unit — the partial update wiped
+ * ``http.url`` seconds after start (the onIdTokenChanged listener
+ * fires almost immediately after start() fetches its token). With no
+ * url, Transistorsoft persists nothing and syncs nothing: 543 captured
+ * / 0 uploaded on the 2026-07-07 Test Walk. Re-sending the complete
+ * block makes token rotation safe regardless of the native layer's
+ * merge semantics.
+ */
+let lastNativeHttpConfig: {
+  url: string;
+  method: "POST";
+  autoSync: boolean;
+  autoSyncThreshold: number;
+  batchSync: boolean;
+  maxBatchSize: number;
+  rootProperty: string;
+} | null = null;
+
+/**
  * Push a fresh ``Authorization`` header into the running plugin. Safe
  * to call repeatedly. Used by tokenRefresh.ts when the Firebase ID
  * token rotates. No-op (silently) if the plugin isn't initialized
  * yet — the next ready() call will pick up the latest header.
+ *
+ * Always re-sends the complete http block (see lastNativeHttpConfig).
+ * In js-uploader mode lastNativeHttpConfig is null and this remains
+ * the old headers-only push — harmless there, since js mode never
+ * configures a native url in the first place.
  */
 export async function setAuthHeader(authHeader: string): Promise<void> {
   try {
     await BackgroundGeolocation.setConfig({
       http: {
+        ...(lastNativeHttpConfig ?? {}),
         headers: {
           Authorization: authHeader,
           "Content-Type": "application/json",
@@ -344,6 +375,22 @@ export async function startWatcher({
     },
   );
 
+  // Capture the session's full http block BEFORE ready() so both the
+  // ready() config below and every subsequent setAuthHeader() token
+  // rotation send the identical complete group. Cleared for js-mode
+  // sessions so a stale url can't leak into a later header push.
+  lastNativeHttpConfig = nativeUploader
+    ? {
+        url: nativeUploader.url,
+        method: "POST",
+        autoSync: true,
+        autoSyncThreshold: 1,
+        batchSync: true,
+        maxBatchSize: 100,
+        rootProperty: "gps",
+      }
+    : null;
+
   await BackgroundGeolocation.ready({
     // Top-level: factory-reset before applying so dev iterations always
     // pick up our latest config (not a stale persisted one).
@@ -413,42 +460,40 @@ export async function startWatcher({
     // body shape MUST exactly match the JS uploader so the same
     // /telemetry handler accepts both code paths.
     //
-    // Config split (v5): `locationTemplate` is a TOP-LEVEL Config
-    // option, NOT a member of the http block (that's the v4 shape).
-    // It shapes the per-location JSON the plugin emits, independent of
-    // whether that JSON is POSTed via the http layer or returned via
-    // the JS onLocation callback. The http block carries the transport
-    // (url, headers, batching, rootProperty).
+    // Config placement (2026-07-07 fix): in the v5 Config,
+    // `locationTemplate` lives in the PERSISTENCE sub-config
+    // (PersistenceConfig.d.ts) — this code previously passed it
+    // TOP-LEVEL, where the plugin silently ignored it. Metro doesn't
+    // type-check, so the violation shipped; `tsc --noEmit` would have
+    // caught it.
     //
-    // locationTemplate uses EJS-style interpolation; the supported
-    // variables are the keys of the plugin's Location object. We map
-    // them to our wire shape, including the m/s → knots conversion
-    // for speed. Negative sentinels (when GPS hasn't computed a value)
-    // are passed through as-is; the backend's pydantic pre-validator
-    // (Phase 4) coerces negative values to null so one sentinel
-    // sample can't 422 the whole batch.
+    // Template quoting (also 2026-07-07): speed/heading/accuracy are
+    // OPTIONAL in v5 — `undefined` instead of v4's `-1` sentinel. An
+    // unquoted `"cog_deg":<%= heading %>` with heading undefined
+    // renders `"cog_deg":` — invalid JSON, killing the whole batch.
+    // Quoting those three fields makes a missing value render as ""
+    // (valid JSON); the backend pre-validator coerces "" and other
+    // non-numeric strings to null, and parses numeric strings. Fields
+    // that are ALWAYS present (timestamp, latitude, longitude) stay
+    // in their natural types.
     //
     // rootProperty="gps" wraps the array as { "gps": [...] } matching
     // TelemetryBatch on the server. (v4 called this `httpRootProperty`.)
     ...(nativeUploader
       ? {
-          // Top-level: shapes the per-location JSON. Numbers emitted
-          // UNQUOTED so they land as JSON numbers, not strings.
-          locationTemplate:
-            '{"t":"<%= timestamp %>",' +
-            '"lat":<%= latitude %>,' +
-            '"lon":<%= longitude %>,' +
-            '"sog_kts":<%= speed * 1.943844 %>,' +
-            '"cog_deg":<%= heading %>,' +
-            '"gps_acc_m":<%= accuracy %>}',
+          persistence: {
+            locationTemplate:
+              '{"t":"<%= timestamp %>",' +
+              '"lat":<%= latitude %>,' +
+              '"lon":<%= longitude %>,' +
+              '"sog_kts":"<%= speed * 1.943844 %>",' +
+              '"cog_deg":"<%= heading %>",' +
+              '"gps_acc_m":"<%= accuracy %>"}',
+          },
           http: {
-            url: nativeUploader.url,
-            method: "POST",
-            autoSync: true,
-            autoSyncThreshold: 1,
-            batchSync: true,
-            maxBatchSize: 100,
-            rootProperty: "gps",
+            // Same block just captured above; `?? {}` only narrows the
+            // type — in this branch it is always non-null.
+            ...(lastNativeHttpConfig ?? {}),
             headers: {
               Authorization: nativeUploader.authHeader,
               "Content-Type": "application/json",

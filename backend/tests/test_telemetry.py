@@ -818,3 +818,49 @@ def test_post_telemetry_accepts_valid_speeds_unchanged(
     assert insert_args[5] == [6.5]
     assert insert_args[6] == [180.0]
     assert insert_args[7] == [5.0]
+
+
+def test_post_telemetry_coerces_string_sentinels(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """v5 string sentinels (2026-07-07 — the zero-upload native bug).
+
+    Transistorsoft v5 reports missing speed/heading/accuracy as
+    ``undefined`` (not v4's ``-1``), so the native locationTemplate now
+    QUOTES those fields: a missing value renders as ``""`` and a
+    present value as a numeric string like ``"12.3"``. The validator
+    must null the former, parse the latter, and treat non-numeric junk
+    in these OPTIONAL fields as null — never 422 the batch.
+    """
+    samples = [
+        {  # all three missing → nulls
+            "t": "2026-07-07T17:30:00Z", "lat": 41.9, "lon": -87.6,
+            "sog_kts": "", "cog_deg": "NaN", "gps_acc_m": "undefined",
+        },
+        {  # numeric strings → parsed floats
+            "t": "2026-07-07T17:30:01Z", "lat": 41.9, "lon": -87.6,
+            "sog_kts": "6.5", "cog_deg": "180.0", "gps_acc_m": "5.0",
+        },
+        {  # uninterpolated template junk in an optional field → null
+            "t": "2026-07-07T17:30:02Z", "lat": 41.9, "lon": -87.6,
+            "sog_kts": "<%= speed * 1.943844 %>",
+        },
+    ]
+    r = client.post(race_url, json={"gps": samples, "imu": []})
+
+    assert r.status_code == 200
+    insert_args = fake_conn.fetch.await_args.args
+    assert insert_args[5] == [None, 6.5, None]
+    assert insert_args[6] == [None, 180.0, None]
+    assert insert_args[7] == [None, 5.0, None]
+
+
+def test_post_telemetry_strict_fields_still_reject_garbage(
+    client: TestClient, race_url: str, fake_conn: MagicMock, no_trigger
+):
+    """The lenient coercion applies ONLY to the optional trio. A junk
+    timestamp or latitude must still 422 — silently nulling those
+    would store corrupt fixes."""
+    bad = {"t": "not-a-time", "lat": 41.9, "lon": -87.6}
+    r = client.post(race_url, json={"gps": [bad], "imu": []})
+    assert r.status_code == 422

@@ -125,18 +125,47 @@ class GpsSample(BaseModel):
 
     @field_validator("sog_kts", "cog_deg", "gps_acc_m", mode="before")
     @classmethod
-    def _coerce_negative_sentinel_to_none(cls, v):
-        """Native SDK sentinel ``-1`` (or any negative) → None.
+    def _coerce_sentinel_to_none(cls, v):
+        """Coerce every known "unavailable" encoding to None.
 
-        Runs BEFORE the ``ge=0`` constraint so negatives don't 422.
+        Two generations of native sentinel (2026-07-07):
+
+        * Transistorsoft v4 emitted ``-1`` for missing speed/heading/
+          accuracy → any negative becomes None (original Phase 4 rule).
+        * The v5 SDK emits ``undefined`` instead, and the native
+          locationTemplate now QUOTES these fields so a missing value
+          renders as ``""`` (or a non-numeric string like ``"NaN"``)
+          instead of producing invalid JSON that 422'd the entire
+          batch — the root cause of the zero-upload native sessions.
+          Strings that parse as numbers are accepted (pydantic would
+          coerce them anyway); anything else in these OPTIONAL fields
+          becomes None. ``t``/``lat``/``lon`` remain strict — garbage
+          there still fails the sample.
+
+        Runs BEFORE the ``ge=0`` constraint so sentinels don't 422.
         Idempotent on already-None or already-valid values.
         """
+        import math
+
         if v is None:
             return None
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return v  # let pydantic surface the original error
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "" or s.lower() in ("nan", "null", "undefined", "none"):
+                return None
+            try:
+                f = float(s)
+            except ValueError:
+                # Junk string in an optional field (e.g. an uninterpolated
+                # template fragment) — drop the field, keep the batch.
+                return None
+        else:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return v  # non-string, non-numeric — let pydantic surface it
+        if math.isnan(f) or math.isinf(f):
+            return None
         if f < 0:
             return None
         return f
