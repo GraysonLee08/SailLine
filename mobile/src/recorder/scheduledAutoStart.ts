@@ -283,31 +283,48 @@ export async function scheduleAutoStart(
 
   // ── T-6 notification ─────────────────────────────────────────────────
   if (notifDelay > 0) {
+    const baseContent = {
+      title: "Race starts in 6 min",
+      body:
+        "Tap to start tracking. SailLine will auto-start at T-5 if you don't.",
+      data: { kind: "autoStart", raceId },
+      ...(Platform.OS === "android" ? { channelId: ANDROID_CHANNEL_ID } : {}),
+    };
+    const trigger = {
+      type: Notifications.SchedulableTriggerInputTypes.DATE,
+      date: new Date(now + notifDelay),
+    } as Notifications.NotificationTriggerInput;
+
+    // 2026-07-06 — categoryIdentifier adds an explicit "Start recording"
+    // action button so watches can start from the wrist (Garmin relays
+    // action buttons, not body taps — see raceCategories.ts).
+    //
+    // 2026-07-07 — FALLBACK: the two tests after the category landed
+    // both had NO T-6 notification at all, while the pre-category build
+    // fired it fine. Prime suspect is scheduleNotificationAsync failing
+    // on the category and the old silent catch eating it. Whatever the
+    // root cause, the policy is: a reminder without a wrist button
+    // beats no reminder — try WITH the category, retry WITHOUT on any
+    // failure.
     try {
       await Notifications.scheduleNotificationAsync({
         identifier: notifTag(raceId),
-        content: {
-          title: "Race starts in 6 min",
-          body:
-            "Tap to start tracking. SailLine will auto-start at T-5 if you don't.",
-          // 2026-07-06 — explicit action button so watches can start the
-          // recorder from the wrist. Body tap still works on the phone;
-          // Garmin only relays action buttons (see raceCategories.ts).
-          categoryIdentifier: CATEGORY_AUTO_START,
-          data: { kind: "autoStart", raceId },
-          ...(Platform.OS === "android"
-            ? { channelId: ANDROID_CHANNEL_ID }
-            : {}),
-        },
-        trigger: {
-          type: Notifications.SchedulableTriggerInputTypes.DATE,
-          date: new Date(now + notifDelay),
-        } as Notifications.NotificationTriggerInput,
+        content: { ...baseContent, categoryIdentifier: CATEGORY_AUTO_START },
+        trigger,
       });
       notifFireAt = new Date(now + notifDelay);
     } catch {
-      // Notification scheduling can fail if permission is denied — that's
-      // fine, the BG fetch task below is independent.
+      try {
+        await Notifications.scheduleNotificationAsync({
+          identifier: notifTag(raceId),
+          content: baseContent,
+          trigger,
+        });
+        notifFireAt = new Date(now + notifDelay);
+      } catch {
+        // Both attempts failed (e.g. permission denied) — fine, the BG
+        // fetch task below is independent.
+      }
     }
   }
 
