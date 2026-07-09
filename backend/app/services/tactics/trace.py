@@ -141,7 +141,9 @@ class EvalTrace:
             {
                 "type": c.call_type,
                 "class": c.call_class,
-                "eta": c.eta,
+                # Serialized here (not left to json.dumps) so the
+                # returned record and the stored blob are identical.
+                "eta": _json_default(c.eta) if c.eta is not None else None,
                 "diagnosis": c.diagnosis,
                 "won": c is winner,
             }
