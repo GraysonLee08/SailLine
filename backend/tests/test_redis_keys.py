@@ -236,6 +236,21 @@ def test_ttl_constants():
 
 
 # ---------------------------------------------------------------------------
+# Tactician trace (Phase A observability, 2026-07-09)
+
+
+def test_tactics_trace_key_fingerprint():
+    assert (
+        redis_keys.tactics_trace_key(_RACE_ID)
+        == "tactics:trace:11111111-2222-3333-4444-555555555555"
+    )
+
+
+def test_tactics_trace_ttl():
+    assert redis_keys.TACTICS_TRACE_TTL_S == 24 * 3600
+
+
+# ---------------------------------------------------------------------------
 # Dead-recorder watchdog
 
 

@@ -252,6 +252,20 @@ def tactics_cooldown_key(
     return f"tactics:cooldown:{race_id}"
 
 
+# 24 hours — traces are a diagnostic artifact, not history. Long enough
+# to debrief the morning after a race night; short enough that the ring
+# buffers can't accumulate across weeks of sessions.
+TACTICS_TRACE_TTL_S: int = 24 * 3600
+
+
+def tactics_trace_key(race_id: Union[UUID, str]) -> str:
+    """Ring buffer (Redis LIST, LPUSH + LTRIM) of per-evaluation trace
+    records for the tactician pipeline. One compact JSON document per
+    ``_evaluate`` run recording which gate exited (or the published
+    call). Read by ``GET /api/races/{id}/tactics/debug``."""
+    return f"tactics:trace:{race_id}"
+
+
 def tactics_playbook_key(race_id: Union[UUID, str]) -> str:
     """Cached pre-race playbook match for this race — the result of
     scoring today's forecast signature against the user's past

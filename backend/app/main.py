@@ -16,6 +16,7 @@ from app.routers import (
     recorder_debrief,
     routing,
     routing_notifications,
+    tactics_debug,
     telemetry,
     telemetry_stream,
     tracks,
@@ -81,6 +82,7 @@ app.include_router(recorder_debrief.router)       # /api/races/{id}/recorder-deb
 app.include_router(routing.router)                # /api/routing - compute endpoint
 app.include_router(routing_notifications.router)  # /api/routing - SSE notifications stream
 app.include_router(ais.router)                    # /api/ais - vessel positions (cache-only read)
+app.include_router(tactics_debug.router)          # /api/races/{id}/tactics/debug (Phase A observability)
 
 
 @app.get("/")

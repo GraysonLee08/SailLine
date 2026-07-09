@@ -27,6 +27,15 @@ Latency budget: telemetry flush cadence (~30 s today) dominates; the
 detector pass is ~ms and Haiku ~1–2 s. Maneuver detectors announce
 2–5 min ahead, so transport latency is noise — see the spec's
 "lead time is the product" section.
+
+Observability (Phase A, 2026-07-09): every evaluation — including the
+earliest gate exits — writes one trace record to the per-race ring
+buffer (``tactics:trace:{race_id}``, see ``trace.EvalTrace``) and one
+structured log line. Read back via
+``GET /api/races/{id}/tactics/debug``. Transient exits
+(``insufficient_track``, ``no_forecast``) release the global cooldown
+they acquired so a hiccup doesn't also silence the next 3 minutes;
+permanent gates (ended / opted-out) keep it, throttling re-checks.
 """
 from __future__ import annotations
 
@@ -77,20 +86,37 @@ async def evaluate_tactics_safe(race_id: UUID, uid: str) -> None:
         log.exception("tactician: evaluation failed race=%s", race_id)
 
 
+async def _finish(trace, redis, race_id: UUID, exit_reason: str) -> None:
+    """Seal the trace and emit ONE structured log line per evaluation.
+
+    The log line duplicates the trace record on purpose: Redis traces
+    expire after 24 h, Cloud Logging is the durable copy for threshold
+    tuning across weeks (spec: "logged drops feed threshold tuning")."""
+    record = await trace.finish(redis, exit_reason)
+    if record is not None:
+        log.info(
+            "tactician: eval race=%s exit=%s trace=%s",
+            race_id, exit_reason,
+            json.dumps(record, default=str),
+        )
+
+
 async def _evaluate(race_id: UUID, uid: str) -> None:
     # Imports are local so a failure in any heavy dependency chain
     # degrades to "tactician off" instead of breaking app startup —
     # same defensive posture as the weather→routing lazy import.
-    from app import db, redis_client
+    from app import redis_client
     from app.services.redis_keys import (
         route_current_key,
         tactics_cooldown_key,
         tactics_latest_key,
         route_notifications_channel,
     )
+    from app.services.tactics.trace import EvalTrace
 
     redis = redis_client.get_client()
     now = datetime.now(timezone.utc)
+    trace = EvalTrace(race_id, now=now)
 
     # 1 ── global cooldown gate (SETNX: first writer wins the window).
     acquired = await redis.set(
@@ -98,7 +124,41 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
         ex=GLOBAL_COOLDOWN_S, nx=True,
     )
     if not acquired:
+        # Traced (not just skipped) so the ring buffer distinguishes
+        # "pipeline alive, inside the quiet window" from "task never
+        # spawned" — the latter was undiagnosable before Phase A.
+        await _finish(trace, redis, race_id, "cooldown_global")
         return
+
+    # Any exception below still burns the global cooldown (a persistent
+    # bug must not hammer full context loads every 30 s batch), but the
+    # trace records it as "error" instead of vanishing.
+    try:
+        await _evaluate_inner(
+            race_id, uid, redis=redis, now=now, trace=trace,
+            route_current_key=route_current_key,
+            tactics_cooldown_key=tactics_cooldown_key,
+            tactics_latest_key=tactics_latest_key,
+            route_notifications_channel=route_notifications_channel,
+        )
+    except Exception:
+        await _finish(trace, redis, race_id, "error")
+        raise
+
+
+async def _evaluate_inner(
+    race_id: UUID,
+    uid: str,
+    *,
+    redis,
+    now: datetime,
+    trace,
+    route_current_key,
+    tactics_cooldown_key,
+    tactics_latest_key,
+    route_notifications_channel,
+) -> None:
+    from app import db
 
     # db.get_pool() raises when the pool is unavailable (non-fatal
     # startup pattern) — the safe wrapper turns that into a logged skip.
@@ -115,12 +175,17 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
             """,
             race_id,
         )
-        if race is None or race["ended_at"] is not None:
+        if race is None:
+            await _finish(trace, redis, race_id, "race_not_found")
+            return
+        if race["ended_at"] is not None:
+            await _finish(trace, redis, race_id, "race_ended")
             return
         # Live only: don't coach a boat that hasn't started recording.
         if race["started_at"] is None and (
             race["start_at"] is None or race["start_at"] > now
         ):
+            await _finish(trace, redis, race_id, "not_live")
             return
 
         # Per-user opt-out (settings sync to user_profiles.app_settings).
@@ -137,6 +202,7 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
                     app_settings = {}
             tact = app_settings.get("tactician") or {}
             if isinstance(tact, dict) and tact.get("enabled") is False:
+                await _finish(trace, redis, race_id, "opted_out")
                 return
 
         track_rows = await conn.fetch(
@@ -185,8 +251,15 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
          "sog_kts": r["speed_kts"], "cog_deg": r["heading_deg"]}
         for r in track_rows
     ]
+    trace.gate("track_points", len(track))
+    trace.gate("imu_samples", len(imu_rows))
     if len(track) < 3:
-        return  # not enough live data to say anything responsible
+        # Transient (more points land with the next batch) — release
+        # the global cooldown so this evaluation doesn't also silence
+        # the following 3 minutes.
+        await redis.delete(tactics_cooldown_key(race_id))
+        await _finish(trace, redis, race_id, "insufficient_track")
+        return
 
     marks = _coerce_jsonb_list(race["marks"])
     passes = _coerce_jsonb_list(race["mark_passes"])
@@ -198,8 +271,13 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
 
     # 3 ── forecast + polar + evals + heel + route.
     forecast = await _load_forecast(track, now)
+    trace.gate("forecast", forecast is not None)
     if forecast is None:
-        return  # no wind context ⇒ no trustworthy calls
+        # Transient (cycle may land within minutes) — release the
+        # cooldown; no wind context ⇒ no trustworthy calls.
+        await redis.delete(tactics_cooldown_key(race_id))
+        await _finish(trace, redis, race_id, "no_forecast")
+        return
 
     from app.services.polars import load_polar_for_class
     polar = load_polar_for_class(race["boat_class"])
@@ -251,6 +329,22 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
         except (ValueError, TypeError):
             route_coords = None
 
+    trace.gate("route", route_coords is not None)
+    trace.gate("playbook", playbook is not None)
+
+    mark_dist_nm = None
+    if next_mark is not None:
+        from app.services.tactics.detectors import _haversine_m
+        last_fix = track[-1]
+        mark_dist_nm = _haversine_m(
+            last_fix["lat"], last_fix["lon"],
+            next_mark["lat"], next_mark["lon"],
+        ) / 1852.0
+    trace.set_context(
+        evals=evals, heel_stat=heel_stat,
+        next_mark=next_mark, mark_dist_nm=mark_dist_nm,
+    )
+
     # 4 ── detect + pick.
     from app.services.tactics.detectors import run_detectors
     candidates = run_detectors(
@@ -268,7 +362,14 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
         if type_ok:
             winner = cand
             break
+    trace.set_candidates(candidates, winner)
     if winner is None:
+        # Distinguish "nothing to say" from "everything on repeat
+        # cooldown" — the second means detectors ARE firing.
+        await _finish(
+            trace, redis, race_id,
+            "cooldown_type" if candidates else "no_candidates",
+        )
         return
 
     # 5 ── snapshot → Claude (thread: the SDK client is sync).
@@ -297,7 +398,13 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
     )
     call = await asyncio.to_thread(advisor.generate_call, snapshot)
     if call is None:
-        return  # SILENT or advisor failure — quiet cockpit wins
+        # SILENT or advisor failure — quiet cockpit wins. (The advisor
+        # logs which; the trace can't tell them apart without threading
+        # a reason through generate_call — Phase B if it matters.)
+        await _finish(trace, redis, race_id, "advisor_silent_or_failed")
+        return
+
+    trace.set_call(message=call["message"], model=call["model"])
 
     # 6 ── staleness guard, enforced in code AFTER the model round-trip.
     post_now = datetime.now(timezone.utc)
@@ -308,6 +415,7 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
                 "tactician: DROPPED late %s call race=%s (%.0fs lead < %.0fs)",
                 winner.call_type, race_id, remaining, MIN_LEAD_S,
             )
+            await _finish(trace, redis, race_id, "dropped_late")
             return
 
     # 7 ── persist + publish.
@@ -338,6 +446,7 @@ async def _evaluate(race_id: UUID, uid: str) -> None:
     blob = json.dumps(payload).encode()
     await redis.setex(tactics_latest_key(race_id), LATEST_CALL_TTL_S, blob)
     await redis.publish(route_notifications_channel(race_id), blob)
+    await _finish(trace, redis, race_id, "published")
     log.info(
         "tactician: %s call published race=%s msg=%r",
         winner.call_type, race_id, call["message"],
