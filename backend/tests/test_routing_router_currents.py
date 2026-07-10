@@ -38,10 +38,11 @@ from app.services.routing.pipeline import (
 # ─── ENGINE_VERSION sanity ──────────────────────────────────────────────
 
 
-def test_engine_version_is_v11_pipeline():
-    """v11 marks the pipeline collapse. Bumping this string forces a
-    cache invalidation across every existing cached route — intentional."""
-    assert ENGINE_VERSION == "v11-pipeline"
+def test_engine_version_is_v12_fullrace():
+    """v12 marks the full-race budget + persist-last-frame changes.
+    Bumping this string forces a cache invalidation across every
+    existing cached route — intentional."""
+    assert ENGINE_VERSION == "v12-fullrace"
 
 
 # ─── _currents_cache_tag ────────────────────────────────────────────────
