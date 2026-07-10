@@ -107,6 +107,43 @@ def test_sample_after_window_returns_none():
     assert fc.sample(42.0, -88.0, t) is None
 
 
+# ─── Persist-last-frame (v12) ────────────────────────────────────────────
+
+
+def test_persist_beyond_horizon_returns_last_frame_wind():
+    a = _make_field(0.0, 0.0, "2026-05-05T12:00:00+00:00")
+    b = _make_field(10.0, 20.0, "2026-05-05T13:00:00+00:00")
+    fc = WindForecast(snapshots=[a, b], persist_beyond_horizon=True)
+    # Way past t_max — should hold the 13:00 frame steady.
+    t = datetime(2026, 5, 7, 0, 0, tzinfo=timezone.utc)
+    assert fc.sample(42.0, -88.0, t) == pytest.approx((10.0, 20.0))
+
+
+def test_persist_does_not_apply_before_window():
+    """Persistence is forward-only: pre-t_min stays None (loader always
+    brackets race_start, so a pre-window sample indicates a bug)."""
+    a = _make_field(0.0, 0.0, "2026-05-05T12:00:00+00:00")
+    b = _make_field(10.0, 10.0, "2026-05-05T13:00:00+00:00")
+    fc = WindForecast(snapshots=[a, b], persist_beyond_horizon=True)
+    t = datetime(2026, 5, 5, 11, 0, tzinfo=timezone.utc)
+    assert fc.sample(42.0, -88.0, t) is None
+
+
+def test_persist_off_grid_still_returns_none():
+    a = _make_field(0.0, 0.0, "2026-05-05T12:00:00+00:00")
+    fc = WindForecast(snapshots=[a], persist_beyond_horizon=True)
+    t = datetime(2026, 5, 6, 0, 0, tzinfo=timezone.utc)
+    # lat=50 is far outside the 41..43 grid — persistence can't invent
+    # wind where the grid never had any.
+    assert fc.sample(50.0, -88.0, t) is None
+
+
+def test_persist_defaults_off():
+    a = _make_field(0.0, 0.0, "2026-05-05T12:00:00+00:00")
+    fc = WindForecast(snapshots=[a])
+    assert fc.persist_beyond_horizon is False
+
+
 def test_sample_outside_grid_returns_none_even_in_time_window():
     a = _make_field(0.0, 0.0, "2026-05-05T12:00:00+00:00")
     b = _make_field(10.0, 10.0, "2026-05-05T13:00:00+00:00")

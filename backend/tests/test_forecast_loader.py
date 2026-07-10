@@ -169,6 +169,71 @@ async def test_race_past_all_horizons_raises_forecast_not_available(freeze_now):
     assert exc.value.available_at < race_start
 
 
+# ─── Persist-last-frame coverage rule (v12) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_mode_loads_race_ending_past_gfs_horizon(freeze_now):
+    """persist_beyond_horizon=True: a race that STARTS inside the GFS
+    horizon but ENDS past it must load (truncated at the horizon) rather
+    than raise — the engine persists the last frame for the tail."""
+    gfs_fhours = list(range(0, 121, 3))
+    gfs_manifest = _make_manifest("gfs", gfs_fhours)
+    cycle = gfs_manifest["cycle"]
+    store: dict = {
+        "weather:gfs:conus:cycles": [cycle.encode()],
+        f"weather:gfs:conus:{cycle}:manifest": json.dumps(gfs_manifest).encode(),
+    }
+    for fh in gfs_fhours:
+        valid = (freeze_now + timedelta(hours=fh)).isoformat()
+        store[f"weather:gfs:conus:{cycle}:f{fh:03d}"] = _wind_blob(valid, "gfs")
+
+    fake = _FakeRedis(store)
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        # Starts at +100h (past HRRR, inside GFS), needs 60h → ends +160h.
+        race_start = freeze_now + timedelta(hours=100)
+        forecast = await load_forecast_for_race(
+            "conus", race_start, duration_hours=60,
+            persist_beyond_horizon=True,
+        )
+
+    assert forecast.quality == "gfs"
+    assert forecast.persist_beyond_horizon is True
+    # Snapshots end at the cycle horizon (+120h), not at race_end.
+    assert forecast.t_max == freeze_now + timedelta(hours=120)
+    # And sampling past the horizon persists instead of returning None.
+    assert forecast.sample(42.0, -88.0, freeze_now + timedelta(hours=150)) is not None
+
+
+@pytest.mark.asyncio
+async def test_strict_mode_still_raises_when_race_end_past_gfs_horizon(freeze_now):
+    """Default (persist off): historical rule — race_end past the GFS
+    horizon raises even when the start is coverable."""
+    fake = _FakeRedis(store={})  # should fail before any lookup
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        race_start = freeze_now + timedelta(hours=100)
+        with pytest.raises(ForecastNotAvailable):
+            await load_forecast_for_race("conus", race_start, duration_hours=60)
+
+
+@pytest.mark.asyncio
+async def test_persist_mode_race_starting_past_gfs_horizon_still_raises(freeze_now):
+    """Even in persist mode there's nothing to persist FROM when the
+    race starts beyond the horizon — must still 425."""
+    fake = _FakeRedis(store={})
+    with patch("app.services.weather.forecast_loader.redis_client.get_client",
+               return_value=fake):
+        race_start = freeze_now + timedelta(hours=130)  # > 120h
+        with pytest.raises(ForecastNotAvailable) as exc:
+            await load_forecast_for_race(
+                "conus", race_start, duration_hours=4,
+                persist_beyond_horizon=True,
+            )
+    assert exc.value.available_at < race_start
+
+
 @pytest.mark.asyncio
 async def test_no_ingested_cycles_raises_runtime_error(freeze_now):
     """HRRR window passes the check, but cycles index is empty → operational error."""

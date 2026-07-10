@@ -7,6 +7,16 @@ interpolates u/v. Edges fall back to the nearest snapshot. Times outside
 the forecast horizon return None - the engine treats that as 'no wind
 information here, don't expand from this node.'
 
+Persist-last-frame (v12): with ``persist_beyond_horizon=True``, times
+PAST t_max return the last snapshot's wind instead of None, so the
+engine can keep routing to the finish when the course outruns the
+forecast window. The persisted tail is a steady-state assumption, not
+a forecast - callers flag it in route metadata (``horizon_exceeded``)
+and the recompute worker replaces it with real data on the next
+ingest. Times BEFORE t_min still return None regardless (the loader
+always brackets race_start, so pre-t_min samples indicate a bug, not
+a horizon problem).
+
 Mixed-source sequences (HRRR + GFS) are concatenated and ordered by
 valid_time. We deliberately do NOT cross-blend the boundary: each
 sample falls inside one source's interval. The lat/lon grids may differ
@@ -42,9 +52,14 @@ class WindForecast:
         snapshots: WindField list ordered by valid_time ascending.
         quality:   "hrrr", "gfs", or "hybrid" - exposed in route metadata
                    so the frontend can label preliminary vs final routes.
+        persist_beyond_horizon:
+                   when True, sample() past t_max returns the LAST
+                   snapshot's wind instead of None (persist-last-frame).
+                   Default False preserves the historical hard-stop.
     """
     snapshots: list[WindField]
     quality: str = "hybrid"
+    persist_beyond_horizon: bool = False
     _times: list[datetime] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
@@ -80,10 +95,11 @@ class WindForecast:
     ) -> Optional[tuple[float, float]]:
         """Linearly interpolate u/v at (lat, lon, valid_time).
 
-        If valid_time is outside [t_min, t_max], returns None - the
-        engine should treat this as 'past forecast horizon, stop
-        expanding from this node.' In practice this caps the search
-        time window naturally.
+        If valid_time is before t_min, returns None. If valid_time is
+        past t_max: returns None (engine stops expanding — the
+        historical behaviour) unless ``persist_beyond_horizon`` is set,
+        in which case the last snapshot's wind is returned so routing
+        can continue on a steady-state assumption.
 
         If valid_time is None, samples the first snapshot. This makes
         WindForecast usable in legacy callers that don't pass time.
@@ -91,7 +107,11 @@ class WindForecast:
         if valid_time is None:
             return self.snapshots[0].sample(lat, lon)
 
-        if valid_time < self._times[0] or valid_time > self._times[-1]:
+        if valid_time < self._times[0]:
+            return None
+        if valid_time > self._times[-1]:
+            if self.persist_beyond_horizon:
+                return self.snapshots[-1].sample(lat, lon)
             return None
 
         # Find bracketing pair.

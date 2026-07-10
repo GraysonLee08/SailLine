@@ -69,6 +69,11 @@ engine's pruning / scoring behaviour changes. The pinning test in
 a knob is added without a corresponding bump.
 
 v11-pipeline: introduced this module; replaces v10-currents.
+v12-fullrace: engine iteration budget sized to the race instead of the
+fixed 240-iteration (20h-at-5min) per-leg default that truncated long
+courses mid-lake; persist-last-frame wind beyond the forecast horizon
+(``horizon_exceeded`` meta); ``reached=False`` results are no longer
+cached.
 """
 from __future__ import annotations
 
@@ -76,7 +81,7 @@ import json
 import logging
 import math
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID
 
@@ -127,7 +132,7 @@ log = logging.getLogger(__name__)
 # is added, or engine behaviour changes in a way that invalidates cached
 # results. Part of the route cache key — old entries become unreachable
 # (and TTL out) the moment this changes.
-ENGINE_VERSION: str = "v11-pipeline"
+ENGINE_VERSION: str = "v12-fullrace"
 
 
 # Defaults that fall through when the worker has no stored RouteRequest
@@ -155,6 +160,21 @@ FORECAST_WINDOW_MARGIN_FRAC: float = 0.15   # proportional cushion on estimate
 FORECAST_WINDOW_MARGIN_MIN_H: float = 1.0   # floor on the cushion
 GFS_MAX_HORIZON_HOURS: float = 120.0        # hard ceiling — GFS forecast limit
 METRES_PER_NM: float = 1852.0
+
+
+# Engine simulated-time budget (v12). The engine's max_iterations default
+# (240 × 5 min = 20h per leg) silently truncated any course longer than 20
+# hours of sailing — the route just stopped mid-lake with reached=False.
+# We now size the budget from the course itself: double the conservative
+# course estimate (slow boat, adverse wind still finishes), with an
+# absolute ceiling so a degenerate marks list can't spin the engine for
+# days of simulated time. The budget is a TOTAL across legs (the multileg
+# driver threads the remainder through), and is independent of the
+# forecast window — persist-last-frame wind covers the gap when the
+# course outruns the forecast.
+ROUTE_DT_MINUTES: float = 5.0               # engine time step; iterations = minutes/dt
+SIM_BUDGET_FACTOR: float = 2.0              # budget = factor × course estimate
+SIM_BUDGET_MAX_HOURS: float = 240.0         # absolute cap on simulated race time
 
 
 # ---------------------------------------------------------------------------
@@ -331,17 +351,37 @@ def _sample_start_wind(
 # Forecast-window sizing
 
 
+def estimate_course_hours(marks: list[dict]) -> float:
+    """Conservative course-time estimate in hours, UNclamped.
+
+    Sums the rhumb-line legs between consecutive marks and divides by a
+    conservative nominal passage speed, then adds a margin. NOT a route
+    ETA — a deliberately slow sizing estimate used for the forecast load
+    window, the engine's simulated-time budget, and the recompute
+    worker's "is this race plausibly still running" check.
+    """
+    if len(marks) < 2:
+        return 0.0
+    total_m = 0.0
+    for a, b in zip(marks, marks[1:]):
+        total_m += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
+    est_h = (total_m / METRES_PER_NM) / NOMINAL_PASSAGE_SPEED_KT
+    est_h += max(FORECAST_WINDOW_MARGIN_MIN_H, FORECAST_WINDOW_MARGIN_FRAC * est_h)
+    return est_h
+
+
 def estimate_load_window_hours(marks: list[dict], floor_hours: float) -> float:
     """Hours of forecast to load so the window spans the whole course.
 
-    Sums the rhumb-line legs between consecutive marks and divides by a
-    conservative nominal passage speed, then adds a margin. The result is
-    clamped to ``[floor_hours, GFS_MAX_HORIZON_HOURS]``:
+    The unclamped :func:`estimate_course_hours` clamped to
+    ``[floor_hours, GFS_MAX_HORIZON_HOURS]``:
 
     * never below ``floor_hours`` — the caller's explicit (or default 6h)
       request is a floor, so a buoy race still loads its usual short window;
     * never above the GFS horizon — beyond 120h there is simply no forecast
-      to load, so a longer estimate would only mislead.
+      to load, so a longer estimate would only mislead. The route no longer
+      truncates there either: persist-last-frame sampling carries the
+      engine past the last snapshot (v12).
 
     A long course (e.g. a ~290 nm Mac) lands around 60-70h here, replacing
     the old fixed 6h window that truncated any race over ~6h. Erring long is
@@ -349,12 +389,28 @@ def estimate_load_window_hours(marks: list[dict], floor_hours: float) -> float:
     """
     if len(marks) < 2:
         return floor_hours
-    total_m = 0.0
-    for a, b in zip(marks, marks[1:]):
-        total_m += haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
-    est_h = (total_m / METRES_PER_NM) / NOMINAL_PASSAGE_SPEED_KT
-    est_h += max(FORECAST_WINDOW_MARGIN_MIN_H, FORECAST_WINDOW_MARGIN_FRAC * est_h)
+    est_h = estimate_course_hours(marks)
     return max(floor_hours, min(est_h, GFS_MAX_HORIZON_HOURS))
+
+
+def simulated_time_budget_iterations(
+    marks: list[dict],
+    effective_duration_hours: float,
+    dt_minutes: float = ROUTE_DT_MINUTES,
+) -> int:
+    """Total engine iteration budget for a course (v12).
+
+    ``SIM_BUDGET_FACTOR ×`` the larger of the course estimate and the
+    forecast window, capped at :data:`SIM_BUDGET_MAX_HOURS`, converted
+    to iterations at ``dt_minutes`` per step. The 2× factor gives slow
+    passages (light air, adverse current) room to finish; the cap keeps
+    a degenerate marks list from spinning the engine indefinitely.
+    """
+    budget_hours = min(
+        SIM_BUDGET_FACTOR * max(estimate_course_hours(marks), effective_duration_hours),
+        SIM_BUDGET_MAX_HOURS,
+    )
+    return max(1, math.ceil(budget_hours * 60.0 / dt_minutes))
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +467,11 @@ async def compute_route(
         region=region,
         race_start=req.race_start,
         duration_hours=effective_duration_hours,
+        # v12: routes outrunning the forecast continue on the last
+        # frame's wind instead of stopping at the horizon. The tail is
+        # flagged via horizon_exceeded in meta and replaced with real
+        # data by the recompute worker on the next ingest.
+        persist_beyond_horizon=True,
     )
 
     # Currents — optional. Same race window as the forecast so the
@@ -467,14 +528,21 @@ async def compute_route(
         race_start=req.race_start,
     )
 
+    # v12: size the engine's simulated-time budget to the course instead
+    # of accepting the 240-iteration (20h) per-leg default that truncated
+    # long races. Total across legs; multileg threads the remainder.
+    max_iterations = simulated_time_budget_iterations(
+        req.marks, effective_duration_hours,
+    )
+
     log.info(
         "compute route race_id=%s region=%s venue=%s polar=%s race_start=%s "
         "forecast_quality=%s marks=%d max_tws=%s margin=%.3f hs=%.2f dens=%.3f "
-        "currents=%s",
+        "currents=%s window_h=%.1f budget_iters=%d",
         req.race_id, region, venue, polar.name, req.race_start.isoformat(),
         forecast.quality, len(req.marks), req.derating.max_tws_kt,
         req.derating.polar_margin, req.derating.hs_m, req.derating.density_factor,
-        currents_quality or "off",
+        currents_quality or "off", effective_duration_hours, max_iterations,
     )
 
     result = compute_isochrone_route_multileg(
@@ -483,12 +551,22 @@ async def compute_route(
         wind=forecast,
         is_navigable=is_navigable,
         race_start=req.race_start,
+        dt_minutes=ROUTE_DT_MINUTES,
+        max_iterations=max_iterations,
         currents=currents,
         max_tws_kt=req.derating.max_tws_kt,
         hs_m=req.derating.hs_m,
         density_factor=req.derating.density_factor,
         polar_margin=req.derating.polar_margin,
     )
+
+    # Persist-last-frame bookkeeping: did the route sail past the last
+    # real forecast snapshot? The tail beyond forecast_t_max was computed
+    # on steady-state wind and firms up on the next ingest.
+    route_end = req.race_start + timedelta(minutes=result.total_minutes)
+    if route_end.tzinfo is None:
+        route_end = route_end.replace(tzinfo=timezone.utc)
+    horizon_exceeded = route_end > forecast.t_max
 
     feature = route_to_geojson(
         result,
@@ -510,6 +588,8 @@ async def compute_route(
             "currents_quality": currents_quality,
             "start_wind_dir_deg": start_wind_dir_deg,
             "start_wind_speed_kt": start_wind_speed_kt,
+            "forecast_t_max": forecast.t_max.isoformat(),
+            "horizon_exceeded": horizon_exceeded,
         },
     )
 
@@ -536,9 +616,15 @@ async def compute_route(
         "currents_quality": currents_quality,
         "start_wind_dir_deg": start_wind_dir_deg,
         "start_wind_speed_kt": start_wind_speed_kt,
+        "forecast_t_max": forecast.t_max.isoformat(),
+        "horizon_exceeded": horizon_exceeded,
     }
 
-    if use_cache:
+    # v12: never cache a truncated route. A reached=False result means
+    # the course is blocked or the budget ran out — serving it from
+    # cache for the next hour would pin a broken route on the map even
+    # after conditions (or code) improve.
+    if use_cache and result.reached:
         try:
             await redis.setex(
                 cache_key,
@@ -547,6 +633,11 @@ async def compute_route(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("route cache write failed: %s", exc)
+    elif use_cache:
+        log.info(
+            "route not cached (reached=False) race_id=%s total_minutes=%.1f",
+            req.race_id, result.total_minutes,
+        )
 
     return RouteOutcome(feature=feature, meta=meta, cached=False, cache_key=cache_key)
 

@@ -1,13 +1,23 @@
 // frontend/src/hooks/useRouteNotifications.js
 //
 // SSE subscription to /api/routing/notifications/{raceId} for the
-// "better route available" stream. Uses @microsoft/fetch-event-source
+// route recompute stream. Uses @microsoft/fetch-event-source
 // rather than the browser's native EventSource because EventSource
 // can't attach an Authorization header — and our endpoint requires
 // the Firebase ID token like every other API call.
 //
+// The worker publishes two kinds of payload (v12):
+//   kind: "update"  fresh route for the newest forecast — meant to be
+//                   applied to the map silently, no user decision.
+//   kind: "better"  beats the stored baseline by ≥5% — surfaces the
+//                   accept/dismiss banner. Payloads WITHOUT a kind
+//                   field come from pre-v12 workers and are treated
+//                   as "better" (that's all they ever published).
+//
 // Returns:
-//   alternative   the most recent unaccepted alternative payload, or null
+//   alternative   the most recent unaccepted "better" payload, or null
+//   update        the most recent "update" payload, or null — consumers
+//                 auto-apply update.route and don't need to clear it
 //   accept(fn)    invokes fn(routeFeature), then clears the alternative
 //   dismiss()     clears the alternative without applying it
 //   error         connection error string, or null
@@ -26,6 +36,7 @@ class FatalError extends Error {}
 
 export function useRouteNotifications(raceId) {
   const [alternative, setAlternative] = useState(null);
+  const [update, setUpdate] = useState(null);
   const [error, setError] = useState(null);
   const ctrlRef = useRef(null);
 
@@ -76,7 +87,13 @@ export function useRouteNotifications(raceId) {
               if (msg.event !== "alternative") return;
               try {
                 const payload = JSON.parse(msg.data);
-                setAlternative(payload);
+                if (payload.kind === "update") {
+                  // Silent refresh — newest-wins, no user decision.
+                  setUpdate(payload);
+                } else {
+                  // "better" or legacy payload without kind.
+                  setAlternative(payload);
+                }
               } catch (e) {
                 console.error("[useRouteNotifications] bad payload", e);
               }
@@ -122,5 +139,5 @@ export function useRouteNotifications(raceId) {
     [alternative],
   );
 
-  return { alternative, accept, dismiss, error };
+  return { alternative, update, accept, dismiss, error };
 }

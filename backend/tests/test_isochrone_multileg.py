@@ -99,6 +99,56 @@ def test_multileg_requires_at_least_two_marks(polar_36_7):
         )
 
 
+# ─── Total time budget across legs (v12) ────────────────────────────────
+
+
+def test_multileg_budget_is_total_not_per_leg(polar_36_7):
+    """v12: max_iterations is a shared budget. A course whose FIRST leg
+    consumes nearly everything must leave the later legs starved —
+    pre-v12 each leg got a fresh allowance, so a 240-cap could still
+    sail 240 iterations per leg."""
+    wind = _uniform_wind(0.0, -5.0)
+    marks = [
+        {"lat": 42.5, "lon": -88.0},
+        {"lat": 42.3, "lon": -87.8},
+        {"lat": 42.0, "lon": -88.0},
+    ]
+    # Generous budget: completes (baseline sanity).
+    full = compute_isochrone_route_multileg(
+        marks=marks, polar=polar_36_7, wind=wind,
+        dt_minutes=5.0, max_iterations=200,
+    )
+    assert full.reached
+
+    # One iteration short of the full run: the final leg must starve.
+    starved = compute_isochrone_route_multileg(
+        marks=marks, polar=polar_36_7, wind=wind,
+        dt_minutes=5.0, max_iterations=full.iterations - 1,
+    )
+    assert not starved.reached
+    # And the shared budget is respected in aggregate.
+    assert starved.iterations <= full.iterations - 1
+
+
+def test_multileg_budget_exhausted_before_leg_returns_partial(polar_36_7):
+    """Budget smaller than leg 1's needs → partial single-leg result,
+    reached=False, no crash."""
+    wind = _uniform_wind(0.0, -5.0)
+    marks = [
+        {"lat": 42.5, "lon": -88.0},
+        {"lat": 42.3, "lon": -87.8},
+        {"lat": 42.0, "lon": -88.0},
+    ]
+    result = compute_isochrone_route_multileg(
+        marks=marks, polar=polar_36_7, wind=wind,
+        dt_minutes=5.0, max_iterations=3,
+    )
+    assert not result.reached
+    assert result.legs == 1
+    assert result.iterations <= 3
+    assert len(result.path) >= 1
+
+
 # ─── Rounding side enforcement ──────────────────────────────────────────
 
 

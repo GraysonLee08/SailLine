@@ -590,12 +590,24 @@ def compute_isochrone_route_multileg(
     number of legs joined. If any leg fails to reach, the result's
     ``reached`` is False and trailing legs are skipped — the partial
     route is still returned for inspection.
+
+    ``max_iterations`` is a TOTAL simulated-time budget shared across
+    all legs (v12): each iteration advances dt_minutes of simulated
+    time, and every leg receives only what previous legs haven't spent.
+    Before v12 each leg got a fresh ``max_iterations``, which still
+    capped any single leg at max_iterations*dt of sailing (20h at the
+    defaults) — the bug that truncated long point-to-point races
+    mid-lake. Callers routing real courses should size the budget from
+    the forecast window / course estimate (see
+    ``pipeline.compute_route``); the default 240 remains for tests and
+    the CLI.
     """
     if len(marks) < 2:
         raise ValueError("multi-leg routing needs >= 2 marks")
 
     legs_completed: list[RouteResult] = []
     elapsed_minutes = 0.0
+    iterations_used = 0
     current_pos = (float(marks[0]["lat"]), float(marks[0]["lon"]))
 
     for i in range(len(marks) - 1):
@@ -621,6 +633,13 @@ def compute_isochrone_route_multileg(
                     rounding=prev_rounding,
                 )
 
+        # Remaining simulated-time budget for this leg (total minus what
+        # earlier legs consumed). Exhausted budget = unreachable course
+        # within the allotted window; return the partial for inspection.
+        iterations_left = max_iterations - iterations_used
+        if iterations_left <= 0:
+            break
+
         leg_result = compute_isochrone_route(
             start=current_pos,
             finish=leg_finish,
@@ -630,7 +649,7 @@ def compute_isochrone_route_multileg(
             race_start=leg_start_dt,
             dt_minutes=dt_minutes,
             heading_step_deg=heading_step_deg,
-            max_iterations=max_iterations,
+            max_iterations=iterations_left,
             finish_radius_nm=finish_radius_nm,
             angular_bins=angular_bins,
             currents=currents,
@@ -642,6 +661,7 @@ def compute_isochrone_route_multileg(
         )
         legs_completed.append(leg_result)
         elapsed_minutes += leg_result.total_minutes
+        iterations_used += leg_result.iterations
 
         if not leg_result.reached:
             # No point routing onward — return the partial.

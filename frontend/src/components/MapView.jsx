@@ -136,6 +136,17 @@ export function MapView({
   const followMode = useFollowMode(activeRace?.id ?? null);
   const permissionStatus = usePermissionStatus();
 
+  // Auto-apply silent route refreshes (kind: "update") from the
+  // recompute worker — every weather ingest produces a fresh route for
+  // this race, and the map should just show it. "better" payloads keep
+  // going through the accept/dismiss banner below; the worker never
+  // publishes both kinds for one pass. applyAlternative is a stable
+  // useCallback, listed to satisfy exhaustive-deps.
+  useEffect(() => {
+    if (!notif.update?.route) return;
+    routing.applyAlternative(notif.update.route);
+  }, [notif.update, routing.applyAlternative]);
+
   // Active calibration for the LIVE gauge — separate from
   // `recorder.pendingCalibration` (which clears on flush ack). Persisted
   // per-race in localStorage so a tab reload doesn't dump the zero.
@@ -713,8 +724,14 @@ function RaceOverlay({
   const inPreStartWindow =
     !cd.isUnset && !cd.isPast && (cd.msUntil ?? 0) <= 5 * 60 * 1000;
   const showArmed = autoStart?.armed && !recording && inPreStartWindow;
+  // Freshness banner only inside the T-5 pre-start window it was
+  // designed for (see useRouteFreshnessCheck header): the check
+  // compares the route's gun-time wind against the CURRENT forecast
+  // frame, which is only a fair comparison minutes before the start.
+  // Days out it just measures "wind now vs wind at the gun" — a Δ53°
+  // false alarm on a race starting in 40h (2026-07-09 Mac report).
   const showFreshness =
-    freshness?.ready && freshness.stale && !cd.isPast && !cd.isUnset;
+    freshness?.ready && freshness.stale && inPreStartWindow;
 
   // "Pre-race" for the Zero button — calibration is dock-only. Visible
   // any time before the gun (covers the case where the user shows up

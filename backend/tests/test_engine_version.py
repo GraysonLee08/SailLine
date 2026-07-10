@@ -30,7 +30,10 @@ from app.services.routing.pipeline import (
 
 
 # Pinned snapshot. Update IN THE SAME COMMIT as the ENGINE_VERSION bump.
-_PINNED_VERSION = "v11-pipeline"
+# v12-fullrace: course-sized engine iteration budget, persist-last-frame
+# wind beyond the forecast horizon, reached=False no longer cached. No
+# RouteRequest/DeratingProfile field changes.
+_PINNED_VERSION = "v12-fullrace"
 
 _PINNED_ROUTE_REQUEST_FIELDS = frozenset({
     "race_id",

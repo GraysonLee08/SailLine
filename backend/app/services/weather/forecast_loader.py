@@ -116,8 +116,20 @@ async def load_forecast_for_race(
     region: str,
     race_start: datetime,
     duration_hours: float = DEFAULT_RACE_DURATION_HOURS,
+    persist_beyond_horizon: bool = False,
 ) -> WindForecast:
     """Build a time-aware forecast for the race window.
+
+    ``persist_beyond_horizon`` (v12) changes two things:
+
+    * Coverage rule: GFS is considered usable when *race_start* falls
+      within its horizon, even if race_end extends past it — the tail
+      beyond the last snapshot is handled by persist-last-frame
+      sampling instead of a 425. With the flag off, the historical
+      rule applies (race_end must be coverable).
+    * The returned :class:`WindForecast` carries the flag, so
+      ``sample()`` past t_max returns the last frame's wind rather
+      than None.
 
     Raises
     ------
@@ -151,16 +163,30 @@ async def load_forecast_for_race(
 
     # GFS covers anything from now out to +120h. We need its tail when
     # the race extends past HRRR, OR when HRRR can't be used at all.
+    # With persist-last-frame enabled, GFS only needs to reach the
+    # START of the race — the un-forecast tail is persisted instead of
+    # refused, so a >120h course no longer 425s when its start is
+    # coverable.
     gfs_horizon_end = now + timedelta(hours=GFS_HORIZON_HOURS)
-    gfs_can_cover_race = has_gfs and race_end <= gfs_horizon_end
+    gfs_can_cover_race = has_gfs and (
+        race_start <= gfs_horizon_end
+        if persist_beyond_horizon
+        else race_end <= gfs_horizon_end
+    )
 
     # Step 2 - if NEITHER model covers, raise ForecastNotAvailable
     # with the soonest moment a future cycle will reach the race.
     if not use_hrrr and not gfs_can_cover_race:
         if has_gfs:
-            # GFS will catch up when its 120h horizon reaches race_end.
-            available_at = race_end - timedelta(hours=GFS_HORIZON_HOURS)
-            reason = "race extends beyond GFS forecast horizon"
+            if persist_beyond_horizon:
+                # Persist mode only fails when even race_START is past
+                # the horizon; GFS catches up when +120h reaches it.
+                available_at = race_start - timedelta(hours=GFS_HORIZON_HOURS)
+                reason = "race starts beyond GFS forecast horizon"
+            else:
+                # GFS will catch up when its 120h horizon reaches race_end.
+                available_at = race_end - timedelta(hours=GFS_HORIZON_HOURS)
+                reason = "race extends beyond GFS forecast horizon"
         elif has_hrrr:
             # Region is HRRR-only and race is past +18h.
             available_at = race_start - timedelta(hours=HRRR_HORIZON_HOURS)
@@ -216,7 +242,11 @@ async def load_forecast_for_race(
         )
 
     quality = "+".join(quality_parts) if len(quality_parts) > 1 else quality_parts[0]
-    return WindForecast(snapshots=snapshots, quality=quality)
+    return WindForecast(
+        snapshots=snapshots,
+        quality=quality,
+        persist_beyond_horizon=persist_beyond_horizon,
+    )
 
 
 async def load_grid_blob_at(

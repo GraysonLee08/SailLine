@@ -45,15 +45,19 @@ from app.services.routing.pipeline import (
     DeratingProfile,
     GFS_MAX_HORIZON_HOURS,
     NOMINAL_PASSAGE_SPEED_KT,
+    ROUTE_DT_MINUTES,
+    SIM_BUDGET_MAX_HOURS,
     RouteOutcome,
     RouteRequest,
     RouteRequestKnobs,
     compute_route,
+    estimate_course_hours,
     estimate_load_window_hours,
     load_last_request,
     request_with_knobs,
     resolve_region,
     save_last_request,
+    simulated_time_budget_iterations,
 )
 from app.services.routing.wind_forecast import WindForecast
 from app.services.weather.forecast_loader import ForecastNotAvailable
@@ -137,6 +141,37 @@ def test_estimate_window_sums_intermediate_legs():
 def test_estimate_window_degenerate_single_mark_returns_floor():
     assert estimate_load_window_hours([{"lat": 43.0, "lon": -87.9}], 6.0) == 6.0
     assert NOMINAL_PASSAGE_SPEED_KT > 0  # guard against a div-by-zero regression
+
+
+# ─── simulated_time_budget_iterations (v12) ─────────────────────────────
+
+
+def test_budget_covers_course_estimate_with_headroom():
+    """A Mac-scale course must get MORE simulated time than its estimate
+    — the 20h-per-leg default was the truncation bug."""
+    marks = [
+        {"lat": 41.8881, "lon": -87.6132},   # Chicago
+        {"lat": 45.8492, "lon": -84.6189},   # Mackinac Island
+    ]
+    est_h = estimate_course_hours(marks)
+    budget_iters = simulated_time_budget_iterations(marks, est_h)
+    budget_hours = budget_iters * ROUTE_DT_MINUTES / 60.0
+    assert budget_hours >= 2.0 * est_h * 0.999   # 2× estimate, fp-tolerant
+    assert budget_hours > 20.0                    # strictly beats the old cap
+
+
+def test_budget_capped_at_absolute_max():
+    """Ocean-crossing-scale course hits the SIM_BUDGET_MAX_HOURS ceiling."""
+    marks = [
+        {"lat": 37.8, "lon": -122.4},   # San Francisco
+        {"lat": 21.3, "lon": -157.9},   # Honolulu (~2070 nm)
+    ]
+    budget_iters = simulated_time_budget_iterations(marks, GFS_MAX_HORIZON_HOURS)
+    assert budget_iters == int(SIM_BUDGET_MAX_HOURS * 60.0 / ROUTE_DT_MINUTES)
+
+
+def test_budget_never_below_one_iteration():
+    assert simulated_time_budget_iterations([], 0.0) >= 1
 
 
 # ─── compute_route fixtures ─────────────────────────────────────────────
@@ -336,6 +371,87 @@ async def test_compute_route_derating_change_changes_cache_key(
     assert get_keys[0] != get_keys[1], (
         "DeratingProfile change must produce a distinct cache key"
     )
+
+
+# ─── v12: budget, persistence flag, horizon meta, unreached cache skip ──
+
+
+@pytest.mark.asyncio
+async def test_compute_route_passes_course_sized_budget_to_engine(
+    base_request, fake_redis,
+):
+    """The engine must receive the course-sized iteration budget, not
+    its 240-iteration default (the 20h truncation bug)."""
+    forecast_mock = AsyncMock(return_value=_fake_forecast())
+    engine_mock = MagicMock(return_value=_fake_result())
+
+    with patch("app.services.weather.load_forecast_for_race", new=forecast_mock), \
+         patch("app.services.routing.pipeline.load_currents_optional",
+               new=AsyncMock(return_value=None)), \
+         patch("app.services.routing.pipeline.make_navigable_predicate",
+               return_value=always_navigable()), \
+         patch("app.services.routing.pipeline.compute_isochrone_route_multileg",
+               new=engine_mock):
+        await compute_route(base_request, redis=fake_redis, use_cache=False)
+
+    kwargs = engine_mock.call_args.kwargs
+    expected_window = estimate_load_window_hours(
+        base_request.marks, base_request.duration_hours,
+    )
+    assert kwargs["dt_minutes"] == ROUTE_DT_MINUTES
+    assert kwargs["max_iterations"] == simulated_time_budget_iterations(
+        base_request.marks, expected_window,
+    )
+    # Forecast loader gets the persist-last-frame flag.
+    assert forecast_mock.await_args.kwargs["persist_beyond_horizon"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_route_flags_horizon_exceeded(base_request, fake_redis):
+    """Route sailing past the last snapshot (t_max 14:00, start 13:00,
+    420 min ETA) is flagged; a 30-min route is not."""
+    for total_minutes, expected in ((420.0, True), (30.0, False)):
+        fake_redis.reset_mock()
+        patches = _pipeline_patches(result=_fake_result(total_minutes=total_minutes))
+        for p in patches:
+            p.start()
+        try:
+            outcome = await compute_route(
+                base_request, redis=fake_redis, use_cache=False,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+        assert outcome.meta["horizon_exceeded"] is expected, total_minutes
+        assert outcome.meta["forecast_t_max"] == "2026-05-05T14:00:00+00:00"
+        assert outcome.feature["properties"]["horizon_exceeded"] is expected
+
+
+@pytest.mark.asyncio
+async def test_compute_route_does_not_cache_unreached_result(
+    base_request, fake_redis,
+):
+    """reached=False must not be pinned in the cache for an hour."""
+    unreached = RouteResult(
+        path=[(42.3636, -87.8261), (42.1, -87.7)],
+        headings=[200.0],
+        total_minutes=1200.0,
+        tack_count=3,
+        reached=False,
+        iterations=240,
+        nodes_explored=5000,
+    )
+    patches = _pipeline_patches(result=unreached)
+    for p in patches:
+        p.start()
+    try:
+        outcome = await compute_route(base_request, redis=fake_redis, use_cache=True)
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.meta["reached"] is False
+    fake_redis.setex.assert_not_called()
 
 
 # ─── RouteRequestKnobs serialization ────────────────────────────────────
