@@ -65,11 +65,15 @@ Frontend:
 
 Tests:
 - `backend/tests/test_engine_version.py` — pinned `v12-fullrace`
+- `backend/tests/test_routing_router_currents.py` — second version pin updated (missed on first pass, caught by the suite)
 - `backend/tests/test_wind_forecast.py` — persistence (4 new)
 - `backend/tests/test_forecast_loader.py` — persist coverage rule (3 new)
 - `backend/tests/test_routing_pipeline.py` — budget sizing, persist flag, horizon meta, unreached cache skip (6 new)
 - `backend/tests/test_isochrone_multileg.py` — total-budget semantics (2 new)
 - `backend/tests/test_route_recompute.py` — rewritten for v12 semantics
+
+**Verification: DONE on Windows** — backend `pytest -m "not slow"`: 923 passed;
+frontend `npm test` (vitest): 184 passed across 16 files.
 
 ## Decisions made
 
@@ -88,13 +92,22 @@ Tests:
 
 ## Open items / next steps
 
-- **Windows verification (required, sandbox can't run these):**
-  - `cd E:\Personal\Coding\SailLine\backend; pytest -m "not slow"`
-  - `cd E:\Personal\Coding\SailLine\frontend; npm test`
-  - After deploy: Recompute the Mac race, confirm the magenta line
-    reaches the island and `horizon_exceeded` behaves.
-- Mobile app consumes the same SSE stream? Verify the RN client handles
-  `kind: "update"` (this session only touched the web frontend).
+- **Mobile SSE `kind` fix (top priority before racing with v12).**
+  Confirmed gap: `mobile/src/hooks/useRouteNotifications.ts:116-127`
+  treats every `alternative` event as a better-route payload — no
+  `kind` check — so the v12 worker's per-ingest `kind: "update"`
+  publishes would pop a "Save 0 min · 0.0% faster" banner on the phone
+  every weather cycle mid-race. Fix mirrors the web change: branch on
+  `payload.kind` in the hook (`"update"` → new `update` state), and
+  auto-apply `update.route` in `RoutingContext.tsx`/`useRouting.ts`.
+  JS-only → no prebuild; rebuild + sideload:
+  `cd mobile\android; .\gradlew assembleRelease;
+  adb install -r app\build\outputs\apk\release\app-release.apk`
+  (`adb uninstall com.sailline.app` first on
+  INSTALL_FAILED_UPDATE_INCOMPATIBLE). Backend is safe to deploy before
+  the APK lands — worst case is the noisy banner, nothing crashes.
+- Push to `main` (auto-deploys; no migration this time), then recompute
+  the Mac race — line should reach the island; check `horizon_exceeded`.
 - Consider surfacing `horizon_exceeded` in the UI (e.g. dashed route tail
   past `forecast_t_max`).
 - Recompute worker trigger cadence unchanged (post-ingest); the wider
