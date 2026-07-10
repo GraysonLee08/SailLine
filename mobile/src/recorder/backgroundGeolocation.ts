@@ -526,6 +526,19 @@ export async function startWatcher({
     // that are ALWAYS present (timestamp, latitude, longitude) stay
     // in their natural types.
     //
+    // BARE VARIABLES ONLY (2026-07-09 — the persistence-failure fix):
+    // TSTemplate.render does simple variable substitution, NOT
+    // expression evaluation. The previous `<%= speed * 1.943844 %>`
+    // threw `IllegalArgumentException: Unknown template variable:
+    // speed*1.943844` on EVERY location — a "Persistence failure" that
+    // silently dropped every 1 Hz fix before it reached the upload
+    // queue (257 drops in a 5-min desk test; only motionchange/
+    // heartbeat positions survived → the chronic ~1 fix/min server
+    // cadence misattributed to motion-state problems for three
+    // sessions). The template now sends raw ``sog_ms`` (m/s) and the
+    // backend GpsSample converts to kts server-side. Never put
+    // arithmetic in this template.
+    //
     // rootProperty="gps" wraps the array as { "gps": [...] } matching
     // TelemetryBatch on the server. (v4 called this `httpRootProperty`.)
     ...(nativeUploader
@@ -535,7 +548,7 @@ export async function startWatcher({
               '{"t":"<%= timestamp %>",' +
               '"lat":<%= latitude %>,' +
               '"lon":<%= longitude %>,' +
-              '"sog_kts":"<%= speed * 1.943844 %>",' +
+              '"sog_ms":"<%= speed %>",' +
               '"cog_deg":"<%= heading %>",' +
               '"gps_acc_m":"<%= accuracy %>"}',
           },

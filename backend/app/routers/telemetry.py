@@ -57,7 +57,7 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app import db
 from app.auth import get_current_user
@@ -112,6 +112,18 @@ class GpsSample(BaseModel):
         description="Speed over ground, knots. Null if the GPS hasn't "
                     "computed velocity yet (typical for the first 1-2 fixes).",
     )
+    sog_ms: Optional[float] = Field(
+        default=None, ge=0,
+        description="Speed over ground, m/s — the native uploader's raw "
+                    "value. Transistorsoft's locationTemplate supports "
+                    "bare variable substitution ONLY: the kts conversion "
+                    "the template used to attempt (`speed * 1.943844`) "
+                    "threw `Unknown template variable` and dropped EVERY "
+                    "fix at the persistence step (2026-07-09 desk-test "
+                    "diagnosis — the true cause of the 1-fix/min native "
+                    "sessions). The client now sends raw m/s and the "
+                    "server converts; see the model validator.",
+    )
     cog_deg: Optional[float] = Field(
         default=None, ge=0, lt=360,
         description="Course over ground, degrees true. Null when SOG "
@@ -123,7 +135,19 @@ class GpsSample(BaseModel):
                     "on this in queries to reject low-quality fixes.",
     )
 
-    @field_validator("sog_kts", "cog_deg", "gps_acc_m", mode="before")
+    @model_validator(mode="after")
+    def _derive_sog_kts_from_ms(self) -> "GpsSample":
+        """Fill ``sog_kts`` from ``sog_ms`` when only the raw m/s value
+        arrived (native-uploader path). ``sog_kts``, when present, wins —
+        the JS uploader already converted client-side. A converted value
+        above the 60 kt sanity cap is treated as GPS junk → None, matching
+        the field constraint the direct path enforces."""
+        if self.sog_kts is None and self.sog_ms is not None:
+            kts = self.sog_ms * 1.943844
+            self.sog_kts = kts if kts <= 60 else None
+        return self
+
+    @field_validator("sog_kts", "sog_ms", "cog_deg", "gps_acc_m", mode="before")
     @classmethod
     def _coerce_sentinel_to_none(cls, v):
         """Coerce every known "unavailable" encoding to None.
