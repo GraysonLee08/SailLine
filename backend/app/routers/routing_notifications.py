@@ -122,11 +122,36 @@ async def _event_publisher(race_id: UUID):
         except Exception as exc:
             log.warning("sse replay tactics failed race=%s: %s", race_id, exc)
 
-        # Tail the channel. pubsub.listen() yields messages indefinitely;
-        # sse-starlette's ping (default 15s) keeps the connection alive
-        # through proxies and detects client disconnects by cancelling
-        # this generator. The finally block then cleans up pubsub state.
-        async for message in pubsub.listen():
+        # Tail the channel. NOT pubsub.listen(): the Redis client is
+        # built with socket_timeout=2 (app/redis_client.py), so a bare
+        # listen() raises TimeoutError after ~2 s of channel silence —
+        # which killed EVERY idle stream ~3 s after connect (observed
+        # live 2026-07-11: mobile reconnect-churn at one connection per
+        # ~10 s all night; invisible on web because the browser client
+        # auto-reconnects and replay hides the loss).
+        # get_message(timeout=1.0) polls with a read deadline UNDER the
+        # socket timeout, so idle reads return None instead of raising
+        # and the stream lives until the client disconnects or Cloud
+        # Run's request timeout (300 s) ends it. sse-starlette's ping
+        # (default 15 s) keeps proxies happy and detects client
+        # disconnects by cancelling this generator; the finally block
+        # then cleans up pubsub state.
+        while True:
+            try:
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0,
+                )
+            except Exception as exc:  # noqa: BLE001 — degraded, not fatal
+                # A genuinely broken Redis connection would error every
+                # poll; end the stream and let the client reconnect
+                # (the replay makes reconnects lossless).
+                log.warning(
+                    "sse pubsub poll failed race=%s: %s — ending stream",
+                    race_id, exc,
+                )
+                break
+            if message is None:
+                continue
             if message["type"] != "message":
                 continue
             data = message["data"]
@@ -172,4 +197,12 @@ async def notifications(
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "race not found")
 
-    return EventSourceResponse(_event_publisher(race_id))
+    # sep="\n" (2026-07-11): sse-starlette's default event separator is
+    # "\r\n". Browsers parse both per the SSE spec, but react-native-sse
+    # splits on a single configured lineEndingCharacter ("\n" in
+    # useRouteNotifications) — under "\r\n" framing every event name
+    # parsed as "tactics\r"/"alternative\r" and matched NO listener,
+    # silently. Mobile never received a single SSE event before this
+    # (first observed: the desk-test tactician call, 04:00:19Z).
+    # "\n" framing is spec-legal and parses correctly on both clients.
+    return EventSourceResponse(_event_publisher(race_id), sep="\n")
