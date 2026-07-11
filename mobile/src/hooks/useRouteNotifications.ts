@@ -16,8 +16,36 @@
 // react-native-sse fills the same need (EventSource API + custom
 // headers) but is RN-native. Same auth contract, same event shape —
 // only the import + listener attach syntax differ.
+//
+// RECONNECTION CONTRACT (2026-07-11 — the desk-test silent-death fix):
+//
+// Cloud Run's request timeout is 300 s, so EVERY healthy SSE
+// connection is server-closed within 5 minutes. Reconnection is the
+// transport, not an error path. The previous config set
+// `pollingInterval: 0`, which in react-native-sse DISABLES the
+// library's automatic reconnect — the only reconnect coded was the
+// explicit 401 handler. Result: the first 5-minute cycle (or any
+// network blip / Android dozing the socket) killed the stream
+// silently and permanently. The first tactician call ever published
+// in prod (desk test 2a5dd333, 04:00:19Z) was lost exactly this way.
+//
+// Three layers now cover every disconnect class:
+//   1. `pollingInterval: 5000` — library auto-reconnect 5 s after any
+//      drop. Handles the routine Cloud Run 300 s cycling and network
+//      blips while the token is still fresh (< 1 h).
+//   2. The 401 error handler — full manual reconnect with a
+//      force-refreshed token (exponential backoff). Handles token
+//      expiry, since library retries reuse the ORIGINAL headers.
+//   3. An AppState listener — foregrounding forces close + fresh
+//      reconnect. Handles sockets Android killed during doze/
+//      background without ever emitting an error event.
+//
+// The server replays the latest stored alternative AND the latest
+// tactics call on every (re)connect, so calls published while
+// disconnected are recovered, not lost.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AppState } from "react-native";
 import EventSource from "react-native-sse";
 
 import { auth } from "../firebase";
@@ -26,6 +54,12 @@ import type { RouteFeature } from "../api/routing";
 const PROD_API_URL =
   "https://sailline-api-105706282249.us-central1.run.app";
 const API_URL = process.env.EXPO_PUBLIC_API_URL || PROD_API_URL;
+
+// Library-level reconnect delay after any connection drop. The server
+// closes every stream at the Cloud Run 300 s timeout by design; 5 s
+// keeps the reconnect gap well under the tactician's 90 s minimum
+// call lead.
+const RECONNECT_POLLING_MS = 5000;
 
 export type AlternativePayload = {
   race_id: string;
@@ -71,8 +105,25 @@ export function useRouteNotifications(raceId: string | null) {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     setError(null);
 
+    const teardown = () => {
+      const es = esRef.current;
+      esRef.current = null;
+      if (es) {
+        try {
+          es.removeAllEventListeners();
+          es.close();
+        } catch {
+          /* best effort */
+        }
+      }
+    };
+
     const connect = async (attempt: number): Promise<void> => {
       if (cancelled) return;
+
+      // Never hold two streams: the manual reconnect paths (401,
+      // AppState foreground) can race the library's own retry timer.
+      teardown();
 
       const user = auth.currentUser;
       if (!user) {
@@ -103,7 +154,13 @@ export function useRouteNotifications(raceId: string | null) {
         {
           headers: { Authorization: `Bearer ${token}` },
           debug: false,
-          pollingInterval: 0,
+          // > 0 enables the library's automatic reconnect after ANY
+          // drop — mandatory transport behavior under Cloud Run's
+          // 300 s stream timeout (see module docstring). NOTE: the
+          // library's retries reuse this connection's token; the 401
+          // handler below covers token expiry with a full
+          // fresh-token reconnect.
+          pollingInterval: RECONNECT_POLLING_MS,
           lineEndingCharacter: "\n",
         },
       );
@@ -144,8 +201,9 @@ export function useRouteNotifications(raceId: string | null) {
         const status = (event as { xhrStatus?: number }).xhrStatus;
         if (status === 401) {
           // Token expired or invalid — close and reconnect with a
-          // fresh token instead of dying permanently. Exponential
-          // backoff capped at 30s to avoid hammering the server.
+          // fresh token instead of letting the library retry with the
+          // same stale one. Exponential backoff capped at 30s to
+          // avoid hammering the server.
           es.close();
           const delay = Math.min(2000 * Math.pow(2, attempt), 30000);
           reconnectTimer = setTimeout(() => void connect(attempt + 1), delay);
@@ -153,25 +211,32 @@ export function useRouteNotifications(raceId: string | null) {
           setError("Race not found");
           es.close();
         }
-        // Other errors: let the library retry silently.
+        // Other errors: the library retries on RECONNECT_POLLING_MS.
       });
     };
 
     void connect(0);
 
+    // Foreground recovery: Android can kill the socket during doze /
+    // background without ever surfacing an error event, leaving a
+    // zombie EventSource that will never reconnect on its own. Any
+    // return to the foreground forces a clean fresh-token reconnect;
+    // the server-side replay makes this cheap and idempotent.
+    const appStateSub = AppState.addEventListener("change", (state) => {
+      if (state === "active" && !cancelled) {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+        void connect(0);
+      }
+    });
+
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      const es = esRef.current;
-      esRef.current = null;
-      if (es) {
-        try {
-          es.removeAllEventListeners();
-          es.close();
-        } catch {
-          /* best effort */
-        }
-      }
+      appStateSub.remove();
+      teardown();
     };
   }, [raceId]);
 
