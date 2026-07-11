@@ -193,19 +193,24 @@ export default function RecordingScreen() {
     routing.compute,
   ]);
 
-  const guidance = useNextMarkGuidance({
-    race: selectedRace,
-    points: recorder.points,
-    lastPoint: recorder.lastPoint,
-  });
-
   // Auto-detected mark passes (server-authoritative, read-only). Drives
-  // the missed-mark notifier's "next expected mark" logic. There is no
+  // the missed-mark notifier's "next expected mark" logic AND (2026-07-10)
+  // the GuidanceCard's next-mark index — the local 120-point replay
+  // regressed to already-passed marks during the Last Test. There is no
   // in-race mark UI and no manual tap-to-pass — the detector is the sole
   // writer (manual-pass path removed 2026-06-08).
   const markPasses = useMarkPasses({
     raceId: selectedRace?.id ?? null,
     recording: recorder.recording,
+  });
+
+  const guidance = useNextMarkGuidance({
+    race: selectedRace,
+    points: recorder.points,
+    lastPoint: recorder.lastPoint,
+    // null while the first fetch is in flight → hook falls back to the
+    // local replay until the poll resolves (≤15 s while recording).
+    serverNextMarkIndex: markPasses.loading ? null : markPasses.passes.length,
   });
 
   // Global auto-pass preference (B2 — 2026-06-03). Default ON; users can

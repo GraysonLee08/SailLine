@@ -530,6 +530,67 @@ def thresholds_for_course(
     return [base] * (mark_count - 1) + [final]
 
 
+def clamp_thresholds_to_spacing(
+    thresholds: Sequence[float],
+    marks: Sequence[Mark],
+    *,
+    factor: float = 0.45,
+    floor_m: float = 25.0,
+    colocated_below_m: float = 5.0,
+) -> list[float]:
+    """Clamp each per-mark CPA threshold by the distance to its nearest
+    DISTINCT neighbouring mark.
+
+    Born from the 2026-07-10 "Last Test" race: the course put Mark 1
+    and Mark 2 only 67 m apart while the inshore CPA threshold was
+    100 m. One visit to Mark 2 satisfied Mark 1's CPA at 75 m, emitted
+    a false Mark 1 pass, chained, and emitted Mark 2 three seconds
+    later — producing two nonsense 12 s / 3 s "legs" in the analysis.
+    A threshold wider than the mark spacing makes cross-talk
+    structurally possible; this clamp makes it structurally impossible.
+
+    Per mark: ``min(threshold, max(floor_m, factor × d_nearest))``.
+
+    * ``factor`` 0.45 keeps the clamped radii of two adjacent marks
+      from overlapping (2 × 0.45 < 1.0).
+    * ``floor_m`` keeps the threshold above GPS noise — a clamp below
+      ~25 m would start missing genuine tight roundings, which is a
+      worse failure than the cross-talk it prevents.
+    * Neighbours closer than ``colocated_below_m`` are ignored: a
+      multi-lap course lists the SAME buoy at several indices
+      (windward–leeward), and those zero-distance "neighbours" must
+      not collapse the threshold. Sequential ordering already guards
+      repeated marks.
+
+    Marks without a distinct neighbour (single-mark course, or all
+    marks co-located) keep their original thresholds. Gate geometry
+    (start/finish lines, rounding rays) is deliberately NOT clamped
+    here — the generous line length is a design decision for real RC
+    lines; this function only tightens the CPA fallback.
+    """
+    n = len(marks)
+    if len(thresholds) != n:
+        raise ValueError(
+            f"thresholds length {len(thresholds)} != mark count {n}"
+        )
+    out: list[float] = []
+    for i, m in enumerate(marks):
+        d_near: Optional[float] = None
+        for j, other in enumerate(marks):
+            if j == i:
+                continue
+            d = _haversine_m(m.lat, m.lon, other.lat, other.lon)
+            if d <= colocated_below_m:
+                continue  # same physical buoy repeated in the course
+            if d_near is None or d < d_near:
+                d_near = d
+        if d_near is None:
+            out.append(float(thresholds[i]))
+        else:
+            out.append(min(float(thresholds[i]), max(floor_m, factor * d_near)))
+    return out
+
+
 def radii_for_course(mark_count: int) -> list[float]:
     """Deprecated alias for ``thresholds_for_course(mark_count, mode="distance")``.
 

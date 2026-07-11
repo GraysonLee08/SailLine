@@ -30,10 +30,10 @@ from app.services.routing.pipeline import (
 
 
 # Pinned snapshot. Update IN THE SAME COMMIT as the ENGINE_VERSION bump.
-# v12-fullrace: course-sized engine iteration budget, persist-last-frame
-# wind beyond the forecast horizon, reached=False no longer cached. No
+# v13-maneuver: tack/gybe penalties, top-2 frontier per bearing bin,
+# maneuver tie-break in culling. Engine behaviour change only — no
 # RouteRequest/DeratingProfile field changes.
-_PINNED_VERSION = "v12-fullrace"
+_PINNED_VERSION = "v13-maneuver"
 
 _PINNED_ROUTE_REQUEST_FIELDS = frozenset({
     "race_id",

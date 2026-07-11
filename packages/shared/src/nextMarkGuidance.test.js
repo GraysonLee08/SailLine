@@ -210,3 +210,70 @@ describe("computeGuidance", () => {
     ).toBeNull();
   });
 });
+
+// ── computeGuidance: server-authoritative nextMarkIndex (2026-07-10) ──
+//
+// When the caller supplies the persisted mark_passes count, the local
+// detector replay must be skipped entirely — a truncated point window
+// regresses to already-passed marks (the Last Test "next mark: Start"
+// bug). These pin the override semantics.
+
+describe("computeGuidance with nextMarkIndex", () => {
+  it("uses the server index and ignores the points entirely", () => {
+    // Points would replay to "A is next" (no passes) — but the server
+    // says two marks are already passed. Server wins.
+    const result = computeGuidance({
+      marks: MARKS,
+      points: [],
+      current: { lat: 41.905, lon: -87.590 },
+      nextMarkIndex: 2,
+    });
+    expect(result).not.toBeNull();
+    expect(result.nextMarkIndex).toBe(2);
+    expect(result.nextMark.name).toBe("C");
+    // Leg line is B→C, so fromMark must be B.
+    expect(result.fromMark?.lat).toBeCloseTo(41.910, 3);
+  });
+
+  it("does NOT regress when points cover only a recent window", () => {
+    // Reproduces the 2026-07-10 bug shape: the point window contains
+    // no rounding patterns at all (they scrolled out), which the old
+    // replay path read as "next mark index 0". With the server index
+    // the answer stays monotonic.
+    const staleWindow = [
+      { lat: 41.905, lon: -87.590, ts: "2026-07-10T23:18:00Z" },
+      { lat: 41.9051, lon: -87.5899, ts: "2026-07-10T23:18:01Z" },
+    ];
+    const result = computeGuidance({
+      marks: MARKS,
+      points: staleWindow,
+      current: { lat: 41.9051, lon: -87.5899 },
+      nextMarkIndex: 3,
+    });
+    expect(result.nextMarkIndex).toBe(3);
+    expect(result.nextMark.name).toBe("Finish");
+  });
+
+  it("returns null when the server says the course is complete", () => {
+    const result = computeGuidance({
+      marks: MARKS,
+      points: [],
+      current: { lat: 41.9, lon: -87.6 },
+      nextMarkIndex: MARKS.length,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("falls back to the replay path for null / undefined / bogus index", () => {
+    for (const bogus of [null, undefined, -1, 1.5, "2", NaN]) {
+      const result = computeGuidance({
+        marks: MARKS,
+        points: [],
+        current: { lat: 41.890, lon: -87.600 },
+        nextMarkIndex: bogus,
+      });
+      expect(result).not.toBeNull();
+      expect(result.nextMarkIndex).toBe(0); // replay of empty points
+    }
+  });
+});

@@ -74,6 +74,12 @@ fixed 240-iteration (20h-at-5min) per-leg default that truncated long
 courses mid-lake; persist-last-frame wind beyond the forecast horizon
 (``horizon_exceeded`` meta); ``reached=False`` results are no longer
 cached.
+v13-maneuver: tack/gybe penalties in the engine (a maneuvering step
+covers less ground), top-2 frontier per bearing bin, tie-break against
+maneuvered candidates. Fixes the staircase artifact where the culling
+preferred one-step-per-gybe lineages hugging the direct bearing —
+modeled time was identical, so the engine was indifferent; real boats
+are not. No RouteRequest/DeratingProfile field changes.
 """
 from __future__ import annotations
 
@@ -132,7 +138,7 @@ log = logging.getLogger(__name__)
 # is added, or engine behaviour changes in a way that invalidates cached
 # results. Part of the route cache key — old entries become unreachable
 # (and TTL out) the moment this changes.
-ENGINE_VERSION: str = "v12-fullrace"
+ENGINE_VERSION: str = "v13-maneuver"
 
 
 # Defaults that fall through when the worker has no stored RouteRequest

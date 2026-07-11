@@ -38,11 +38,14 @@ from app.services.routing.pipeline import (
 # ─── ENGINE_VERSION sanity ──────────────────────────────────────────────
 
 
-def test_engine_version_is_v12_fullrace():
-    """v12 marks the full-race budget + persist-last-frame changes.
-    Bumping this string forces a cache invalidation across every
-    existing cached route — intentional."""
-    assert ENGINE_VERSION == "v12-fullrace"
+def test_engine_version_is_v13_maneuver():
+    """v13 is the current engine fingerprint. Bumping this string
+    forces a cache invalidation across every existing cached route —
+    intentional. NOTE: test_engine_version.py is the CANONICAL
+    fingerprint test; this duplicate went stale at the v12→v13 bump
+    (caught 2026-07-10 as the sole pre-Mackinac pytest failure) and
+    now only asserts the import stays wired."""
+    assert ENGINE_VERSION == "v13-maneuver"
 
 
 # ─── _currents_cache_tag ────────────────────────────────────────────────

@@ -319,6 +319,42 @@ async def test_detect_and_persist_resumes_from_existing(conn):
     conn.execute.assert_awaited_once()
 
 
+async def test_close_marks_do_not_cross_talk(conn):
+    """2026-07-10 Last Test regression at the ingest layer, real
+    geometry: Mark 1 and Mark 2 sit ~67 m apart on an inshore course.
+    A track that only visits Mark 2 must not emit the pass for Mark 1
+    — pre-clamp, the 100 m inshore CPA threshold fired Mark 1 at 75 m
+    and then chained Mark 2 three seconds later (the 12 s / 3 s
+    phantom legs in the race analysis)."""
+    marks = [
+        {"name": "Start", "lat": 41.934910, "lon": -87.673664},
+        {"name": "Mark 1", "lat": 41.935200, "lon": -87.677529},
+        {"name": "Mark 2", "lat": 41.935799, "lon": -87.677531},
+    ]
+    # Start already passed → detector resumes watching Mark 1 (index 1),
+    # which also keeps this test off the start-line-bearing path.
+    existing = [{
+        "mark_index": 0,
+        "ts": "2026-07-10T23:12:52+00:00",
+        "lat": 41.935169,
+        "lon": -87.676263,
+    }]
+
+    all_p, new_p = await track_ingest.detect_and_persist_new_passes(
+        conn,
+        race_id=uuid4(),
+        marks=marks,
+        existing_passes=existing,
+        # Straight through Mark 2 — CPA to Mark 1 is ~67 m: inside the
+        # old 100 m threshold, outside the spacing-clamped ~30 m one.
+        new_points=_rounding_points(marks[2]["lat"], marks[2]["lon"]),
+        mode="inshore",
+    )
+
+    assert new_p == []
+    assert all_p == existing
+
+
 async def test_detect_and_persist_threads_state_into_detector(conn):
     """A non-None detector_state passed in MUST be restored on the
     detector, so the next batch resumes where the previous left off.

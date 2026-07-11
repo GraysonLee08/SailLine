@@ -66,9 +66,20 @@ export function crossTrackErrorM(
  * @property {{lat:number,lon:number,ts:string|Date}[]} points  Track points so far.
  *           Used (with `marks`) to determine which mark is next by
  *           replaying the detector — same source of truth as the auto-
- *           stop hook and the server's mark_rounding detector.
+ *           stop hook and the server's mark_rounding detector. Ignored
+ *           when `nextMarkIndex` is supplied.
  * @property {{lat:number,lon:number}} current  Latest GPS point.
  * @property {number | number[]} [radiusM]  Per-mark or scalar rounding radius.
+ * @property {number} [nextMarkIndex]  Server-authoritative next-mark
+ *           index (= the race's persisted mark_passes count). When
+ *           provided, the local detector replay is skipped entirely.
+ *           This is the correct mode whenever the caller can poll the
+ *           server: a local replay over a truncated point window can
+ *           REGRESS to already-passed marks (the 2026-07-10 "next mark
+ *           is the Start" bug — the mobile hook fed only the last 120
+ *           points, so passes scrolled out of view and the fresh
+ *           detector restarted at mark 0). Values ≥ marks.length mean
+ *           the course is complete → null, matching the replay path.
  */
 
 /**
@@ -92,23 +103,37 @@ export function crossTrackErrorM(
  * @param {GuidanceInput} input
  * @returns {GuidanceResult | null}
  */
-export function computeGuidance({ marks, points, current, radiusM = 50 }) {
+export function computeGuidance({
+  marks,
+  points,
+  current,
+  radiusM = 50,
+  nextMarkIndex = null,
+}) {
   if (!Array.isArray(marks) || marks.length === 0) return null;
   if (!current || !Number.isFinite(current.lat) || !Number.isFinite(current.lon)) {
     return null;
   }
 
-  // Replay the existing track to find the next-mark index. This matches
-  // how the server determines "next mark"; using a fresh detector
-  // (instead of trusting any client-side mark_passes cache) is correct
-  // even if the client UI hasn't refreshed yet.
-  const detector = new MarkRoundingDetector(marks, { radiusM });
-  if (Array.isArray(points) && points.length > 0) {
-    detector.feedBatch(points);
+  let nextIdx;
+  if (Number.isInteger(nextMarkIndex) && nextMarkIndex >= 0) {
+    // Server-authoritative mode: the caller knows how many passes the
+    // backend detector has persisted. No replay — the server's v4
+    // gate/CPA detector is strictly better informed than any client
+    // window (see the typedef note on the 2026-07-10 regression bug).
+    if (nextMarkIndex >= marks.length) return null; // course complete
+    nextIdx = nextMarkIndex;
+  } else {
+    // Fallback: replay the provided track to find the next-mark index.
+    // Only sound when `points` is the FULL track from the gun — a
+    // truncated window makes the fresh detector forget prior passes.
+    const detector = new MarkRoundingDetector(marks, { radiusM });
+    if (Array.isArray(points) && points.length > 0) {
+      detector.feedBatch(points);
+    }
+    if (detector.done) return null;
+    nextIdx = detector.nextMarkIndex;
   }
-  if (detector.done) return null;
-
-  const nextIdx = detector.nextMarkIndex;
   const next = marks[nextIdx];
   const distanceM = haversineM(current.lat, current.lon, next.lat, next.lon);
   const bearingDeg = initialBearingDeg(

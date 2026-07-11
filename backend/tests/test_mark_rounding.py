@@ -43,6 +43,7 @@ from app.services.mark_rounding import (
     Mark,
     MarkRoundingDetector,
     Point,
+    clamp_thresholds_to_spacing,
     compute_passes,
     radii_for_course,
     thresholds_for_course,
@@ -389,6 +390,99 @@ def test_thresholds_for_course_edge_cases():
     assert thresholds_for_course(1) == [
         DEFAULT_DISTANCE_THRESHOLD_M + FINAL_MARK_BONUS_M,
     ]
+
+
+# ─── clamp_thresholds_to_spacing (2026-07-10 cross-talk fix) ──────────
+#
+# The "Last Test" race put Mark 1 and Mark 2 ~67 m apart under a 100 m
+# inshore threshold: one visit to Mark 2 emitted a false Mark 1 pass at
+# 75 m, then chained Mark 2 three seconds later. The clamp bounds each
+# mark's CPA threshold by 0.45 × the distance to its nearest DISTINCT
+# neighbour (floor 25 m), making cross-talk structurally impossible.
+
+
+def test_clamp_tightens_thresholds_for_close_marks():
+    """Two marks 67 m apart in inshore mode: both clamp to ~30 m."""
+    marks = [
+        Mark(REF_LAT, REF_LON),
+        Mark(REF_LAT + m_to_dlat(67.0), REF_LON),
+    ]
+    out = clamp_thresholds_to_spacing(
+        thresholds_for_course(2, mode="inshore"), marks,
+    )
+    for t in out:
+        assert 25.0 <= t <= 0.46 * 67.0
+        assert t < DEFAULT_INSHORE_THRESHOLD_M
+
+
+def test_clamp_no_op_when_marks_are_far_apart():
+    """Spacing far beyond threshold/factor: base thresholds unchanged."""
+    marks = [
+        Mark(REF_LAT, REF_LON),
+        Mark(REF_LAT + m_to_dlat(2000.0), REF_LON),
+        Mark(REF_LAT, REF_LON + m_to_dlon(3000.0)),
+    ]
+    base = thresholds_for_course(3, mode="inshore")
+    assert clamp_thresholds_to_spacing(base, marks) == base
+
+
+def test_clamp_respects_floor():
+    """Marks 30 m apart: 0.45 × 30 = 13.5 m would be below GPS noise —
+    the floor (25 m) wins over the factor."""
+    marks = [
+        Mark(REF_LAT, REF_LON),
+        Mark(REF_LAT + m_to_dlat(30.0), REF_LON),
+    ]
+    out = clamp_thresholds_to_spacing([100.0, 100.0], marks)
+    assert out == [25.0, 25.0]
+
+
+def test_clamp_ignores_colocated_repeated_marks():
+    """Multi-lap courses repeat the SAME buoy at several indices. The
+    zero-distance 'neighbour' must not collapse the threshold —
+    sequential ordering already guards repeats."""
+    a = Mark(REF_LAT, REF_LON)
+    b = Mark(REF_LAT + m_to_dlat(800.0), REF_LON)
+    marks = [a, b, a, b]  # W-L, 2 laps
+    base = thresholds_for_course(4, mode="inshore")
+    assert clamp_thresholds_to_spacing(base, marks) == base
+
+
+def test_clamp_single_mark_unchanged():
+    out = clamp_thresholds_to_spacing([150.0], [Mark(REF_LAT, REF_LON)])
+    assert out == [150.0]
+
+
+def test_clamp_length_mismatch_rejects():
+    with pytest.raises(ValueError):
+        clamp_thresholds_to_spacing([100.0], [
+            Mark(REF_LAT, REF_LON),
+            Mark(REF_LAT + m_to_dlat(500.0), REF_LON),
+        ])
+
+
+def test_close_marks_no_cross_talk_regression():
+    """2026-07-10 Last Test regression, real geometry: Mark 1 and
+    Mark 2 are 67 m apart. A track that only visits Mark 2 must NOT
+    emit a pass for Mark 1 once thresholds are spacing-clamped."""
+    m1 = Mark(41.935200, -87.677529)  # "Mark 1"
+    m2 = Mark(41.935799, -87.677531)  # "Mark 2", ~67 m north
+    marks = [m1, m2]
+    thresholds = clamp_thresholds_to_spacing(
+        thresholds_for_course(2, mode="inshore"), marks,
+    )
+    det = MarkRoundingDetector(marks, threshold_m=thresholds)
+    # East→west line straight through Mark 2 — CPA to Mark 1 is ~67 m
+    # (inside the old 100 m threshold, outside the clamped ~30 m one).
+    passes = det.feed_batch(line_through(m2, closest_m=0.0))
+    # Sequential detector is watching Mark 1; the visit to Mark 2 must
+    # not satisfy it.
+    assert passes == []
+    assert det.next_mark_index == 0
+
+    # Positive control: a genuine tight rounding of Mark 1 still fires.
+    passes = det.feed_batch(line_through(m1, closest_m=20.0, t0=1000.0))
+    assert [p.mark_index for p in passes] == [0]
 
 
 def test_radii_for_course_back_compat_returns_distance_thresholds():

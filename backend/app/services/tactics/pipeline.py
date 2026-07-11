@@ -189,10 +189,26 @@ async def _evaluate_inner(
             return
 
         # Per-user opt-out (settings sync to user_profiles.app_settings).
-        settings_row = await conn.fetchrow(
-            "SELECT app_settings FROM user_profiles WHERE id = $1",
-            uid,
-        )
+        #
+        # HARDENED 2026-07-10: this read is best-effort. The phantom
+        # app_settings column silenced the tactician for TWO full races
+        # (walk test 07-09, Last Test 07-10 — migration 0025 was applied
+        # to the wrong database) because a failure here crashed the
+        # whole evaluation. An opt-out check must never cost a call:
+        # any failure reads as "not opted out" and the pipeline runs.
+        try:
+            settings_row = await conn.fetchrow(
+                "SELECT app_settings FROM user_profiles WHERE id = $1",
+                uid,
+            )
+        except Exception:  # noqa: BLE001 — degraded, never fatal
+            log.warning(
+                "tactician: app_settings read failed race=%s — "
+                "treating as not opted out",
+                race_id,
+                exc_info=True,
+            )
+            settings_row = None
         if settings_row is not None:
             app_settings = settings_row["app_settings"] or {}
             if isinstance(app_settings, str):

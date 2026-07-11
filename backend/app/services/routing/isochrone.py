@@ -24,6 +24,31 @@ WindForecast (multiple snapshots). The engine just calls
 wind.sample(lat, lon, valid_time). WindField also accepts the kwarg and
 ignores it, so legacy callers and existing tests work unchanged.
 
+Maneuver cost (v13): switching tacks or gybes between a parent node and
+its candidate costs time. The candidate's projected distance for the
+step is reduced by ``penalty_seconds × boat_speed`` (tack and gybe have
+separate penalties). Without this the engine was indifferent between
+two long boards and a staircase of one-step boards — modeled time was
+identical — and the bearing-bin culling systematically preferred the
+staircase because alternating sides hugs the direct bearing to the
+finish. The penalty makes consolidated boards strictly faster, so the
+optimizer produces sailable routes and prices real maneuver losses
+into the ETA. Frontier culling also keeps the top-K nodes per bearing
+bin (not just the best) because a parent-heading-dependent penalty
+breaks strict isochrone dominance: a slightly-behind node on the
+correct tack can beat a slightly-ahead node on the wrong one.
+
+Because a single tack (~46 m at cruising speed) costs far less than
+the 5-minute time quantum, penalties alone cannot fully stop weaving:
+lineages with a dozen extra tacks still reach on the same iteration.
+Three mechanisms close the gap: (1) the culling score charges each
+lineage BIN_TIEBREAK_M per cumulative maneuver, (2) when several
+nodes reach the finish on one iteration the fewest-maneuvers lineage
+wins, and (3) a post-search pass (``_consolidate_boards``) stably
+reorders step vectors inside bounded windows to cluster same-tack
+steps into boards — time and endpoints unchanged, navigability and
+rounding re-checked per window.
+
 Multi-leg: ``compute_isochrone_route_multileg`` accepts a list of marks
 and threads elapsed wall-clock across legs so each leg samples the
 correct forecast frame. Intermediate marks may carry a ``rounding``
@@ -56,6 +81,44 @@ M_PER_NM = 1852.0
 # trip the rounding-side check) but small enough that the visual bend
 # at the mark looks correct on the chart.
 ROUNDING_OFFSET_M = 200.0
+
+# ── Maneuver penalties (v13) ────────────────────────────────────────────
+# Time lost to a tack / gybe, expressed as seconds of sailing removed
+# from the step in which the maneuver happens (distance_m is shortened
+# by penalty_s × boat_speed). Values are deliberately conservative for
+# a ~36 ft keelboat: a clean tack costs ~15 s of VMG, a gybe (kite up)
+# a bit more. Both are engine kwargs so callers/tests can tune them;
+# setting both to 0.0 restores pre-v13 behaviour exactly.
+DEFAULT_TACK_PENALTY_S = 15.0
+DEFAULT_GYBE_PENALTY_S = 25.0
+
+# Frontier culling keeps the top-K candidates per bearing bin (v13).
+# K=1 was sufficient when the step cost was parent-independent; with
+# maneuver penalties, strict per-bin dominance no longer holds — a node
+# a boat-length behind but on the correct tack may lead to a faster
+# finish. K=2 doubles frontier width, which the v12 budget sizing
+# absorbs comfortably.
+DEFAULT_FRONTIER_PER_BIN = 2
+
+# Tie-break: when ranking candidates within a bin, each cumulative
+# maneuver along a candidate's lineage scores it this many metres
+# "further" than a maneuver-free rival. Small relative to a 5-minute
+# step (~600–900 m) so it only reorders near-ties; the real
+# disincentive is the distance penalty. Cumulative (not per-step)
+# because at dt=5min a single tack costs ~46 m — well under the time
+# quantum — so per-step nudges alone can't stop weaving lineages.
+BIN_TIEBREAK_M = 25.0
+
+# Post-search board consolidation (v13). Within windows of this many
+# steps, same-tack steps are clustered by a stable reorder of the
+# step displacement vectors — total time and window endpoints are
+# unchanged, but the artificial one-step-per-gybe alternation the bin
+# culling produces collapses into sailable boards. Windows are only
+# accepted when every reordered segment passes navigability (and the
+# rounding filter, when present); otherwise the window keeps its
+# original order. 24 steps = 2 h at dt=5min, which bounds how far any
+# step drifts from the position/time its wind sample came from.
+CONSOLIDATION_WINDOW_STEPS = 24
 
 
 # ─── Geometry primitives (public — tests + scripts import these) ────────
@@ -110,6 +173,87 @@ def _twa(heading_deg_: float, wind_dir_from_deg: float) -> float:
     if diff > 180.0:
         diff = 360.0 - diff
     return diff
+
+
+def _wind_side(heading_deg_: float, wind_dir_from_deg: float) -> int:
+    """Which side the wind is on for a given heading.
+
+    Returns +1 for starboard tack (wind over the starboard side), -1
+    for port tack, 0 for dead upwind / dead downwind (no defined side).
+    A tack or gybe is a sign flip between parent and candidate.
+    """
+    rel = (heading_deg_ - wind_dir_from_deg + 360.0) % 360.0
+    if rel < 1e-9 or abs(rel - 180.0) < 1e-9:
+        return 0
+    return 1 if rel > 180.0 else -1
+
+
+def _consolidate_boards(
+    path: list[tuple[float, float]],
+    headings: list[float],
+    sides: list[int],
+    is_navigable,
+    window: int,
+    rounding_filter: Optional[Callable[[float, float], bool]] = None,
+) -> tuple[list[tuple[float, float]], list[float]]:
+    """Cluster same-tack steps into boards by reordering step vectors.
+
+    The bin culling induces a tack cadence tied to bin width — even
+    with maneuver penalties, the surviving lineage alternates sides
+    every few steps because closing speed on the finish *point* is
+    maximised on the direct bearing. On a beat/run in near-uniform
+    wind, any permutation of the step displacement vectors reaches the
+    same endpoint in the same time, so within bounded windows we
+    stably reorder steps to put each window's leading side first.
+    Stable = intra-side order preserved. Endpoint and total time are
+    exactly unchanged; intermediate positions move, which is why the
+    window is bounded (limits drift from where each step's wind sample
+    was taken) and why every reordered segment is re-checked against
+    navigability and the rounding filter — a failing window keeps its
+    original order.
+    """
+    n = len(headings)
+    if n < 3 or window < 2 or len(path) < n + 1:
+        return path, headings
+    new_path: list[tuple[float, float]] = [path[0]]
+    new_headings: list[float] = []
+    for w0 in range(0, n, window):
+        w1 = min(w0 + window, n)
+        steps = []
+        prev_key = 0
+        for i in range(w0, w1):
+            dlat = path[i + 1][0] - path[i][0]
+            dlon = path[i + 1][1] - path[i][1]
+            # Dead up/downwind steps (side 0) travel with the side
+            # they follow so they don't split a board.
+            key = sides[i] if sides[i] != 0 else prev_key
+            prev_key = key
+            steps.append((key, dlat, dlon, headings[i]))
+        first_key = next((k for k, *_ in steps if k != 0), 0)
+        if first_key == 0:
+            reordered = steps
+        else:
+            order = {first_key: 0, 0: 1, -first_key: 1}
+            reordered = sorted(steps, key=lambda s: order[s[0]])
+        cand_pts = [new_path[-1]]
+        for _, dlat, dlon, _ in reordered:
+            cand_pts.append((cand_pts[-1][0] + dlat, cand_pts[-1][1] + dlon))
+        ok = all(
+            is_navigable.segment(cand_pts[j][0], cand_pts[j][1],
+                                 cand_pts[j + 1][0], cand_pts[j + 1][1])
+            for j in range(len(cand_pts) - 1)
+        ) and (
+            rounding_filter is None
+            or all(rounding_filter(pt[0], pt[1]) for pt in cand_pts[1:])
+        )
+        chosen = reordered if ok else steps
+        if not ok:
+            cand_pts = [new_path[-1]]
+            for _, dlat, dlon, _ in chosen:
+                cand_pts.append((cand_pts[-1][0] + dlat, cand_pts[-1][1] + dlon))
+        new_path.extend(cand_pts[1:])
+        new_headings.extend(s[3] for s in chosen)
+    return new_path, new_headings
 
 
 def _segment_check(
@@ -212,6 +356,9 @@ class _Node:
     heading_deg: float
     parent_idx: Optional[int]
     iteration: int
+    maneuvered: bool = False   # this step included a tack/gybe (v13)
+    maneuvers: int = 0         # cumulative tacks+gybes along lineage (v13)
+    side: int = 0              # wind side of this step's heading (v13)
 
 
 @dataclass
@@ -275,6 +422,10 @@ def compute_isochrone_route(
     density_factor: float = 1.0,                       # ρ/ρ_std
     polar_margin: float = 1.0,                         # gust/perf de-rating
     rounding_filter: Optional[Callable[[float, float], bool]] = None,
+    # ── New in v13 ─────────────────────────────────────────────────────
+    tack_penalty_s: float = DEFAULT_TACK_PENALTY_S,
+    gybe_penalty_s: float = DEFAULT_GYBE_PENALTY_S,
+    frontier_per_bin: int = DEFAULT_FRONTIER_PER_BIN,
     # ──────────────────────────────────────────────────────────────────
 ) -> RouteResult:
     """Find a near-optimal single-leg route from start to finish.
@@ -299,6 +450,14 @@ def compute_isochrone_route(
                        side of a mark constraint. Used by the multi-leg
                        driver to enforce port/starboard rounding without
                        changing the inner loop.
+
+    New in v13:
+      tack_penalty_s:   seconds of sailing lost to a tack. Applied by
+                        shortening the maneuvering step's distance.
+      gybe_penalty_s:   same, for a gybe (candidate TWA >= 90°).
+      frontier_per_bin: candidates kept per bearing bin during culling.
+                        Set both penalties to 0 and this to 1 to
+                        reproduce pre-v13 behaviour exactly.
     """
     if is_navigable is None:
         # Default to the singleton always-navigable predicate so the
@@ -353,6 +512,11 @@ def compute_isochrone_route(
                 # alternative paths exist outside the cutoff zone.
                 continue
 
+            # Side of the wind the parent was sailing on. The root node
+            # (parent_idx None) has no meaningful heading — its
+            # expansions are the first real headings, so no penalty.
+            parent_side = parent.side if parent.parent_idx is not None else 0
+
             for k in range(heading_count):
                 heading = k * heading_step_deg
                 twa = _twa(heading, wind_from_deg)
@@ -364,7 +528,20 @@ def compute_isochrone_route(
                 )
                 if speed_kt <= 0:
                     continue
-                distance_m = speed_kt * KT_TO_MS * dt_seconds
+                # Maneuver penalty (v13): a sign flip of the wind side
+                # between parent and candidate is a tack (candidate TWA
+                # < 90°) or gybe (>= 90°). The step still advances
+                # dt_seconds of wall clock, but covers less ground.
+                cand_side = _wind_side(heading, wind_from_deg)
+                maneuvered = False
+                effective_dt_s = dt_seconds
+                if parent_side != 0 and cand_side != 0 and cand_side != parent_side:
+                    maneuvered = True
+                    penalty_s = (
+                        tack_penalty_s if twa < 90.0 else gybe_penalty_s
+                    )
+                    effective_dt_s = max(dt_seconds - penalty_s, 0.0)
+                distance_m = speed_kt * KT_TO_MS * effective_dt_s
                 new_lat, new_lon = _apply_currents(
                     parent.lat, parent.lon, heading, distance_m,
                     currents, valid_time, dt_seconds,
@@ -385,13 +562,20 @@ def compute_isochrone_route(
                     heading_deg=heading,
                     parent_idx=parent_idx,
                     iteration=iteration,
+                    maneuvered=maneuvered,
+                    maneuvers=parent.maneuvers + (1 if maneuvered else 0),
+                    side=cand_side,
                 ))
 
         if not candidates:
             break
 
-        # Bin by bearing FROM finish; keep the closest-to-finish per bin.
-        by_bin: dict[int, tuple[int, float]] = {}  # bin -> (cand_idx, dist_m)
+        # Bin by bearing FROM finish; keep the top-K closest-to-finish
+        # per bin (v13 — K > 1 because the maneuver penalty makes step
+        # cost parent-dependent, so the single closest node per bin no
+        # longer dominates). Ranking charges each lineage a small
+        # per-cumulative-maneuver nudge so weaving loses near-ties.
+        by_bin: dict[int, list[tuple[float, int]]] = {}  # bin -> [(score, idx)]
         for cand in candidates:
             d_finish = haversine_m(cand.lat, cand.lon, finish_lat, finish_lon)
             brg = bearing_deg(finish_lat, finish_lon, cand.lat, cand.lon)
@@ -399,26 +583,35 @@ def compute_isochrone_route(
             cand_idx_in_list = len(all_nodes)
             all_nodes.append(cand)
             nodes_explored += 1
-            current = by_bin.get(bin_idx)
-            if current is None or d_finish < current[1]:
-                by_bin[bin_idx] = (cand_idx_in_list, d_finish)
+            score = d_finish + cand.maneuvers * BIN_TIEBREAK_M
+            by_bin.setdefault(bin_idx, []).append((score, cand_idx_in_list))
 
-        new_frontier = [v[0] for v in by_bin.values()]
+        new_frontier: list[int] = []
+        for entries in by_bin.values():
+            entries.sort(key=lambda t: t[0])
+            new_frontier.extend(idx for _, idx in entries[:frontier_per_bin])
         # Check finish hit on the kept set. Require the final approach
         # segment (from the candidate node to the finish mark itself)
         # to be navigable end-to-end — a node within finish_radius is
         # irrelevant if the path between it and the mark crosses land.
+        # v13: several lineages typically hit the radius on the same
+        # iteration — a tack costs ~46 m, far below the 5-minute time
+        # quantum, so weaving and clean lineages "arrive together".
+        # Prefer the fewest cumulative maneuvers, then the closest.
+        reachers: list[tuple[int, float, int]] = []  # (maneuvers, d_m, idx)
         for idx in new_frontier:
             n = all_nodes[idx]
-            if haversine_m(n.lat, n.lon, finish_lat, finish_lon) > finish_radius_m:
+            d = haversine_m(n.lat, n.lon, finish_lat, finish_lon)
+            if d > finish_radius_m:
                 continue
             if not _segment_check(
                 n.lat, n.lon, finish_lat, finish_lon, is_navigable,
             ):
                 continue
-            reached_idx = idx
-            break
-        if reached_idx is not None:
+            reachers.append((n.maneuvers, d, idx))
+        if reachers:
+            reachers.sort()
+            reached_idx = reachers[0][2]
             break
 
         frontier = new_frontier
@@ -448,6 +641,11 @@ def compute_isochrone_route(
 
     path = [(all_nodes[i].lat, all_nodes[i].lon) for i in path_idxs]
     headings = [all_nodes[i].heading_deg for i in path_idxs[1:]]
+    sides = [all_nodes[i].side for i in path_idxs[1:]]
+    path, headings = _consolidate_boards(
+        path, headings, sides, is_navigable, CONSOLIDATION_WINDOW_STEPS,
+        rounding_filter=rounding_filter,
+    )
     if reached:
         path.append(finish)
 
@@ -575,6 +773,9 @@ def compute_isochrone_route_multileg(
     hs_m: float = 0.0,
     density_factor: float = 1.0,
     polar_margin: float = 1.0,
+    tack_penalty_s: float = DEFAULT_TACK_PENALTY_S,
+    gybe_penalty_s: float = DEFAULT_GYBE_PENALTY_S,
+    frontier_per_bin: int = DEFAULT_FRONTIER_PER_BIN,
 ) -> RouteResult:
     """Route through a multi-mark course, threading wall-clock across legs.
 
@@ -658,6 +859,9 @@ def compute_isochrone_route_multileg(
             density_factor=density_factor,
             polar_margin=polar_margin,
             rounding_filter=rf,
+            tack_penalty_s=tack_penalty_s,
+            gybe_penalty_s=gybe_penalty_s,
+            frontier_per_bin=frontier_per_bin,
         )
         legs_completed.append(leg_result)
         elapsed_minutes += leg_result.total_minutes
@@ -749,4 +953,6 @@ __all__ = [
     "route_to_geojson",
     "haversine_m", "bearing_deg", "project", "uv_to_tws_twd",
     "M_PER_NM", "KT_TO_MS", "EARTH_RADIUS_M",
+    "DEFAULT_TACK_PENALTY_S", "DEFAULT_GYBE_PENALTY_S",
+    "DEFAULT_FRONTIER_PER_BIN",
 ]

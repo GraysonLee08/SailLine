@@ -68,6 +68,7 @@ from app.services.mark_gates import GateAwareDetector, build_gates
 from app.services.mark_rounding import (
     Mark as DetectorMark,
     Point as DetectorPoint,
+    clamp_thresholds_to_spacing,
     thresholds_for_course,
 )
 from app.services.start_line import resolve_start_line_bearing
@@ -384,10 +385,17 @@ async def detect_and_persist_new_passes(
     elif start_line_bearing_deg is not None:
         line_bearing = float(start_line_bearing_deg)
 
+    # Per-mark CPA thresholds: mode base (400/100 m) clamped by mark
+    # spacing (2026-07-10 — cross-talk fix: a threshold wider than the
+    # gap between two marks let one visit emit both passes).
+    thresholds = clamp_thresholds_to_spacing(
+        thresholds_for_course(len(detector_marks), mode=mode),
+        detector_marks,
+    )
     det = GateAwareDetector(
         detector_marks,
         gates=build_gates(marks, line_bearing),
-        threshold_m=thresholds_for_course(len(detector_marks), mode=mode),
+        threshold_m=thresholds,
         next_mark_index=next_idx,
         state=detector_state,
     )
